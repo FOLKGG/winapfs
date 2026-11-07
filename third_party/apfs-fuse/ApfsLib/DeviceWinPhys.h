@@ -23,10 +23,27 @@ along with apfs-fuse.  If not, see <http://www.gnu.org/licenses/>.
 
 #include "Device.h"
 
-// #define WIN32_LEAN_AND_MEAN
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <Windows.h>
-#include <tchar.h>
 
+#include <list>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+
+// winapfs: raw disk (\\.\PhysicalDriveN, or any \\.\ device path).
+// Raw disk I/O must be sector-aligned in offset, length and buffer address,
+// and it bypasses the Windows file cache. So small reads go through an LRU
+// cache of aligned 128 KiB chunks (64 MiB), and large reads go straight to the
+// device through an aligned bounce buffer. The handle is overlapped so reads
+// from several threads run concurrently instead of being serialized on the
+// file object.
 class DeviceWinPhys : public Device
 {
 public:
@@ -39,9 +56,23 @@ public:
 	bool Read(void *data, uint64_t offs, uint64_t len) override;
 	uint64_t GetSize() const override;
 
+	// Physical sector size reported by the device (I/O alignment unit).
+	uint32_t GetIoAlignment() const { return m_io_align; }
+
 private:
+	typedef std::shared_ptr<std::vector<uint8_t>> Chunk;
+
+	bool ReadAligned(uint8_t *aligned_buf, uint64_t offs, uint32_t len, uint32_t &got);
+	bool ReadDirect(uint8_t *dst, uint64_t offs, uint64_t len);
+	Chunk GetChunk(uint64_t idx);
+
 	HANDLE m_drive;
 	uint64_t m_size;
+	uint32_t m_io_align;
+
+	std::mutex m_cache_mutex;
+	std::list<std::pair<uint64_t, Chunk>> m_lru;
+	std::unordered_map<uint64_t, std::list<std::pair<uint64_t, Chunk>>::iterator> m_cache;
 };
 
 #endif

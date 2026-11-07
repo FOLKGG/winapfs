@@ -1,0 +1,8 @@
+/build/
+/build-*/
+/out/
+*.log
+.vs/
+# raw images are large; fetch them separately (see testdata/generator/README.md)
+/testdata/*.img
+*.errors

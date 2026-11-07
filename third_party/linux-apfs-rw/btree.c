@@ -671,7 +671,7 @@ static void apfs_btree_change_rec_count(struct apfs_query *query, int change,
 
 	sb = root->object.sb;
 	root_raw = (void *)root->object.data;
-	info = (void *)root_raw + sb->s_blocksize - sizeof(*info);
+	info = (void *)((char *)root_raw + sb->s_blocksize - sizeof(*info));
 
 	apfs_assert_in_transaction(sb, &root_raw->btn_o);
 	if (key_len > le32_to_cpu(info->bt_longest_key))
@@ -702,7 +702,7 @@ void apfs_btree_change_node_count(struct apfs_query *query, int change)
 
 	sb = root->object.sb;
 	root_raw = (void *)root->object.data;
-	info = (void *)root_raw + sb->s_blocksize - sizeof(*info);
+	info = (void *)((char *)root_raw + sb->s_blocksize - sizeof(*info));
 
 	apfs_assert_in_transaction(sb, &root_raw->btn_o);
 	le64_add_cpu(&info->bt_node_count, change);
@@ -945,7 +945,7 @@ static int __apfs_btree_remove(struct apfs_query *query)
 		first_key_len = apfs_node_locate_key(node, 1, &first_key_off);
 		if (!first_key_len)
 			return -EFSCORRUPTED;
-		key = (void *)node_raw + first_key_off;
+		key = (void *)((char *)node_raw + first_key_off);
 
 		err = __apfs_btree_replace(query->parent, key, first_key_len, NULL /* val */, 0 /* val_len */);
 		if (err == -EAGAIN)

@@ -305,8 +305,8 @@ static int apfs_shrink_extent_head(struct apfs_query *query, struct apfs_dstream
 		return err;
 	}
 	raw = query->node->object.data;
-	key = *(struct apfs_file_extent_key *)(raw + query->key_off);
-	val = *(struct apfs_file_extent_val *)(raw + query->off);
+	key = *(struct apfs_file_extent_key *)((void *)((char *)raw + query->key_off));
+	val = *(struct apfs_file_extent_val *)((void *)((char *)raw + query->off));
 
 	new_len = extent.logical_addr + extent.len - start;
 	head_len = extent.len - new_len;
@@ -362,7 +362,7 @@ static int apfs_shrink_extent_tail(struct apfs_query *query, struct apfs_dstream
 		apfs_err(sb, "bad extent record for dstream 0x%llx", dstream->ds_id);
 		return err;
 	}
-	val = raw + query->off;
+	val = (void *)((char *)raw + query->off);
 
 	new_len = end - extent.logical_addr;
 	new_blkcount = new_len >> sb->s_blocksize_bits;
@@ -395,7 +395,7 @@ static inline bool apfs_query_found_extent(struct apfs_query *query)
 
 	if (query->key_len < sizeof(*hdr))
 		return false;
-	hdr = raw + query->key_off;
+	hdr = (void *)((char *)raw + query->key_off);
 
 	if (apfs_cat_type(hdr) != APFS_TYPE_FILE_EXTENT)
 		return false;
@@ -550,9 +550,9 @@ static int apfs_split_extent(struct apfs_query *query, u64 div)
 		apfs_err(sb, "bad extent record");
 		return err;
 	}
-	val1 = raw + query->off;
-	val2 = *(struct apfs_file_extent_val *)(raw + query->off);
-	key2 = *(struct apfs_file_extent_key *)(raw + query->key_off);
+	val1 = (void *)((char *)raw + query->off);
+	val2 = *(struct apfs_file_extent_val *)((void *)((char *)raw + query->off));
+	key2 = *(struct apfs_file_extent_key *)((void *)((char *)raw + query->key_off));
 
 	len1 = div - extent.logical_addr;
 	blkcount1 = len1 >> sb->s_blocksize_bits;
@@ -970,7 +970,7 @@ static int apfs_put_phys_extent(struct apfs_phys_extent *pext, struct apfs_query
 		return err;
 	}
 	raw = query->node->object.data;
-	val = raw + query->off;
+	val = (void *)((char *)raw + query->off);
 	val->refcnt = cpu_to_le32(pext->refcnt);
 	return 0;
 }
@@ -999,7 +999,7 @@ static int apfs_take_phys_extent(struct apfs_phys_extent *pext, struct apfs_quer
 		return err;
 	}
 	raw = query->node->object.data;
-	val = raw + query->off;
+	val = (void *)((char *)raw + query->off);
 	val->refcnt = cpu_to_le32(pext->refcnt);
 	return 0;
 }
@@ -1049,9 +1049,9 @@ static int apfs_split_phys_ext(struct apfs_query *query, u64 div)
 		apfs_err(sb, "bad pext record over div 0x%llx", div);
 		return err;
 	}
-	val1 = raw + query->off;
-	val2 = *(struct apfs_phys_ext_val *)(raw + query->off);
-	key2 = *(struct apfs_phys_ext_key *)(raw + query->key_off);
+	val1 = (void *)((char *)raw + query->off);
+	val2 = *(struct apfs_phys_ext_val *)((void *)((char *)raw + query->off));
+	key2 = *(struct apfs_phys_ext_key *)((void *)((char *)raw + query->key_off));
 
 	blkcount1 = div - pextent.bno;
 	blkcount2 = pextent.blkcount - blkcount1;
@@ -2324,7 +2324,7 @@ int apfs_nonsparse_dstream_read(struct apfs_dstream_info *dstream, void *buf, si
 			left_in_block = sb->s_blocksize - off_in_block;
 
 		memcpy(buf, bhs[idx]->b_data + off_in_block, left_in_block);
-		buf += left_in_block;
+		buf = (char *)buf + left_in_block; /* winapfs: no void* arithmetic in MSVC */
 	}
 
 out:

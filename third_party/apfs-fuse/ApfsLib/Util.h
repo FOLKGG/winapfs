@@ -57,6 +57,13 @@ bool GetPassword(std::string &pw);
 
 int log2(uint32_t val);
 
-void log_debug(const char *msg, ...) __attribute__((format(printf, 1, 2)));
-void log_warn(const char *msg, ...) __attribute__((format(printf, 1, 2)));
-void log_error(const char *msg, ...) __attribute__((format(printf, 1, 2)));
+// winapfs: MSVC has no __attribute__
+#if defined(__GNUC__) || defined(__clang__)
+#define APFS_PRINTF_ATTR(a, b) __attribute__((format(printf, a, b)))
+#else
+#define APFS_PRINTF_ATTR(a, b)
+#endif
+
+void log_debug(const char *msg, ...) APFS_PRINTF_ATTR(1, 2);
+void log_warn(const char *msg, ...) APFS_PRINTF_ATTR(1, 2);
+void log_error(const char *msg, ...) APFS_PRINTF_ATTR(1, 2);

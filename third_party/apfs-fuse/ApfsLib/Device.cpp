@@ -45,18 +45,19 @@ Device * Device::OpenDevice(const char * name)
 	const char *ext;
 
 #ifdef _WIN32
-	if (!strncmp(name, "\\\\.\\PhysicalDrive", 17))
+	// winapfs: any \\.\ device path (PhysicalDriveN, HarddiskNPartitionM, ...)
+	// is a raw device; don't fall back to plain file access for those.
+	if (!strncmp(name, "\\\\.\\", 4))
 	{
 		dev = new DeviceWinPhys();
 		rc = dev->Open(name);
 		if (rc)
 			return dev;
-		else
-		{
-			dev->Close();
-			delete dev;
-			dev = nullptr;
-		}
+		DWORD err = GetLastError();
+		dev->Close();
+		delete dev;
+		SetLastError(err);
+		return nullptr;
 	}
 #endif
 

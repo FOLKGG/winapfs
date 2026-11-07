@@ -1,0 +1,291 @@
+/*
+ * winapfs - read-only APFS for Windows
+ * Copyright (C) 2026 winapfs contributors
+ * SPDX-License-Identifier: GPL-2.0-only
+ *
+ * kshim: block devices. winapfs registers a device (an image file or a raw
+ * disk, plus the byte range of the APFS partition) and gets back a name of
+ * the form "kshim:N". The driver opens that name with
+ * bdev_file_open_by_path(). Offsets the driver uses are relative to the
+ * partition start.
+ *
+ * I/O is positional (OVERLAPPED offsets) so it is safe from any thread.
+ * Buffers come from the page cache and are page-aligned; offsets are
+ * multiples of the block size, so raw-disk sector alignment holds as long as
+ * the partition itself is sector-aligned (GPT guarantees that).
+ */
+#include <kshim.h>
+#include "kshim_internal.h"
+
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
+
+#define MAX_BDEVS	64
+
+struct kshim_bdev {
+	bool used;
+	HANDLE h;
+	u64 offset;
+	u64 size;
+	bool writable;
+	struct block_device bdev;
+	struct gendisk disk;
+	struct backing_dev_info bdi;
+	struct address_space mapping;
+	int opens;
+};
+
+static struct kshim_bdev g_bdevs[MAX_BDEVS];
+static SRWLOCK g_bdev_lock = SRWLOCK_INIT;
+
+int kshim_bdev_register(const wchar_t *path, u64 offset, u64 size, bool writable, char *name, size_t name_size)
+{
+	HANDLE h;
+	int i;
+
+	h = CreateFileW(path, GENERIC_READ | (writable ? GENERIC_WRITE : 0), FILE_SHARE_READ | FILE_SHARE_WRITE,
+			NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS, NULL);
+	if (h == INVALID_HANDLE_VALUE)
+		return -(int)GetLastError();
+
+	if (!size) {
+		LARGE_INTEGER sz;
+		if (!GetFileSizeEx(h, &sz)) {
+			CloseHandle(h);
+			return -EINVAL;
+		}
+		size = (u64)sz.QuadPart - offset;
+	}
+
+	AcquireSRWLockExclusive(&g_bdev_lock);
+	for (i = 0; i < MAX_BDEVS && g_bdevs[i].used; i++)
+		;
+	if (i == MAX_BDEVS) {
+		ReleaseSRWLockExclusive(&g_bdev_lock);
+		CloseHandle(h);
+		return -ENOSPC;
+	}
+	struct kshim_bdev *b = &g_bdevs[i];
+	memset(b, 0, sizeof(*b));
+	b->used = true;
+	b->h = h;
+	b->offset = offset;
+	b->size = size;
+	b->writable = writable;
+	b->bdev.kshim_dev = b;
+	b->bdev.bd_dev = (dev_t)(0x800000 + i);   /* fake major/minor, unique per device */
+	b->bdev.bd_block_size = 4096;
+	b->bdev.bd_size = size;
+	b->bdev.bd_read_only = !writable;
+	b->bdev.bd_disk = &b->disk;
+	b->bdev.bd_mapping = &b->mapping;
+	b->disk.bdi = &b->bdi;
+	b->bdi.ra_pages = 32;
+	b->bdi.io_pages = 256;
+	snprintf(b->bdev.bd_name, sizeof(b->bdev.bd_name), "kshim%d", i);
+	snprintf(b->disk.disk_name, sizeof(b->disk.disk_name), "kshim%d", i);
+	kshim_mapping_init(&b->mapping, NULL);
+	b->mapping.flags |= KSHIM_MAPPING_BDEV;
+	ReleaseSRWLockExclusive(&g_bdev_lock);
+
+	snprintf(name, name_size, "kshim:%d", i);
+	return 0;
+}
+
+static struct kshim_bdev *lookup(const char *name)
+{
+	int i;
+	if (strncmp(name, "kshim:", 6) != 0)
+		return NULL;
+	i = atoi(name + 6);
+	if (i < 0 || i >= MAX_BDEVS || !g_bdevs[i].used)
+		return NULL;
+	return &g_bdevs[i];
+}
+
+void kshim_bdev_unregister(const char *name)
+{
+	struct kshim_bdev *b;
+	AcquireSRWLockExclusive(&g_bdev_lock);
+	b = lookup(name);
+	if (b && b->opens == 0) {
+		kshim_mapping_release_all(&b->mapping);
+		CloseHandle(b->h);
+		b->used = false;
+	}
+	ReleaseSRWLockExclusive(&g_bdev_lock);
+}
+
+struct kshim_bdev *kshim_bdev_of(struct block_device *bdev)
+{
+	return bdev->kshim_dev;
+}
+
+static int io(struct block_device *bdev, bool write, u64 off, void *buf, size_t len)
+{
+	struct kshim_bdev *b = bdev->kshim_dev;
+	u8 *p = buf;
+
+	if (write && !b->writable)
+		return -EROFS;
+	if (off > b->size || len > b->size - off)
+		return -EIO;
+	off += b->offset;
+
+	while (len > 0) {
+		OVERLAPPED ov = { 0 };
+		DWORD chunk = len > (1u << 30) ? (1u << 30) : (DWORD)len, done = 0;
+		BOOL ok;
+
+		ov.Offset = (DWORD)off;
+		ov.OffsetHigh = (DWORD)(off >> 32);
+		ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+		ok = write ? WriteFile(b->h, p, chunk, NULL, &ov) : ReadFile(b->h, p, chunk, NULL, &ov);
+		if (!ok && GetLastError() != ERROR_IO_PENDING) {
+			CloseHandle(ov.hEvent);
+			return -EIO;
+		}
+		ok = GetOverlappedResult(b->h, &ov, &done, TRUE);
+		CloseHandle(ov.hEvent);
+		if (!ok || done != chunk)
+			return -EIO;
+		p += chunk;
+		off += chunk;
+		len -= chunk;
+	}
+	return 0;
+}
+
+int kshim_bdev_read(struct block_device *bdev, u64 off, void *buf, size_t len)
+{
+	return io(bdev, false, off, buf, len);
+}
+
+int kshim_bdev_write(struct block_device *bdev, u64 off, const void *buf, size_t len)
+{
+	return io(bdev, true, off, (void *)buf, len);
+}
+
+/* Durability barrier: everything written so far reaches stable storage. */
+int kshim_bdev_flush(struct block_device *bdev)
+{
+	struct kshim_bdev *b = bdev->kshim_dev;
+	if (!b->writable)
+		return 0;
+	return FlushFileBuffers(b->h) ? 0 : -EIO;
+}
+
+/* ------------------------------------------------------------ Linux API */
+
+struct file *bdev_file_open_by_path(const char *path, blk_mode_t mode, void *holder, const void *hops)
+{
+	struct kshim_bdev *b;
+	struct file *f;
+
+	AcquireSRWLockExclusive(&g_bdev_lock);
+	b = lookup(path);
+	if (b && (mode & BLK_OPEN_WRITE) && !b->writable)
+		b = NULL;
+	if (b)
+		b->opens++;
+	ReleaseSRWLockExclusive(&g_bdev_lock);
+	if (!b)
+		return ERR_PTR(-ENODEV);
+
+	f = calloc(1, sizeof(*f));
+	f->kshim_bdev = &b->bdev;
+	f->f_mapping = &b->mapping;
+	f->f_mode = FMODE_READ | ((mode & BLK_OPEN_WRITE) ? FMODE_WRITE : 0);
+	return f;
+}
+
+struct block_device *file_bdev(struct file *f)
+{
+	return f->kshim_bdev;
+}
+
+void bdev_fput(struct file *f)
+{
+	struct kshim_bdev *b = f->kshim_bdev->kshim_dev;
+	AcquireSRWLockExclusive(&g_bdev_lock);
+	b->opens--;
+	ReleaseSRWLockExclusive(&g_bdev_lock);
+	free(f);
+}
+
+void fput(struct file *f)
+{
+	if (f && f->kshim_bdev)
+		bdev_fput(f);
+	else
+		free(f);
+}
+
+int lookup_bdev(const char *path, dev_t *dev)
+{
+	struct kshim_bdev *b = lookup(path);
+	if (!b)
+		return -ENODEV;
+	*dev = b->bdev.bd_dev;
+	return 0;
+}
+
+int set_blocksize(struct file *f, int size)
+{
+	f->kshim_bdev->bd_block_size = (unsigned)size;
+	return 0;
+}
+
+int sb_set_blocksize(struct super_block *sb, int size)
+{
+	if (size < 512 || size > (int)PAGE_SIZE || !is_power_of_2((u64)size))
+		return 0;
+	sb->s_blocksize = (unsigned long)size;
+	sb->s_blocksize_bits = (unsigned char)blksize_bits((unsigned)size);
+	if (sb->s_bdev)
+		sb->s_bdev->bd_block_size = (unsigned)size;
+	return size;
+}
+
+int sb_min_blocksize(struct super_block *sb, int size)
+{
+	return sb_set_blocksize(sb, size < 512 ? 512 : size);
+}
+
+int sync_blockdev(struct block_device *b)
+{
+	int err = kshim_mapping_writeback(b->bd_mapping);
+	return err ? err : kshim_bdev_flush(b);
+}
+
+int blkdev_issue_flush(struct block_device *b)
+{
+	return kshim_bdev_flush(b);
+}
+
+void invalidate_bdev(struct block_device *bdev)
+{
+	kshim_mapping_drop_clean(bdev->bd_mapping);
+}
+
+static volatile long g_anon_dev = 0x900000;
+
+int get_anon_bdev(dev_t *p)
+{
+	*p = (dev_t)InterlockedIncrement(&g_anon_dev);
+	return 0;
+}
+
+void free_anon_bdev(dev_t d)
+{
+	(void)d;
+}
+
+struct block_device *kshim_bdev_by_mapping(struct address_space *m)
+{
+	int i;
+	for (i = 0; i < MAX_BDEVS; i++)
+		if (g_bdevs[i].used && &g_bdevs[i].mapping == m)
+			return &g_bdevs[i].bdev;
+	return NULL;
+}

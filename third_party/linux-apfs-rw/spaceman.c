@@ -26,7 +26,7 @@ static u64 apfs_spaceman_read_cib_addr(struct super_block *sb, int index)
 	__le64 *addr_p;
 
 	offset = sm->sm_addr_offset + index * sizeof(*addr_p);
-	addr_p = (void *)sm_raw + offset;
+	addr_p = (void *)((char *)sm_raw + offset);
 	return le64_to_cpup(addr_p);
 }
 
@@ -47,7 +47,7 @@ static void apfs_spaceman_write_cib_addr(struct super_block *sb,
 	apfs_assert_in_transaction(sb, &sm_raw->sm_o);
 
 	offset = sm->sm_addr_offset + index * sizeof(*addr_p);
-	addr_p = (void *)sm_raw + offset;
+	addr_p = (void *)((char *)sm_raw + offset);
 	*addr_p = cpu_to_le64(addr);
 }
 
@@ -112,7 +112,7 @@ static __le16 *apfs_spaceman_get_16(struct super_block *sb, size_t off)
 		return NULL;
 	if (off + sizeof(__le16) > spaceman->sm_size)
 		return NULL;
-	return (void *)sm_raw + off;
+	return (void *)((char *)sm_raw + off);
 }
 
 /**
@@ -131,7 +131,7 @@ static __le64 *apfs_spaceman_get_64(struct super_block *sb, size_t off)
 		return NULL;
 	if (off + sizeof(__le64) > spaceman->sm_size)
 		return NULL;
-	return (void *)sm_raw + off;
+	return (void *)((char *)sm_raw + off);
 }
 
 /**
@@ -643,7 +643,7 @@ static int apfs_flush_free_queue(struct super_block *sb, unsigned int qid)
 	}
 
 	if (qid == APFS_SFQ_MAIN) {
-		fq_info = (void *)fq_root->object.data + sb->s_blocksize - sizeof(*fq_info);
+		fq_info = (void *)((char *)fq_root->object.data + sb->s_blocksize - sizeof(*fq_info));
 		sm->sm_main_fq_nodes = le64_to_cpu(fq_info->bt_node_count);
 		if (sm->sm_main_fq_nodes != 1) {
 			apfs_alert(sb, "main queue wasn't flushed in full - bug!");
@@ -965,7 +965,7 @@ static int apfs_free_queue_try_insert(struct super_block *sb, u64 bno, u64 count
 		goto fail;
 	}
 
-	fq_info = (void *)fq_root->object.data + sb->s_blocksize - sizeof(*fq_info);
+	fq_info = (void *)((char *)fq_root->object.data + sb->s_blocksize - sizeof(*fq_info));
 	node_count = le64_to_cpu(fq_info->bt_node_count);
 	node_limit = le16_to_cpu(fq->sfq_tree_node_limit);
 	if (node_count == node_limit) {

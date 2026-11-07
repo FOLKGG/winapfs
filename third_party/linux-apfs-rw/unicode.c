@@ -17,11 +17,19 @@
 
 /* The arrays of unicode data are defined at the bottom of the file */
 /* TODO: would a single trie with all the data be more efficient? */
+#ifdef _MSC_VER /* winapfs: MSVC rejects static arrays of unknown size */
+static u16 apfs_nfd_trie[4016];
+static unicode_t apfs_nfd[3404];
+static u16 apfs_cf_trie[2944];
+static unicode_t apfs_cf[1521];
+static u8 apfs_ccc_trie[3520];
+#else
 static u16 apfs_nfd_trie[];
 static unicode_t apfs_nfd[];
 static u16 apfs_cf_trie[];
 static unicode_t apfs_cf[];
 static u8 apfs_ccc_trie[];
+#endif
 
 #define TRIE_HEIGHT		5
 

@@ -1564,7 +1564,11 @@ struct apfs_kb_locker {
 	__le16				kl_nkeys;
 	__le32				kl_nbytes;
 	__le64				padding;
+#ifdef _MSC_VER /* winapfs: MSVC rejects arrays of structs ending in a flexible array (unused) */
+	u8				kl_entries[];
+#else
 	struct apfs_keybag_entry	kl_entries[];
+#endif
 } __packed;
 
 #endif	/* _APFS_RAW_H */

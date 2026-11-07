@@ -71,24 +71,12 @@ bool ApfsVolume::Init(paddr_t apsb_paddr)
 	if ((m_sb.apfs_fs_flags & 3) != APFS_FS_UNENCRYPTED && !m_container.IsUnencrypted())
 	{
 		uint8_t vek[0x20];
-		std::string str;
 
-		std::cout << "Volume " << m_sb.apfs_volname << " is encrypted." << std::endl;
-
+		// winapfs: never prompt from inside the library (the volume may be
+		// opened from a service). The caller passes the passphrase to
+		// ApfsContainer::GetVolume and asks the user itself on failure.
 		if (!m_container.GetVolumeKey(vek, m_sb.apfs_vol_uuid))
-		{
-			if (m_container.GetPasswordHint(str, m_sb.apfs_vol_uuid))
-				std::cout << "Hint: " << str << std::endl;
-
-			std::cout << "Enter Password: ";
-			GetPassword(str);
-
-			if (!m_container.GetVolumeKey(vek, m_sb.apfs_vol_uuid, str.c_str()))
-			{
-				std::cout << "Wrong password!" << std::endl;
-				return false;
-			}
-		}
+			return false;
 
 		m_aes.SetKey(vek, vek + 0x10);
 		m_is_encrypted = true;
@@ -173,24 +161,12 @@ bool ApfsVolume::MountSnapshot(paddr_t apsb_paddr, xid_t snap_xid)
 	if ((m_sb.apfs_fs_flags & 3) != APFS_FS_UNENCRYPTED)
 	{
 		uint8_t vek[0x20];
-		std::string str;
 
-		std::cout << "Volume " << m_sb.apfs_volname << " is encrypted." << std::endl;
-
+		// winapfs: never prompt from inside the library (the volume may be
+		// opened from a service). The caller passes the passphrase to
+		// ApfsContainer::GetVolume and asks the user itself on failure.
 		if (!m_container.GetVolumeKey(vek, m_sb.apfs_vol_uuid))
-		{
-			if (m_container.GetPasswordHint(str, m_sb.apfs_vol_uuid))
-				std::cout << "Hint: " << str << std::endl;
-
-			std::cout << "Enter Password: ";
-			GetPassword(str);
-
-			if (!m_container.GetVolumeKey(vek, m_sb.apfs_vol_uuid, str.c_str()))
-			{
-				std::cout << "Wrong password!" << std::endl;
-				return false;
-			}
-		}
+			return false;
 
 		m_aes.SetKey(vek, vek + 0x10);
 		m_is_encrypted = true;

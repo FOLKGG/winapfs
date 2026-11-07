@@ -26,7 +26,14 @@
 #define RHEL_VERSION_GE(a, b)	0
 #endif
 
+/* winapfs: MSVC has no __packed suffix; every on-disk struct is in apfs_raw.h */
+#ifdef _MSC_VER
+#pragma pack(push, 1)
+#endif
 #include "apfs_raw.h"
+#ifdef _MSC_VER
+#pragma pack(pop)
+#endif
 
 #define EFSBADCRC	EBADMSG		/* Bad CRC detected */
 #define EFSCORRUPTED	EUCLEAN		/* Filesystem is corrupted */

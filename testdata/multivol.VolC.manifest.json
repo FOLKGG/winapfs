@@ -1,0 +1,96 @@
+{
+ "volume_mountpoint": "/var/folders/s7/2rngkr054zj7_tp0s95y4cwr0000gn/T/winapfs-verify.2SenzpHM83/VolC",
+ "block_size": 4096,
+ "case_sensitive": false,
+ "entry_count": 4,
+ "entries": [
+  {
+   "path": "/",
+   "path_utf8_hex": "2e",
+   "type": "dir",
+   "inode": 2,
+   "nlink": 5,
+   "mode": "0o775",
+   "uid": 0,
+   "gid": 0,
+   "flags": 0,
+   "compressed": false,
+   "mtime_ns": 1794077453596717031,
+   "ctime_ns": 1794077453596717031,
+   "atime_ns": 1794077451600116905,
+   "birthtime": 1794077451.600117
+  },
+  {
+   "path": "/data",
+   "path_utf8_hex": "64617461",
+   "type": "dir",
+   "inode": 19,
+   "nlink": 3,
+   "mode": "0o755",
+   "uid": 501,
+   "gid": 20,
+   "flags": 0,
+   "compressed": false,
+   "mtime_ns": 1794077453596745323,
+   "ctime_ns": 1794077453596745323,
+   "atime_ns": 1794077453596716365,
+   "birthtime": 1794077453.5967164,
+   "xattrs": {
+    "com.apple.provenance": {
+     "size": 11,
+     "sha256": "839037a1f97e5d8e13a258b59b1ad8612b4c6a3cf82690374e9b05d807f99cca"
+    }
+   }
+  },
+  {
+   "path": "/volume.txt",
+   "path_utf8_hex": "766f6c756d652e747874",
+   "type": "file",
+   "inode": 18,
+   "nlink": 1,
+   "mode": "0o644",
+   "uid": 501,
+   "gid": 20,
+   "flags": 0,
+   "compressed": false,
+   "mtime_ns": 1794077453596537951,
+   "ctime_ns": 1794077453596537951,
+   "atime_ns": 1794077453596478868,
+   "birthtime": 1794077453.596479,
+   "size": 20,
+   "allocated_bytes": 4096,
+   "sha256": "803fb8b6ca39a3883b2f6b9d1680420c3537dfc404e81d4981f26e8149bae2a0",
+   "xattrs": {
+    "com.apple.provenance": {
+     "size": 11,
+     "sha256": "839037a1f97e5d8e13a258b59b1ad8612b4c6a3cf82690374e9b05d807f99cca"
+    }
+   }
+  },
+  {
+   "path": "/data/VolC.bin",
+   "path_utf8_hex": "646174612f566f6c432e62696e",
+   "type": "file",
+   "inode": 20,
+   "nlink": 1,
+   "mode": "0o644",
+   "uid": 501,
+   "gid": 20,
+   "flags": 0,
+   "compressed": false,
+   "mtime_ns": 1794077453596779114,
+   "ctime_ns": 1794077453596779114,
+   "atime_ns": 1794077453596744823,
+   "birthtime": 1794077453.5967448,
+   "size": 100000,
+   "allocated_bytes": 102400,
+   "sha256": "2d6b9e94ff59a09bb0f40d1620ee92d9f4be95d205134b00067b904201105bb4",
+   "xattrs": {
+    "com.apple.provenance": {
+     "size": 11,
+     "sha256": "839037a1f97e5d8e13a258b59b1ad8612b4c6a3cf82690374e9b05d807f99cca"
+    }
+   }
+  }
+ ]
+}

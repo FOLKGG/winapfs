@@ -21,10 +21,19 @@ along with apfs-fuse.  If not, see <http://www.gnu.org/licenses/>.
 
 #ifdef _WIN32
 
-#include <fstream>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
 
 #include "Device.h"
 
+// winapfs: plain image file. Uses positional ReadFile (OVERLAPPED offset on a
+// synchronous handle) so concurrent reads from several threads are safe.
+// Paths are UTF-8.
 class DeviceWinFile : public Device
 {
 public:
@@ -39,7 +48,7 @@ public:
 	uint64_t GetSize() const override { return m_size; }
 
 private:
-	std::ifstream m_vol;
+	HANDLE m_file;
 	uint64_t m_size;
 };
 

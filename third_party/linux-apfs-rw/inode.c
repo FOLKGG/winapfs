@@ -222,7 +222,7 @@ int apfs_dstream_adj_refcnt(struct apfs_dstream_info *dstream, u32 delta)
 		goto out;
 	}
 	raw = query->node->object.data;
-	raw_val = *(struct apfs_dstream_id_val *)(raw + query->off);
+	raw_val = *(struct apfs_dstream_id_val *)((void *)((char *)raw + query->off));
 	refcnt = le32_to_cpu(raw_val.refcnt);
 
 	refcnt += delta;
@@ -368,7 +368,7 @@ int apfs_crypto_adj_refcnt(struct super_block *sb, u64 crypto_id, int delta)
 		return ret;
 	}
 	raw = query->node->object.data;
-	raw_val = (void *)raw + query->off;
+	raw_val = (void *)((char *)raw + query->off);
 
 	le32_add_cpu(&raw_val->refcnt, delta);
 
@@ -412,7 +412,7 @@ static int apfs_crypto_set_key(struct super_block *sb, u64 crypto_id, struct apf
 		goto out;
 	}
 	raw = query->node->object.data;
-	raw_val = (void *)raw + query->off;
+	raw_val = (void *)((char *)raw + query->off);
 
 	new_val->refcnt = raw_val->refcnt;
 
@@ -455,7 +455,7 @@ static int apfs_crypto_get_key(struct super_block *sb, u64 crypto_id, struct apf
 	if (ret)
 		goto out;
 	raw = query->node->object.data;
-	raw_val = (void *)raw + query->off;
+	raw_val = (void *)((char *)raw + query->off);
 
 	pfk_len = le16_to_cpu(raw_val->state.key_len);
 	if (pfk_len > max_len) {
@@ -1008,7 +1008,7 @@ static int apfs_check_dstream_refcnt(struct inode *inode)
 		goto fail;
 	}
 	raw = query->node->object.data;
-	raw_val = *(struct apfs_dstream_id_val *)(raw + query->off);
+	raw_val = *(struct apfs_dstream_id_val *)((void *)((char *)raw + query->off));
 	refcnt = le32_to_cpu(raw_val.refcnt);
 
 	dstream->ds_shared = refcnt > 1;
@@ -1459,7 +1459,7 @@ static int apfs_inode_resize(struct inode *inode, struct apfs_query *query)
 		return err;
 	}
 	raw = query->node->object.data;
-	inode_raw = (void *)raw + query->off;
+	inode_raw = (void *)((char *)raw + query->off);
 
 	xlen = apfs_find_xfield(inode_raw->xfields,
 				query->len - sizeof(*inode_raw),
@@ -1557,7 +1557,7 @@ static int apfs_inode_resize_sparse(struct inode *inode, struct apfs_query *quer
 		return err;
 	}
 	raw = query->node->object.data;
-	inode_raw = (void *)raw + query->off;
+	inode_raw = (void *)((char *)raw + query->off);
 
 	xlen = apfs_find_xfield(inode_raw->xfields,
 				query->len - sizeof(*inode_raw),
@@ -1639,7 +1639,7 @@ int apfs_update_inode(struct inode *inode, char *new_name)
 	}
 	node_raw = (void *)query->node->object.data;
 	apfs_assert_in_transaction(sb, &node_raw->btn_o);
-	inode_raw = (void *)node_raw + query->off;
+	inode_raw = (void *)((char *)node_raw + query->off);
 
 	inode_raw->parent_id = cpu_to_le64(ai->i_parent_id);
 	inode_raw->private_id = cpu_to_le64(dstream->ds_id);

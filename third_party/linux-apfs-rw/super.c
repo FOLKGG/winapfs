@@ -1120,7 +1120,7 @@ static int apfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 
 	/* There are no clear rules for the fsid, so we follow ext2 here */
 	fsid = le64_to_cpup((void *)vol->apfs_vol_uuid) ^
-	       le64_to_cpup((void *)vol->apfs_vol_uuid + sizeof(u64));
+	       le64_to_cpup((void *)((char *)vol->apfs_vol_uuid + sizeof(u64)));
 	buf->f_fsid.val[0] = fsid & 0xFFFFFFFFUL;
 	buf->f_fsid.val[1] = (fsid >> 32) & 0xFFFFFFFFUL;
 

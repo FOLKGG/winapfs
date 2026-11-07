@@ -296,7 +296,7 @@ int apfs_compressed_data_read(struct apfs_compressed_data *cdata, void *buf, siz
 		/* No caller is expected to legitimately read out-of-bounds */
 		return -EFSCORRUPTED;
 	}
-	memcpy(buf, cdata->data + offset, count);
+	memcpy(buf, (void *)((char *)cdata->data + offset), count);
 	return 0;
 }
 
@@ -642,7 +642,7 @@ static struct apfs_dstream_info *apfs_create_xattr_dstream(struct super_block *s
 
 		off = i << sb->s_blocksize_bits;
 		tocopy = min(sb->s_blocksize, (unsigned long)(size - off));
-		memcpy(bh->b_data, value + off, tocopy);
+		memcpy(bh->b_data, (const void *)((const char *)value + off), tocopy);
 		if (tocopy < sb->s_blocksize)
 			memset(bh->b_data + tocopy, 0, sb->s_blocksize - tocopy);
 		brelse(bh);

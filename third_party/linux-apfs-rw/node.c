@@ -315,7 +315,7 @@ int apfs_make_empty_btree_root(struct super_block *sb, u32 subtype, u64 *oid)
 	root->btn_val_free_list.off = cpu_to_le16(APFS_BTOFF_INVALID);
 	root->btn_val_free_list.len = 0;
 
-	apfs_set_empty_btree_info(sb, (void *)root + sb->s_blocksize - info_len, subtype);
+	apfs_set_empty_btree_info(sb, (void *)((char *)root + sb->s_blocksize - info_len), subtype);
 
 	root->btn_o.o_oid = cpu_to_le64(bno);
 	root->btn_o.o_xid = cpu_to_le64(APFS_NXI(sb)->nx_xid);
@@ -1076,11 +1076,11 @@ static int apfs_btree_inc_height(struct apfs_query *query)
 	new_node->val_free_list_len = root->val_free_list_len;
 	new_raw = (void *)new_node->object.data;
 	/* Don't copy the object header, already set by apfs_create_node() */
-	memcpy((void *)new_raw + sizeof(new_raw->btn_o),
-	       (void *)root_raw + sizeof(root_raw->btn_o),
+	memcpy((void *)((char *)new_raw + sizeof(new_raw->btn_o)),
+	       (void *)((char *)root_raw + sizeof(root_raw->btn_o)),
 	       root->free - sizeof(new_raw->btn_o));
-	memcpy((void *)new_raw + new_node->val,
-	       (void *)root_raw + root->val,
+	memcpy((void *)((char *)new_raw + new_node->val),
+	       (void *)((char *)root_raw + root->val),
 	       sb->s_blocksize - new_node->val);
 	query->off += sizeof(*info);
 	apfs_update_node(new_node);
@@ -1105,15 +1105,15 @@ static int apfs_btree_inc_height(struct apfs_query *query)
 	}
 	root->key = sizeof(*root_raw) +
 		    apfs_node_min_table_size(sb, root->tree_type, root->flags & ~APFS_BTNODE_LEAF);
-	memmove((void *)root_raw + root->key,
-		(void *)root_raw + root_query->key_off, root_query->key_len);
+	memmove((void *)((char *)root_raw + root->key),
+		(void *)((char *)root_raw + root_query->key_off), root_query->key_len);
 	root_query->key_off = root->key;
 	root->free = root->key + root_query->key_len;
 
 	/* The new root is a nonleaf node; the record value is the child id */
 	root->flags &= ~APFS_BTNODE_LEAF;
 	root->val = sb->s_blocksize - sizeof(*info) - sizeof(*raw_oid);
-	raw_oid = (void *)root_raw + root->val;
+	raw_oid = (void *)((char *)root_raw + root->val);
 	*raw_oid = cpu_to_le64(new_node->object.oid);
 	root_query->off = root->val;
 	root_query->len = sizeof(*raw_oid);
@@ -1243,7 +1243,7 @@ static int apfs_attach_child(struct apfs_query *query, struct apfs_node *child)
 		return -EFSCORRUPTED;
 	}
 
-	return __apfs_btree_insert(query, (void *)raw + key_off, key_len, &raw_oid, sizeof(raw_oid));
+	return __apfs_btree_insert(query, (void *)((char *)raw + key_off), key_len, &raw_oid, sizeof(raw_oid));
 }
 
 /**
@@ -1498,7 +1498,7 @@ static void apfs_node_free_list_add(struct apfs_node *node, u16 off, u16 len)
 		return;
 
 	/* The free list doesn't seem to be kept in any particular order */
-	new = (void *)node_raw + off;
+	new = (void *)((char *)node_raw + off);
 	new->off = head->off;
 	new->len = cpu_to_le16(len);
 	head->off = cpu_to_le16(off_to_rel(node, off));
@@ -1582,7 +1582,7 @@ static int apfs_node_free_list_alloc(struct apfs_node *node, u16 len, bool value
 			apfs_err(sb, "nloc out of bounds (%d-%d)", abs_off, (int)sizeof(*curr));
 			return -EFSCORRUPTED;
 		}
-		curr = (void *)node_raw + abs_off;
+		curr = (void *)((char *)node_raw + abs_off);
 
 		curr_len = le16_to_cpu(curr->len);
 		if (curr_len >= len) {
@@ -1816,12 +1816,12 @@ retry:
 	if (key) {
 		query->key_off = key_off;
 		query->key_len = key_len;
-		memcpy((void *)node_raw + key_off, key, key_len);
+		memcpy((void *)((char *)node_raw + key_off), key, key_len);
 	}
 	if (val) {
 		query->off = val_off;
 		query->len = val_len;
-		memcpy((void *)node_raw + val_off, val, val_len);
+		memcpy((void *)((char *)node_raw + val_off), val, val_len);
 	}
 
 	/* If the key or value were resized, update the table of contents */
@@ -1902,8 +1902,8 @@ retry:
 		new_free_base += inc;
 		if (new_free_base > node->val)
 			goto defrag;
-		memmove((void *)node_raw + new_key_base,
-			(void *)node_raw + node->key, node->free - node->key);
+		memmove((void *)((char *)node_raw + new_key_base),
+			(void *)((char *)node_raw + node->key), node->free - node->key);
 
 		node->key = new_key_base;
 		node->free = new_free_base;
@@ -1934,12 +1934,12 @@ retry:
 
 	query->key_len = key_len;
 	query->key_off = key_off;
-	memcpy((void *)node_raw + key_off, key, key_len);
+	memcpy((void *)((char *)node_raw + key_off), key, key_len);
 
 	query->len = val_len;
 	if (val) {
 		query->off = val_off;
-		memcpy((void *)node_raw + val_off, val, val_len);
+		memcpy((void *)((char *)node_raw + val_off), val, val_len);
 	} else {
 		query->off = 0;
 	}

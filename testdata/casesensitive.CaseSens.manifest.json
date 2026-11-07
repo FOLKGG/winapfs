@@ -1,0 +1,293 @@
+{
+ "volume_mountpoint": "/var/folders/s7/2rngkr054zj7_tp0s95y4cwr0000gn/T/winapfs-verify.2SenzpHM83/CaseSens",
+ "block_size": 4096,
+ "case_sensitive": true,
+ "entry_count": 12,
+ "entries": [
+  {
+   "path": "/",
+   "path_utf8_hex": "2e",
+   "type": "dir",
+   "inode": 2,
+   "nlink": 11,
+   "mode": "0o755",
+   "uid": 501,
+   "gid": 20,
+   "flags": 0,
+   "compressed": false,
+   "mtime_ns": 1794077449031554570,
+   "ctime_ns": 1794077449031554570,
+   "atime_ns": 1794077447801657019,
+   "birthtime": 1794077447.801657
+  },
+  {
+   "path": "/Dir",
+   "path_utf8_hex": "446972",
+   "type": "dir",
+   "inode": 19,
+   "nlink": 3,
+   "mode": "0o755",
+   "uid": 501,
+   "gid": 20,
+   "flags": 0,
+   "compressed": false,
+   "mtime_ns": 1794077449031256993,
+   "ctime_ns": 1794077449031256993,
+   "atime_ns": 1794077449031223202,
+   "birthtime": 1794077449.0312233,
+   "xattrs": {
+    "com.apple.provenance": {
+     "size": 11,
+     "sha256": "839037a1f97e5d8e13a258b59b1ad8612b4c6a3cf82690374e9b05d807f99cca"
+    }
+   }
+  },
+  {
+   "path": "/dir",
+   "path_utf8_hex": "646972",
+   "type": "dir",
+   "inode": 21,
+   "nlink": 3,
+   "mode": "0o755",
+   "uid": 501,
+   "gid": 20,
+   "flags": 0,
+   "compressed": false,
+   "mtime_ns": 1794077449031335283,
+   "ctime_ns": 1794077449031335283,
+   "atime_ns": 1794077449031302367,
+   "birthtime": 1794077449.0313025,
+   "xattrs": {
+    "com.apple.provenance": {
+     "size": 11,
+     "sha256": "839037a1f97e5d8e13a258b59b1ad8612b4c6a3cf82690374e9b05d807f99cca"
+    }
+   }
+  },
+  {
+   "path": "/README.txt",
+   "path_utf8_hex": "524541444d452e747874",
+   "type": "file",
+   "inode": 17,
+   "nlink": 1,
+   "mode": "0o644",
+   "uid": 501,
+   "gid": 20,
+   "flags": 0,
+   "compressed": false,
+   "mtime_ns": 1794077449031126912,
+   "ctime_ns": 1794077449031126912,
+   "atime_ns": 1794077449031095079,
+   "birthtime": 1794077449.031095,
+   "size": 6,
+   "allocated_bytes": 4096,
+   "sha256": "6b8e8d36d042ba2f6e1e8841725ee5caed3b5cf1bf6f1428e0ffb598b992a116",
+   "xattrs": {
+    "com.apple.provenance": {
+     "size": 11,
+     "sha256": "839037a1f97e5d8e13a258b59b1ad8612b4c6a3cf82690374e9b05d807f99cca"
+    }
+   }
+  },
+  {
+   "path": "/ReadMe.txt",
+   "path_utf8_hex": "526561644d652e747874",
+   "type": "file",
+   "inode": 18,
+   "nlink": 1,
+   "mode": "0o644",
+   "uid": 501,
+   "gid": 20,
+   "flags": 0,
+   "compressed": false,
+   "mtime_ns": 1794077449031193869,
+   "ctime_ns": 1794077449031193869,
+   "atime_ns": 1794077449031167119,
+   "birthtime": 1794077449.031167,
+   "size": 6,
+   "allocated_bytes": 4096,
+   "sha256": "2c90b72102b314026522c350f724187c559f7940e2c04c761a96600388b364f6",
+   "xattrs": {
+    "com.apple.provenance": {
+     "size": 11,
+     "sha256": "839037a1f97e5d8e13a258b59b1ad8612b4c6a3cf82690374e9b05d807f99cca"
+    }
+   }
+  },
+  {
+   "path": "/STRASSE.txt",
+   "path_utf8_hex": "535452415353452e747874",
+   "type": "file",
+   "inode": 26,
+   "nlink": 1,
+   "mode": "0o644",
+   "uid": 501,
+   "gid": 20,
+   "flags": 0,
+   "compressed": false,
+   "mtime_ns": 1794077449031578028,
+   "ctime_ns": 1794077449031578028,
+   "atime_ns": 1794077449031554153,
+   "birthtime": 1794077449.0315542,
+   "size": 3,
+   "allocated_bytes": 4096,
+   "sha256": "e55bcbf1a5c86b21f9464894142a3f12aa65fc3fbff755e3af046725a50d8f3e",
+   "xattrs": {
+    "com.apple.provenance": {
+     "size": 11,
+     "sha256": "839037a1f97e5d8e13a258b59b1ad8612b4c6a3cf82690374e9b05d807f99cca"
+    }
+   }
+  },
+  {
+   "path": "/readme.txt",
+   "path_utf8_hex": "726561646d652e747874",
+   "type": "file",
+   "inode": 16,
+   "nlink": 1,
+   "mode": "0o644",
+   "uid": 501,
+   "gid": 20,
+   "flags": 0,
+   "compressed": false,
+   "mtime_ns": 1794077449031043789,
+   "ctime_ns": 1794077449031043789,
+   "atime_ns": 1794077449030528841,
+   "birthtime": 1794077449.0305288,
+   "size": 6,
+   "allocated_bytes": 4096,
+   "sha256": "b908e4daaf9d57fe9cb551a689a35c9a9e0fac85fdf11faaa0a1ba0e5efc06fd",
+   "xattrs": {
+    "com.apple.provenance": {
+     "size": 11,
+     "sha256": "839037a1f97e5d8e13a258b59b1ad8612b4c6a3cf82690374e9b05d807f99cca"
+    }
+   }
+  },
+  {
+   "path": "/straße.txt",
+   "path_utf8_hex": "73747261c39f652e747874",
+   "type": "file",
+   "inode": 25,
+   "nlink": 1,
+   "mode": "0o644",
+   "uid": 501,
+   "gid": 20,
+   "flags": 0,
+   "compressed": false,
+   "mtime_ns": 1794077449031522904,
+   "ctime_ns": 1794077449031522904,
+   "atime_ns": 1794077449031494821,
+   "birthtime": 1794077449.0314949,
+   "size": 8,
+   "allocated_bytes": 4096,
+   "sha256": "06e741939c6f9590219cd7fb16a1c02df29379297fb8222aa8b8a5dbec7bf3d1",
+   "xattrs": {
+    "com.apple.provenance": {
+     "size": 11,
+     "sha256": "839037a1f97e5d8e13a258b59b1ad8612b4c6a3cf82690374e9b05d807f99cca"
+    }
+   }
+  },
+  {
+   "path": "/École.txt",
+   "path_utf8_hex": "c389636f6c652e747874",
+   "type": "file",
+   "inode": 23,
+   "nlink": 1,
+   "mode": "0o644",
+   "uid": 501,
+   "gid": 20,
+   "flags": 0,
+   "compressed": false,
+   "mtime_ns": 1794077449031415656,
+   "ctime_ns": 1794077449031415656,
+   "atime_ns": 1794077449031390073,
+   "birthtime": 1794077449.0313902,
+   "size": 16,
+   "allocated_bytes": 4096,
+   "sha256": "812ae11a4b212b3a68f606c5be64b09180e4352c6de7cfb0a7aec76d71cc72f3",
+   "xattrs": {
+    "com.apple.provenance": {
+     "size": 11,
+     "sha256": "839037a1f97e5d8e13a258b59b1ad8612b4c6a3cf82690374e9b05d807f99cca"
+    }
+   }
+  },
+  {
+   "path": "/école.txt",
+   "path_utf8_hex": "c3a9636f6c652e747874",
+   "type": "file",
+   "inode": 24,
+   "nlink": 1,
+   "mode": "0o644",
+   "uid": 501,
+   "gid": 20,
+   "flags": 0,
+   "compressed": false,
+   "mtime_ns": 1794077449031467447,
+   "ctime_ns": 1794077449031467447,
+   "atime_ns": 1794077449031444530,
+   "birthtime": 1794077449.0314445,
+   "size": 14,
+   "allocated_bytes": 4096,
+   "sha256": "760a0dea3c2958d1f42c497119a5fdc3e7c58de1c275363a30f9334c8508b3c9",
+   "xattrs": {
+    "com.apple.provenance": {
+     "size": 11,
+     "sha256": "839037a1f97e5d8e13a258b59b1ad8612b4c6a3cf82690374e9b05d807f99cca"
+    }
+   }
+  },
+  {
+   "path": "/Dir/a.txt",
+   "path_utf8_hex": "4469722f612e747874",
+   "type": "file",
+   "inode": 20,
+   "nlink": 1,
+   "mode": "0o644",
+   "uid": 501,
+   "gid": 20,
+   "flags": 0,
+   "compressed": false,
+   "mtime_ns": 1794077449031278034,
+   "ctime_ns": 1794077449031278034,
+   "atime_ns": 1794077449031256534,
+   "birthtime": 1794077449.0312564,
+   "size": 6,
+   "allocated_bytes": 4096,
+   "sha256": "82597520163b9440f324657e7921a1ac208c3c19674ca5f908682943fade2484",
+   "xattrs": {
+    "com.apple.provenance": {
+     "size": 11,
+     "sha256": "839037a1f97e5d8e13a258b59b1ad8612b4c6a3cf82690374e9b05d807f99cca"
+    }
+   }
+  },
+  {
+   "path": "/dir/a.txt",
+   "path_utf8_hex": "6469722f612e747874",
+   "type": "file",
+   "inode": 22,
+   "nlink": 1,
+   "mode": "0o644",
+   "uid": 501,
+   "gid": 20,
+   "flags": 0,
+   "compressed": false,
+   "mtime_ns": 1794077449031360615,
+   "ctime_ns": 1794077449031360615,
+   "atime_ns": 1794077449031334866,
+   "birthtime": 1794077449.0313349,
+   "size": 6,
+   "allocated_bytes": 4096,
+   "sha256": "9cb0b9af948edfed33af82c6d449b0aca3571689f961df211d70bab70ae7bc42",
+   "xattrs": {
+    "com.apple.provenance": {
+     "size": 11,
+     "sha256": "839037a1f97e5d8e13a258b59b1ad8612b4c6a3cf82690374e9b05d807f99cca"
+    }
+   }
+  }
+ ]
+}

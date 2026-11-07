@@ -136,9 +136,9 @@ int apfs_insert_xfield(u8 *buffer, int buflen, const struct apfs_x_field *xkey,
 			return 0;
 		curr_xval = buffer + buflen - rest;
 		rest -= max(padded_xlen, curr_xlen);
-		memmove(curr_xval + padded_xlen, curr_xval + curr_xlen, rest);
+		memmove((void *)((char *)curr_xval + padded_xlen), (void *)((char *)curr_xval + curr_xlen), rest);
 		memcpy(curr_xval, xval, xlen);
-		memset(curr_xval + xlen, 0, padded_xlen - xlen);
+		memset((void *)((char *)curr_xval + xlen), 0, padded_xlen - xlen);
 		used_data += padded_xlen - curr_xlen;
 
 		goto done;
@@ -158,7 +158,7 @@ int apfs_insert_xfield(u8 *buffer, int buflen, const struct apfs_x_field *xkey,
 		return 0;
 	curr_xval = buffer + buflen - rest;
 	memcpy(curr_xval, xval, xlen);
-	memset(curr_xval + xlen, 0, padded_xlen - xlen);
+	memset((void *)((char *)curr_xval + xlen), 0, padded_xlen - xlen);
 	used_data += padded_xlen;
 
 done:

@@ -1,0 +1,5 @@
+add_executable(winapfs-cli main.cpp)
+target_link_libraries(winapfs-cli PRIVATE winapfs_core)
+target_compile_options(winapfs-cli PRIVATE /W4 /wd4100)
+target_link_options(winapfs-cli PRIVATE /ENTRY:wmainCRTStartup)
+install(TARGETS winapfs-cli RUNTIME DESTINATION bin)

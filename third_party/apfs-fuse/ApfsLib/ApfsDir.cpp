@@ -163,6 +163,21 @@ ApfsDir::DirRec::DirRec(const ApfsDir::DirRec& o)
 	has_sibling_id = o.has_sibling_id;
 }
 
+// winapfs: declared upstream but never defined
+ApfsDir::XAttr::XAttr()
+{
+	flags = 0;
+	xdata_len = 0;
+	memset(&xstrm, 0, sizeof(xstrm));
+}
+
+ApfsDir::XAttr::XAttr(const ApfsDir::XAttr &o)
+{
+	flags = o.flags;
+	xdata_len = o.xdata_len;
+	xstrm = o.xstrm;
+}
+
 ApfsDir::ApfsDir(ApfsVolume &vol) :
 	m_vol(vol),
 	m_fs_tree(vol.fstree())
@@ -463,6 +478,21 @@ bool ApfsDir::LookupName(ApfsDir::DirRec& res, uint64_t parent_id, const char* n
 
 	const j_drec_val_t *v = reinterpret_cast<const j_drec_val_t *>(e.val);
 
+	// winapfs: report the stored name, which differs from the search name on
+	// case- or normalization-insensitive volumes.
+	if (m_txt_fmt & 9)
+	{
+		const j_drec_hashed_key_t *k = reinterpret_cast<const j_drec_hashed_key_t *>(e.key);
+		res.name.assign(reinterpret_cast<const char *>(k->name), strnlen(reinterpret_cast<const char *>(k->name), k->name_len_and_hash & J_DREC_LEN_MASK));
+		res.hash = k->name_len_and_hash;
+	}
+	else
+	{
+		const j_drec_key_t *k = reinterpret_cast<const j_drec_key_t *>(e.key);
+		res.name.assign(reinterpret_cast<const char *>(k->name), strnlen(reinterpret_cast<const char *>(k->name), k->name_len));
+	}
+	res.flags = v->flags;
+
 	res.file_id = v->file_id;
 	res.date_added = v->date_added;
 	// v->unk ?
@@ -492,6 +522,12 @@ bool ApfsDir::ReadFile(void* data, uint64_t inode, uint64_t offs, size_t size)
 
 	while (size > 0)
 	{
+		// winapfs: an offset not covered by any extent is a sparse hole (no
+		// extent record at all, e.g. a leading hole, or past the end of the
+		// preceding extent). Upstream returned false or underflowed cur_size
+		// there. Zero-fill up to the next block boundary and look again.
+		bool hole = false;
+
 		if (m_vol.isSealed()) {
 			fext_tree_key_t key;
 			const fext_tree_key_t *fext_key = nullptr;
@@ -525,26 +561,49 @@ bool ApfsDir::ReadFile(void* data, uint64_t inode, uint64_t offs, size_t size)
 			rc = m_fs_tree.Lookup(e, &key, sizeof(key), CompareStdDirKey, this, false);
 
 			if (!rc)
-				return false;
-
-			ext_key = reinterpret_cast<const j_file_extent_key_t *>(e.key);
-			ext_val = reinterpret_cast<const j_file_extent_val_t *>(e.val);
-
-			if (g_debug & Dbg_Dir)
 			{
-				std::cout << "FileExtent " << ext_key->hdr.obj_id_and_type << " " << ext_key->logical_addr << " => ";
-				std::cout << ext_val->len_and_flags << " " << ext_val->phys_block_num << " " << ext_val->crypto_id << std::endl;
+				hole = true;
 			}
+			else
+			{
+				ext_key = reinterpret_cast<const j_file_extent_key_t *>(e.key);
+				ext_val = reinterpret_cast<const j_file_extent_val_t *>(e.val);
 
-			if (ext_key->hdr.obj_id_and_type != key.hdr.obj_id_and_type)
-				return false;
+				if (g_debug & Dbg_Dir)
+				{
+					std::cout << "FileExtent " << ext_key->hdr.obj_id_and_type << " " << ext_key->logical_addr << " => ";
+					std::cout << ext_val->len_and_flags << " " << ext_val->phys_block_num << " " << ext_val->crypto_id << std::endl;
+				}
 
-			// Remove flags from length member
-			extent_offs = offs - ext_key->logical_addr;
+				if (ext_key->hdr.obj_id_and_type != key.hdr.obj_id_and_type)
+				{
+					hole = true;
+				}
+				else
+				{
+					// Remove flags from length member
+					extent_offs = offs - ext_key->logical_addr;
 
-			extent_size = ext_val->len_and_flags & J_FILE_EXTENT_LEN_MASK;
-			extent_paddr = ext_val->phys_block_num;
-			extent_crypto_id = ext_val->crypto_id;
+					extent_size = ext_val->len_and_flags & J_FILE_EXTENT_LEN_MASK;
+					extent_paddr = ext_val->phys_block_num;
+					extent_crypto_id = ext_val->crypto_id;
+				}
+			}
+		}
+
+		if (!hole && extent_offs >= extent_size)
+			hole = true;
+
+		if (hole)
+		{
+			cur_size = static_cast<size_t>(m_blksize - (offs & m_blksize_mask_lo));
+			if (cur_size > size)
+				cur_size = size;
+			memset(bdata, 0, cur_size);
+			bdata += cur_size;
+			offs += cur_size;
+			size -= cur_size;
+			continue;
 		}
 
 		blk_idx = extent_offs >> m_blksize_sh;

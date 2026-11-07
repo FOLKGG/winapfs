@@ -28,6 +28,15 @@
 #if defined(__linux__) || defined(__APPLE__)
 #include <termios.h>
 #endif
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+#endif
 #include <stdio.h>
 
 #include "Util.h"
@@ -416,6 +425,19 @@ bool GetPassword(std::string &pw)
 	/* Restore terminal. */
 	(void) tcsetattr (fileno (stream), TCSAFLUSH, &told);
 
+	std::cout << std::endl;
+
+	return true;
+#elif defined(_WIN32)
+	// winapfs: read without echo from the console
+	HANDLE hin = GetStdHandle(STD_INPUT_HANDLE);
+	DWORD mode = 0;
+	bool console = GetConsoleMode(hin, &mode) != 0;
+	if (console)
+		SetConsoleMode(hin, mode & ~ENABLE_ECHO_INPUT);
+	std::getline(std::cin, pw);
+	if (console)
+		SetConsoleMode(hin, mode);
 	std::cout << std::endl;
 
 	return true;
