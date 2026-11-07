@@ -1,6 +1,9 @@
 # winapfs — notes for working on this repo
 
-Read-only APFS driver for Windows. GPL-2.0-or-later (vendored apfs-fuse is GPL-2+).
+APFS driver for Windows (read-write in progress). Licence: the distributed
+whole is **GPL-2.0-only**, because linux-apfs-rw is GPL-2.0-only (apfs-fuse
+is GPL-2.0-or-later, apfsprogs GPLv2; zlib, bzip2, lzfse (BSD-3) and
+nlohmann/json (MIT) are permissive and compatible, keep their notices).
 C++17, MSVC (VS 2022 Build Tools), CMake ≥ 3.20, WinFsp 2.1 native API.
 
 ## Build and test
@@ -140,8 +143,15 @@ Read-write milestones (after M1–M3):
   - signing: WinFsp's kernel driver is already signed by its author, so
     winapfs needs no driver signing; the installer itself should be
     Authenticode-signed to avoid SmartScreen warnings (needs a certificate)
-  - licensing to check before shipping: WinFsp is GPLv3 with a FLOSS
-    exception; bundling it next to GPL-2.0-or-later winapfs
+  - licensing (checked 2026-11-07 against C:\Program Files (x86)\WinFsp\License.txt):
+    WinFsp is GPLv3 with a FLOSS exception that lets free software under any
+    FSF/OSI licence (GPL-2.0 qualifies) link winfsp-x64.dll and redistribute
+    the unmodified WinFsp installer, on condition that (a) winapfs shows
+    "WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos"
+    plus a link to github.com/winfsp/winfsp in its UI and user-facing docs
+    (TODO: --help/about box, README, installer), and (b) nothing proprietary
+    is linked or bundled with it. Source must be published (GPL); file
+    headers that say GPL-2.0-or-later can stay, the combination is GPL-2.0.
 
 ### W1 status: engine reads, not yet behind the mount
 
@@ -243,8 +253,45 @@ requires fsck to fail. Encrypted containers aren't checked: apfsck can't
 decrypt, so Secret's encrypted metadata fails checksums (presumably block
 0x324 is Secret's; W6). `winapfs-cli list -l --flags` shows BSD/internal flags.
 
-Next: W3 writes (apfsrw write API, WinFsp write callbacks, ReadOnlyVolume off
-with `--rw`), each write test ending in winapfs-fsck clean + ApfsLib re-read.
+### W3 status: engine writes done, mount write side next
+
+apfsrw write API (`src/kshim/apfsrw_write.c`, declared in `apfsrw.h`): create,
+mkdir, symlink, link, unlink, rmdir, rename (NOREPLACE), write, fsync,
+setattr (mode/uid/gid/size/atime/mtime; ctime = now). It plays the VFS:
+namespace ops take (dir, name) and build fresh dentries (never a cached node:
+hard links have several names, renames change them), hold a global namespace
+lock then the directory inode locks; write = generic_perform_write (page at a
+time through the driver's write_begin/write_end under the inode lock, after
+file_update_time); setattr fills times like notify_change. Rename refuses to
+move a directory into its own subtree (walks i_parent_id).
+
+`apfsrw-writetest <manifest> <src.img> <work.img> [vol]` copies an image,
+mirrors ~640 operations into a model built from the manifest (new files,
+misaligned writes, CoW of macOS-written files, appends, truncation both ways,
+mkdir, renames incl. replace and moving a full directory, 100 deletions in a
+multi-level catalog, chmod/mtime, symlink, hard link, 500 files in one dir,
+NFD and astral-plane names), unmounts, then walks the whole tree through
+ApfsLib and a fresh read-only linux-apfs-rw mount and compares every entry.
+CTest: `write.*` on basic (bare and GPT), casesensitive, multivol VolB, each
+followed by `write_fsck.*` and `write_fsck_crash.*` (-c). 72 tests pass.
+Debug knobs: `WRITETEST_TRACE=1` (print ops, validate heap after each),
+`WRITETEST_SKIP=mac,renames,links,many,gone,nfd`, `WRITETEST_NAMES=a|b`
+(%XX bytes); a crash prints a symbolized stack (DbgHelp). Debug builds route
+kmalloc & co. through `_malloc_dbg` with the driver's file/line.
+
+Shim bugs the write tests found (all fixed):
+1. buffers attached to a folio must hold a folio reference
+   (folio_attach_private); truncation/eviction only remove the folio from the
+   mapping and busy (in-transaction) buffers keep it alive. Freeing them with
+   the folio left dangling pointers on the transaction list (use-after-free
+   at commit; showed up as heap corruption on small-catalog volumes and as
+   the odd "exit 127" under Git Bash).
+2. closing the last handle to a block device must write back dirty buffers
+   (blkdev_put): the driver only marks the block-zero superblock copy dirty
+   at unmount, so "unmounted cleanly" was lost nondeterministically.
+3. __block_write_begin marks a new block dirty when the folio is uptodate.
+
+Next: WinFsp write callbacks and `--rw`, then the crash test.
 
 ## Milestones (read path)
 

@@ -6,7 +6,11 @@
  * kshim: printk, memory, strings, bitops, atomics, locks, time, crc32c,
  * zlib, utf8, mount-option parser, seq_file and other small primitives.
  */
+#define KSHIM_ALLOC_IMPL   /* this file defines kmalloc & co. */
 #include <kshim.h>
+#ifdef _DEBUG
+#include <crtdbg.h>
+#endif
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -156,6 +160,23 @@ void kshim_bug(const char *file, int line)
 }
 
 /* ------------------------------------------------------------ memory */
+
+#ifdef _DEBUG
+void *kshim_kmalloc_dbg(size_t size, gfp_t flags, const char *file, int line)
+{
+	void *p = _malloc_dbg(size ? size : 1, _NORMAL_BLOCK, file, line);
+	if (p && (flags & __GFP_ZERO))
+		memset(p, 0, size);
+	return p;
+}
+
+void *kshim_kcalloc_dbg(size_t n, size_t size, gfp_t flags, const char *file, int line)
+{
+	if (size && n > SIZE_MAX / size)
+		return NULL;
+	return _calloc_dbg(n ? n : 1, size ? size : 1, _NORMAL_BLOCK, file, line);
+}
+#endif
 
 void *kmalloc(size_t size, gfp_t flags)
 {

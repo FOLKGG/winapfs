@@ -109,6 +109,9 @@ void kshim_bdev_unregister(const char *name)
 	AcquireSRWLockExclusive(&g_bdev_lock);
 	b = lookup(name);
 	if (b && b->opens == 0) {
+		/* nothing dirty should be left after the last close; never drop it silently */
+		if (b->writable)
+			sync_blockdev(&b->bdev);
 		kshim_mapping_release_all(&b->mapping);
 		CloseHandle(b->h);
 		b->used = false;
@@ -204,12 +207,20 @@ struct block_device *file_bdev(struct file *f)
 	return f->kshim_bdev;
 }
 
+/*
+ * Like blkdev_put(): the last close writes back every dirty buffer and
+ * flushes. The driver relies on this for the final block-zero superblock
+ * copy (apfs_make_super_copy), which it only marks dirty.
+ */
 void bdev_fput(struct file *f)
 {
 	struct kshim_bdev *b = f->kshim_bdev->kshim_dev;
+	bool last;
 	AcquireSRWLockExclusive(&g_bdev_lock);
-	b->opens--;
+	last = --b->opens == 0;
 	ReleaseSRWLockExclusive(&g_bdev_lock);
+	if (last && b->writable)
+		sync_blockdev(&b->bdev);
 	free(f);
 }
 

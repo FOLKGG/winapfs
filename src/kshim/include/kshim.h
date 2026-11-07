@@ -304,6 +304,16 @@ void kfree(const void *p);
 char *kstrdup(const char *s, gfp_t flags);
 char *kstrndup(const char *s, size_t max, gfp_t flags);
 void *kmemdup(const void *src, size_t len, gfp_t flags);
+#if defined(_DEBUG) && !defined(KSHIM_ALLOC_IMPL)
+/* Debug builds: the CRT debug heap records the driver's allocation site, so
+ * an overrun report names the driver line that allocated the damaged block. */
+void *kshim_kmalloc_dbg(size_t size, gfp_t flags, const char *file, int line);
+void *kshim_kcalloc_dbg(size_t n, size_t size, gfp_t flags, const char *file, int line);
+#define kmalloc(s, f)		kshim_kmalloc_dbg((s), (f), __FILE__, __LINE__)
+#define kzalloc(s, f)		kshim_kcalloc_dbg(1, (s), (f), __FILE__, __LINE__)
+#define kcalloc(n, s, f)	kshim_kcalloc_dbg((n), (s), (f), __FILE__, __LINE__)
+#define kmalloc_array(n, s, f)	kshim_kcalloc_dbg((n), (s), (f), __FILE__, __LINE__)
+#endif
 #define kvmalloc(s, f)	kmalloc(s, f)
 #define kvzalloc(s, f)	kzalloc(s, f)
 #define kvcalloc(n, s, f)	kcalloc(n, s, f)

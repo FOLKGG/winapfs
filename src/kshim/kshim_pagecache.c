@@ -124,7 +124,19 @@ void kshim_mapping_init(struct address_space *m, struct inode *host)
 	ReleaseSRWLockExclusive(&g_mappings_lock);
 }
 
-static void free_buffers(struct folio *f)
+/*
+ * Folio lifetime, as in Linux: the mapping holds one reference, and a ring of
+ * buffer heads holds another (folio_attach_private takes it). Truncation and
+ * eviction only remove a folio from its mapping; buffers that are still busy
+ * (queued in a transaction, dirty, locked or referenced) keep it alive until
+ * try_to_free_buffers() releases them, typically after the commit that writes
+ * them. Freeing busy buffers with the folio left dangling pointers on the
+ * driver's transaction list.
+ */
+static bool buffers_idle(struct folio *f);
+
+/* Free the ring of buffer heads; no reference change. */
+static void free_buffer_ring(struct folio *f)
 {
 	struct buffer_head *head = folio_buffers(f), *bh, *next;
 	if (!head)
@@ -140,18 +152,39 @@ static void free_buffers(struct folio *f)
 
 static void folio_free(struct folio *f)
 {
-	free_buffers(f);
+	free_buffer_ring(f);   /* none left normally: buffers hold a reference */
 	_aligned_free(f->page.data);
 	free(f);
 	InterlockedDecrement(&g_nr_folios);
 }
 
-/* Remove a folio from its mapping (caller holds m->kshim_lock). */
+/* try_to_free_buffers(): release idle buffers and the reference they hold.
+ * The caller holds its own reference (or the mapping's). */
+static bool release_buffers(struct folio *f)
+{
+	if (!folio_buffers(f))
+		return true;
+	if (!buffers_idle(f))
+		return false;
+	free_buffer_ring(f);
+	folio_put(f);
+	return true;
+}
+
+/* References a folio may have when nothing but the cache is using it. */
+static long idle_refs(struct folio *f)
+{
+	return folio_buffers(f) ? 2 : 1;
+}
+
+/* Remove a folio from its mapping and drop the mapping's reference; busy
+ * buffers keep it alive (caller holds m->kshim_lock). */
 static void folio_detach(struct address_space *m, struct folio *f)
 {
 	pmap_remove(m->kshim_pages, f);
 	m->nrpages--;
 	f->page.mapping = NULL;
+	release_buffers(f);
 	if (atomic_dec_and_test(&f->page.refcount))
 		folio_free(f);
 }
@@ -204,7 +237,7 @@ static long drop_clean(struct address_space *m, long want)
 		struct folio *f = pm->slots[i];
 		if (!f || f == TOMBSTONE)
 			continue;
-		if (atomic_read(&f->page.refcount) != 1 || folio_test_dirty(f) || folio_test_locked(f) || !buffers_idle(f))
+		if (atomic_read(&f->page.refcount) != idle_refs(f) || folio_test_dirty(f) || folio_test_locked(f) || !buffers_idle(f))
 			continue;
 		folio_detach(m, f);
 		dropped++;
@@ -412,6 +445,7 @@ struct buffer_head *folio_create_empty_buffers(struct folio *f, unsigned long bl
 	}
 	tail->b_this_page = head;
 	f->page.private = head;
+	folio_get(f);   /* folio_attach_private(): the buffers pin the folio */
 	return head;
 }
 
@@ -422,12 +456,7 @@ struct buffer_head *create_empty_buffers(struct folio *f, unsigned long blocksiz
 
 bool try_to_free_buffers(struct folio *f)
 {
-	if (!folio_buffers(f))
-		return true;
-	if (!buffers_idle(f))
-		return false;
-	free_buffers(f);
-	return true;
+	return release_buffers(f);
 }
 
 /* Block-device buffer for (block, size); the folio stays in bd_mapping. */
@@ -449,12 +478,11 @@ static struct buffer_head *bdev_buffer(struct block_device *bdev, sector_t block
 	head = folio_buffers(f);
 	if (head && head->b_size != size) {
 		/* re-slice the page with a new block size (only before first use) */
-		if (!buffers_idle(f)) {
+		if (!release_buffers(f)) {
 			folio_unlock(f);
 			folio_put(f);
 			return NULL;
 		}
-		free_buffers(f);
 		head = NULL;
 	}
 	if (!head) {
@@ -695,7 +723,7 @@ void clean_bdev_aliases(struct block_device *bdev, sector_t block, sector_t len)
 		struct folio *f;
 		mutex_lock(&m->kshim_lock);
 		f = pmap_get(m->kshim_pages, index);
-		if (f && atomic_read(&f->page.refcount) == 1 && !folio_test_locked(f) && buffers_idle(f))
+		if (f && atomic_read(&f->page.refcount) == idle_refs(f) && !folio_test_locked(f) && buffers_idle(f))
 			folio_detach(m, f);
 		mutex_unlock(&m->kshim_lock);
 	}
@@ -832,7 +860,11 @@ void truncate_inode_pages(struct address_space *m, loff_t start)
 	for (i = 0; i < pm->cap; i++) {
 		struct folio *f = pm->slots[i];
 		if (f && f != TOMBSTONE && f->page.index >= first) {
-			free_buffers(f);
+			/*
+			 * The driver's ->invalidate_folio is a no-op: buffers already
+			 * in a transaction are written by its commit, so they must
+			 * survive here (folio_detach keeps busy buffers alive).
+			 */
 			folio_clear_dirty(f);
 			folio_detach(m, f);
 		}
@@ -981,6 +1013,7 @@ int __block_write_begin(struct folio *f, loff_t pos, unsigned len, get_block_t *
 				if (folio_test_uptodate(f)) {
 					clear_buffer_new(bh);
 					set_buffer_uptodate(bh);
+					mark_buffer_dirty(bh);   /* as fs/buffer.c does */
 					continue;
 				}
 				/* fresh block: zero what this write doesn't cover */

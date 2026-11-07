@@ -102,6 +102,43 @@ int apfsrw_readlink(apfsrw_node *n, char *buf, size_t size);
 long apfsrw_listxattr(apfsrw_node *n, char *buf, size_t size);
 long apfsrw_getxattr(apfsrw_node *n, const char *name, void *buf, size_t size);
 
+/* ------------------------------------------------------------ writing
+ * Only on a mount made with readwrite=true. Namespace operations take the
+ * parent directory and a name (never a cached node: hard links have several
+ * names, and a rename changes them). The driver runs each operation in its
+ * own transaction and commits in the background; apfsrw_sync() or unmount
+ * makes everything durable.
+ */
+int apfsrw_create(apfsrw_node *dir, const char *name, size_t len, uint32_t mode, apfsrw_node **out);	/* -EEXIST */
+int apfsrw_mkdir(apfsrw_node *dir, const char *name, size_t len, uint32_t mode, apfsrw_node **out);
+int apfsrw_symlink(apfsrw_node *dir, const char *name, size_t len, const char *target, apfsrw_node **out);
+int apfsrw_link(apfsrw_node *src, apfsrw_node *dir, const char *name, size_t len, apfsrw_node **out);
+int apfsrw_unlink(apfsrw_node *dir, const char *name, size_t len);
+int apfsrw_rmdir(apfsrw_node *dir, const char *name, size_t len);	/* -ENOTEMPTY */
+#define APFSRW_RENAME_NOREPLACE	1
+int apfsrw_rename(apfsrw_node *olddir, const char *oldname, size_t oldlen,
+		  apfsrw_node *newdir, const char *newname, size_t newlen, unsigned flags);
+
+/* Writes len bytes at off (extending the file as needed). */
+int apfsrw_write(apfsrw_file *f, uint64_t off, const void *buf, size_t len, size_t *written);
+int apfsrw_fsync(apfsrw_file *f);
+
+#define APFSRW_SET_MODE		0x01
+#define APFSRW_SET_UID		0x02
+#define APFSRW_SET_GID		0x04
+#define APFSRW_SET_SIZE		0x08
+#define APFSRW_SET_ATIME	0x10
+#define APFSRW_SET_MTIME	0x20
+typedef struct apfsrw_setattr_t {
+	uint32_t mask;
+	uint32_t mode;          /* permission bits only */
+	uint32_t uid, gid;
+	uint64_t size;
+	int64_t atime_ns, mtime_ns;
+} apfsrw_setattr_t;
+/* ctime is always set to now, as the Linux VFS does. */
+int apfsrw_setattr(apfsrw_node *n, const apfsrw_setattr_t *a);
+
 #ifdef __cplusplus
 }
 #endif

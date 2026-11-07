@@ -7,10 +7,7 @@
  * of the Linux VFS for one system call: it takes the locks the VFS would
  * take and calls the driver's operation tables.
  */
-#include <kshim.h>
-#include "kshim_internal.h"
-#include <apfsrw.h>
-#include "apfs.h"   /* driver internals: APFS_I() */
+#include "apfsrw_internal.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -21,7 +18,6 @@ int kshim_module_init(void);
 int kshim_bdev_register(const wchar_t *path, u64 offset, u64 size, bool writable, char *name, size_t name_size);
 void kshim_bdev_unregister(const char *name);
 struct file_system_type *kshim_get_fs_type(const char *name);
-struct dentry *kshim_d_alloc(struct dentry *parent, const char *name, size_t len);
 void kshim_deactivate_super(struct super_block *sb);
 void kshim_set_log_sink(void (*sink)(int level, const char *msg));
 
@@ -30,10 +26,6 @@ struct apfsrw_mount {
 	struct super_block *sb;
 	char devname[32];
 	bool readwrite;
-};
-
-struct apfsrw_file {
-	struct file f;
 };
 
 static INIT_ONCE g_init_once = INIT_ONCE_STATIC_INIT;
@@ -49,9 +41,6 @@ void apfsrw_set_log(apfsrw_log_fn fn)
 {
 	kshim_set_log_sink(fn);
 }
-
-static struct dentry *D(apfsrw_node *n) { return (struct dentry *)n; }
-static apfsrw_node *N(struct dentry *d) { return (apfsrw_node *)d; }
 
 int apfsrw_mount_volume(const wchar_t *path, uint64_t offset, uint64_t size, unsigned vol_index, bool readwrite,
 			const char *snapshot, apfsrw_mount **out)

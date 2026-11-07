@@ -165,3 +165,23 @@ foreach(mode omap-flip omap-misdirect)
 	add_test(NAME fsck_detects.${mode} COMMAND winapfs-fsck ${CMAKE_CURRENT_BINARY_DIR}/corrupt-${mode}.img)
 	set_tests_properties(fsck_detects.${mode} PROPERTIES WILL_FAIL TRUE FIXTURES_REQUIRED corrupt-${mode})
 endforeach()
+
+# W3: writes with the linux-apfs-rw engine on image copies, read back through
+# both engines and checked with winapfs-fsck.
+add_executable(apfsrw-writetest writetest.cpp)
+target_link_libraries(apfsrw-writetest PRIVATE winapfs_core apfsrw bcrypt dbghelp)
+target_include_directories(apfsrw-writetest PRIVATE ${TP})
+target_link_options(apfsrw-writetest PRIVATE /ENTRY:wmainCRTStartup)
+foreach(v "basic.container.img|basic|Basic" "basic.img|basic|Basic" "casesensitive.img|casesensitive|CaseSens" "multivol.img|multivol|VolB")
+	string(REPLACE "|" ";" f "${v}")
+	list(GET f 0 img)
+	list(GET f 1 prefix)
+	list(GET f 2 vol)
+	set(work ${CMAKE_CURRENT_BINARY_DIR}/w3-${img})
+	add_test(NAME write.${img}.${vol}
+		COMMAND apfsrw-writetest ${TD}/${prefix}.${vol}.manifest.json ${TD}/${img} ${work} ${vol})
+	set_tests_properties(write.${img}.${vol} PROPERTIES FIXTURES_SETUP w3-${img})
+	add_test(NAME write_fsck.${img} COMMAND winapfs-fsck ${work})
+	add_test(NAME write_fsck_crash.${img} COMMAND winapfs-fsck -c ${work})
+	set_tests_properties(write_fsck.${img} write_fsck_crash.${img} PROPERTIES FIXTURES_REQUIRED w3-${img})
+endforeach()
