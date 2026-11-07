@@ -182,6 +182,21 @@ public:
 	virtual bool ReadXattr(uint64_t inode, const std::string &name, uint64_t off, void *buf, size_t len, size_t &got) = 0;
 	virtual bool ReadLink(uint64_t inode, std::string &target) = 0;
 
+	// ---- writing (linux-apfs-rw volumes mounted read-write). Every call
+	// returns 0 or a negative errno; read-only volumes return -EROFS.
+	virtual bool Writable() const { return false; }
+	virtual int Create(uint64_t parent, const std::string &name, bool dir, uint32_t mode, DirEntry &out) { return -30; }
+	// Removes one name; the inode is freed when its last name and use go.
+	virtual int Remove(uint64_t parent, const std::string &name, bool dir) { return -30; }
+	virtual int Rename(uint64_t old_parent, const std::string &old_name, uint64_t new_parent, const std::string &new_name, bool replace) { return -30; }
+	virtual int Write(uint64_t inode, uint64_t off, const void *buf, size_t len, size_t &written) { return -30; }
+	virtual int SetSize(uint64_t inode, uint64_t size) { return -30; }
+	// INT64_MIN leaves a time unchanged; ctime becomes now.
+	virtual int SetTimes(uint64_t inode, int64_t atime_ns, int64_t mtime_ns) { return -30; }
+	virtual int SetMode(uint64_t inode, uint32_t mode) { return -30; }
+	// Makes everything written so far durable (a transaction commit).
+	virtual int Sync() { return -30; }
+
 protected:
 	explicit Volume(const VolumeInfo &info) : m_info(info) {}
 	VolumeInfo m_info;

@@ -159,13 +159,147 @@ static int io(struct block_device *bdev, bool write, u64 off, void *buf, size_t 
 	return 0;
 }
 
+/* ------------------------------------------------ crash simulation (tests) */
+
+struct pending_write {
+	struct block_device *bdev;
+	u64 off;
+	size_t len;
+	u8 *data;
+};
+
+static struct {
+	int how;			/* 0 = off, else APFSRW_CRASH_* */
+	u64 at;
+	u32 rng;
+	u64 writes;
+	struct pending_write *pend;	/* APFSRW_CRASH_POWER: writes since the last flush */
+	size_t npend, cap;
+	SRWLOCK lock;
+} g_crash = { .lock = SRWLOCK_INIT };
+
+#define CRASH_COUNT	1
+#define CRASH_KILL	2
+#define CRASH_POWER	3
+#define CRASH_NOBARRIER	4	/* like POWER on a disk that ignores flushes: must corrupt */
+#define HOLDS_WRITES(h)	((h) >= CRASH_POWER)
+
+void apfsrw_test_crash(int how, u64 at, u32 seed)
+{
+	AcquireSRWLockExclusive(&g_crash.lock);
+	g_crash.how = how;
+	g_crash.at = at;
+	g_crash.rng = seed * 2654435761u | 1;
+	g_crash.writes = 0;
+	ReleaseSRWLockExclusive(&g_crash.lock);
+}
+
+u64 apfsrw_test_writes(void)
+{
+	u64 n;
+	AcquireSRWLockShared(&g_crash.lock);
+	n = g_crash.writes;
+	ReleaseSRWLockShared(&g_crash.lock);
+	return n;
+}
+
+static u32 crash_rand(void)
+{
+	u32 x = g_crash.rng;
+	x ^= x << 13;
+	x ^= x >> 17;
+	x ^= x << 5;
+	return g_crash.rng = x;
+}
+
+/* Lock held. Writes pending entries of bdev (all of them, or a random subset) and drops them. */
+static void crash_apply(struct block_device *bdev, bool subset)
+{
+	size_t i, keep = 0;
+	for (i = 0; i < g_crash.npend; i++) {
+		struct pending_write *p = &g_crash.pend[i];
+		if (bdev && p->bdev != bdev) {
+			g_crash.pend[keep++] = *p;
+			continue;
+		}
+		if (!subset || (crash_rand() & 1))
+			io(p->bdev, true, p->off, p->data, p->len);
+		free(p->data);
+	}
+	g_crash.npend = keep;
+}
+
+static int crash_write(struct block_device *bdev, u64 off, const void *buf, size_t len)
+{
+	struct kshim_bdev *b = bdev->kshim_dev;
+	int err = 0;
+
+	AcquireSRWLockExclusive(&g_crash.lock);
+	if (++g_crash.writes == g_crash.at && g_crash.how != CRASH_COUNT) {
+		if (HOLDS_WRITES(g_crash.how))
+			crash_apply(NULL, true);
+		fflush(NULL);
+		TerminateProcess(GetCurrentProcess(), 99);
+	}
+	if (!HOLDS_WRITES(g_crash.how)) {
+		err = io(bdev, true, off, (void *)buf, len);
+	} else if (!b->writable) {
+		err = -EROFS;
+	} else if (off > b->size || len > b->size - off) {
+		err = -EIO;
+	} else {
+		struct pending_write p = { bdev, off, len, malloc(len) };
+		if (g_crash.npend == g_crash.cap) {
+			size_t cap = g_crash.cap ? g_crash.cap * 2 : 1024;
+			void *n = realloc(g_crash.pend, cap * sizeof(*g_crash.pend));
+			if (!n)
+				abort();
+			g_crash.pend = n;
+			g_crash.cap = cap;
+		}
+		if (!p.data)
+			abort();
+		memcpy(p.data, buf, len);
+		g_crash.pend[g_crash.npend++] = p;
+	}
+	ReleaseSRWLockExclusive(&g_crash.lock);
+	return err;
+}
+
+/*
+ * Reads see the held-back writes (in order, so the newest wins). The lock is
+ * held across the device read so that a flush can't apply and drop an entry
+ * in between.
+ */
+static int crash_read(struct block_device *bdev, u64 off, u8 *buf, size_t len)
+{
+	size_t i;
+	int err;
+	AcquireSRWLockShared(&g_crash.lock);
+	err = io(bdev, false, off, buf, len);
+	for (i = 0; !err && i < g_crash.npend; i++) {
+		struct pending_write *p = &g_crash.pend[i];
+		u64 s = max(off, p->off), e = min(off + len, p->off + p->len);
+		if (p->bdev == bdev && s < e)
+			memcpy(buf + (s - off), p->data + (s - p->off), (size_t)(e - s));
+	}
+	ReleaseSRWLockShared(&g_crash.lock);
+	return err;
+}
+
+/* ------------------------------------------------------------ device I/O */
+
 int kshim_bdev_read(struct block_device *bdev, u64 off, void *buf, size_t len)
 {
+	if (HOLDS_WRITES(g_crash.how))
+		return crash_read(bdev, off, buf, len);
 	return io(bdev, false, off, buf, len);
 }
 
 int kshim_bdev_write(struct block_device *bdev, u64 off, const void *buf, size_t len)
 {
+	if (g_crash.how)
+		return crash_write(bdev, off, buf, len);
 	return io(bdev, true, off, (void *)buf, len);
 }
 
@@ -175,6 +309,11 @@ int kshim_bdev_flush(struct block_device *bdev)
 	struct kshim_bdev *b = bdev->kshim_dev;
 	if (!b->writable)
 		return 0;
+	if (g_crash.how == CRASH_POWER) {
+		AcquireSRWLockExclusive(&g_crash.lock);
+		crash_apply(bdev, false);
+		ReleaseSRWLockExclusive(&g_crash.lock);
+	}
 	return FlushFileBuffers(b->h) ? 0 : -EIO;
 }
 

@@ -16,6 +16,7 @@
 
 #include <apfsrw.h>
 #include <winapfs/Apfs.h>
+#include <winapfs/Names.h>
 
 #include <nlohmann/json.hpp>
 
@@ -45,6 +46,7 @@ struct Expect
 	std::string sha256;
 	std::string target;
 	int mode = -1;            // permission bits to check, -1 = don't
+	int orig_mode = -1;       // mode before the test touched it (manifest or 0644 for new files)
 	int64_t mtime_ns = INT64_MIN;
 };
 
@@ -105,9 +107,33 @@ bool Skipped(const std::string &path)
 std::string Parent(const std::string &p) { size_t s = p.rfind('/'); return s == 0 ? "/" : p.substr(0, s); }
 std::string Base(const std::string &p) { return p.substr(p.rfind('/') + 1); }
 
-// ---------------------------------------------------------------- engine helpers
+// ---------------------------------------------------------------- backends
+//
+// The same operations run either directly on the engine (apfsrw API) or
+// through a mounted drive with plain Win32 file APIs, the way any Windows
+// program writes. Each returns false on failure (and reports it).
 
-struct Rw
+struct Backend
+{
+	virtual ~Backend() = default;
+	virtual std::vector<uint8_t> ReadAll(const std::string &path) = 0;
+	// Writes data at off in chunks of `chunk` bytes (exercises partial pages).
+	virtual bool Write(const std::string &path, uint64_t off, const std::vector<uint8_t> &data, size_t chunk) = 0;
+	virtual bool Create(const std::string &path) = 0;
+	virtual bool Mkdir(const std::string &path) = 0;
+	virtual bool Rename(const std::string &from, const std::string &to) = 0;
+	virtual bool Remove(const std::string &path, bool dir) = 0;
+	virtual bool SetSize(const std::string &path, uint64_t size) = 0;
+	virtual bool SetMtime(const std::string &path, int64_t ns) = 0;
+	// Permission bits; the Win32 backend can only toggle "read-only"
+	virtual bool SetMode(const std::string &path, int mode) = 0;
+	virtual bool CanChmod() const = 0;
+	virtual bool Symlink(const std::string &path, const std::string &target) = 0;
+	virtual bool Link(const std::string &existing, const std::string &path) = 0;
+	virtual bool CanLink() const = 0;
+};
+
+struct RwBackend : Backend
 {
 	apfsrw_mount *m = nullptr;
 
@@ -132,7 +158,7 @@ struct Rw
 		return cur;
 	}
 
-	std::vector<uint8_t> ReadAll(const std::string &path)
+	std::vector<uint8_t> ReadAll(const std::string &path) override
 	{
 		std::vector<uint8_t> out;
 		apfsrw_node *n = Walk(path);
@@ -155,30 +181,282 @@ struct Rw
 		return out;
 	}
 
-	// Writes data at off in chunks of `chunk` bytes (exercises partial pages).
-	void Write(const std::string &path, uint64_t off, const std::vector<uint8_t> &data, size_t chunk)
+	bool Write(const std::string &path, uint64_t off, const std::vector<uint8_t> &data, size_t chunk) override
 	{
 		apfsrw_node *n = Walk(path);
 		apfsrw_file *f = nullptr;
 		CHECK(n && apfsrw_open(n, true, &f) == 0, "open for write %s", path.c_str());
 		if (!f)
-			return;
+		{
+			if (n)
+				apfsrw_put(n);
+			return false;
+		}
 		size_t done = 0;
+		bool ok = true;
 		while (done < data.size())
 		{
 			size_t len = std::min(chunk, data.size() - done), w = 0;
 			int err = apfsrw_write(f, off + done, data.data() + done, len, &w);
 			CHECK(err == 0 && w == len, "write %s at %llu: err %d wrote %zu", path.c_str(), (unsigned long long)(off + done), err, w);
 			if (err || !w)
+			{
+				ok = false;
 				break;
+			}
 			done += w;
 		}
 		apfsrw_release(f);
 		apfsrw_put(n);
+		return ok;
 	}
+
+	template <typename F> bool InParent(const std::string &path, const char *what, F fn)
+	{
+		apfsrw_node *dir = Walk(Parent(path));
+		std::string name = Base(path);
+		int err = dir ? fn(dir, name) : -2;
+		CHECK(err == 0, "%s %s: %d", what, path.c_str(), err);
+		if (dir)
+			apfsrw_put(dir);
+		return err == 0;
+	}
+
+	bool Create(const std::string &path) override
+	{
+		return InParent(path, "create", [](apfsrw_node *d, const std::string &n) { return apfsrw_create(d, n.data(), n.size(), 0644, nullptr); });
+	}
+
+	bool Mkdir(const std::string &path) override
+	{
+		return InParent(path, "mkdir", [](apfsrw_node *d, const std::string &n) { return apfsrw_mkdir(d, n.data(), n.size(), 0755, nullptr); });
+	}
+
+	bool Remove(const std::string &path, bool dir) override
+	{
+		return InParent(path, dir ? "rmdir" : "unlink", [dir](apfsrw_node *d, const std::string &n) {
+			return dir ? apfsrw_rmdir(d, n.data(), n.size()) : apfsrw_unlink(d, n.data(), n.size());
+		});
+	}
+
+	bool Symlink(const std::string &path, const std::string &target) override
+	{
+		return InParent(path, "symlink", [&](apfsrw_node *d, const std::string &n) { return apfsrw_symlink(d, n.data(), n.size(), target.c_str(), nullptr); });
+	}
+
+	bool Rename(const std::string &from, const std::string &to) override
+	{
+		apfsrw_node *od = Walk(Parent(from)), *nd = Walk(Parent(to));
+		std::string on = Base(from), nn = Base(to);
+		int err = (od && nd) ? apfsrw_rename(od, on.data(), on.size(), nd, nn.data(), nn.size(), 0) : -2;
+		CHECK(err == 0, "rename %s -> %s: %d", from.c_str(), to.c_str(), err);
+		if (od)
+			apfsrw_put(od);
+		if (nd)
+			apfsrw_put(nd);
+		return err == 0;
+	}
+
+	bool Link(const std::string &existing, const std::string &path) override
+	{
+		apfsrw_node *src = Walk(existing);
+		bool ok = src && InParent(path, "link", [src](apfsrw_node *d, const std::string &n) { return apfsrw_link(src, d, n.data(), n.size(), nullptr); });
+		if (src)
+			apfsrw_put(src);
+		return ok;
+	}
+
+	bool Setattr(const std::string &path, const apfsrw_setattr_t &a, const char *what)
+	{
+		apfsrw_node *n = Walk(path);
+		int err = n ? apfsrw_setattr(n, &a) : -2;
+		CHECK(err == 0, "%s %s: %d", what, path.c_str(), err);
+		if (n)
+			apfsrw_put(n);
+		return err == 0;
+	}
+
+	bool SetSize(const std::string &path, uint64_t size) override
+	{
+		apfsrw_setattr_t a = {};
+		a.mask = APFSRW_SET_SIZE;
+		a.size = size;
+		return Setattr(path, a, "truncate");
+	}
+
+	bool SetMtime(const std::string &path, int64_t ns) override
+	{
+		apfsrw_setattr_t a = {};
+		a.mask = APFSRW_SET_MTIME;
+		a.mtime_ns = ns;
+		return Setattr(path, a, "set mtime");
+	}
+
+	bool SetMode(const std::string &path, int mode) override
+	{
+		apfsrw_setattr_t a = {};
+		a.mask = APFSRW_SET_MODE;
+		a.mode = static_cast<uint32_t>(mode);
+		return Setattr(path, a, "chmod");
+	}
+
+	bool CanChmod() const override { return true; }
+	bool CanLink() const override { return true; }
 };
 
-Rw g_rw;
+struct Win32Backend : Backend
+{
+	std::wstring root;   // \\?\X:
+
+	std::wstring Win(const std::string &path)
+	{
+		std::wstring w = root;
+		size_t pos = 1;
+		while (pos < path.size())
+		{
+			size_t next = path.find('/', pos);
+			if (next == std::string::npos)
+				next = path.size();
+			w += L"\\" + ApfsNameToWindows(path.substr(pos, next - pos));
+			pos = next + 1;
+		}
+		return w;
+	}
+
+	HANDLE Open(const std::string &path, DWORD access, DWORD disposition, DWORD flags = 0)
+	{
+		HANDLE h = CreateFileW(Win(path).c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, disposition,
+			flags, nullptr);
+		CHECK(h != INVALID_HANDLE_VALUE, "CreateFile %s: error %lu", path.c_str(), GetLastError());
+		return h;
+	}
+
+	std::vector<uint8_t> ReadAll(const std::string &path) override
+	{
+		std::vector<uint8_t> out;
+		HANDLE h = Open(path, GENERIC_READ, OPEN_EXISTING);
+		if (h == INVALID_HANDLE_VALUE)
+			return out;
+		LARGE_INTEGER size;
+		GetFileSizeEx(h, &size);
+		out.resize(static_cast<size_t>(size.QuadPart));
+		size_t off = 0;
+		while (off < out.size())
+		{
+			DWORD got = 0;
+			if (!ReadFile(h, out.data() + off, static_cast<DWORD>(std::min<size_t>(out.size() - off, 1 << 20)), &got, nullptr) || !got)
+				break;
+			off += got;
+		}
+		CHECK(off == out.size(), "short read of %s", path.c_str());
+		CloseHandle(h);
+		return out;
+	}
+
+	bool Write(const std::string &path, uint64_t off, const std::vector<uint8_t> &data, size_t chunk) override
+	{
+		HANDLE h = Open(path, GENERIC_WRITE, OPEN_EXISTING);
+		if (h == INVALID_HANDLE_VALUE)
+			return false;
+		size_t done = 0;
+		bool ok = true;
+		while (done < data.size())
+		{
+			DWORD len = static_cast<DWORD>(std::min(chunk, data.size() - done)), w = 0;
+			OVERLAPPED ov = {};
+			ov.Offset = static_cast<DWORD>(off + done);
+			ov.OffsetHigh = static_cast<DWORD>((off + done) >> 32);
+			if (!WriteFile(h, data.data() + done, len, &w, &ov) || w != len)
+			{
+				CHECK(false, "WriteFile %s at %llu: error %lu", path.c_str(), (unsigned long long)(off + done), GetLastError());
+				ok = false;
+				break;
+			}
+			done += w;
+		}
+		CloseHandle(h);
+		return ok;
+	}
+
+	bool Create(const std::string &path) override
+	{
+		HANDLE h = Open(path, GENERIC_WRITE, CREATE_NEW);
+		if (h == INVALID_HANDLE_VALUE)
+			return false;
+		CloseHandle(h);
+		return true;
+	}
+
+	bool Mkdir(const std::string &path) override
+	{
+		bool ok = CreateDirectoryW(Win(path).c_str(), nullptr) != 0;
+		CHECK(ok, "CreateDirectory %s: error %lu", path.c_str(), GetLastError());
+		return ok;
+	}
+
+	bool Rename(const std::string &from, const std::string &to) override
+	{
+		bool ok = MoveFileExW(Win(from).c_str(), Win(to).c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+		CHECK(ok, "MoveFileEx %s -> %s: error %lu", from.c_str(), to.c_str(), GetLastError());
+		return ok;
+	}
+
+	bool Remove(const std::string &path, bool dir) override
+	{
+		bool ok = dir ? RemoveDirectoryW(Win(path).c_str()) != 0 : DeleteFileW(Win(path).c_str()) != 0;
+		CHECK(ok, "%s %s: error %lu", dir ? "RemoveDirectory" : "DeleteFile", path.c_str(), GetLastError());
+		return ok;
+	}
+
+	bool SetSize(const std::string &path, uint64_t size) override
+	{
+		HANDLE h = Open(path, GENERIC_WRITE, OPEN_EXISTING);
+		if (h == INVALID_HANDLE_VALUE)
+			return false;
+		FILE_END_OF_FILE_INFO eof;
+		eof.EndOfFile.QuadPart = static_cast<LONGLONG>(size);
+		bool ok = SetFileInformationByHandle(h, FileEndOfFileInfo, &eof, sizeof(eof)) != 0;
+		CHECK(ok, "set size %s: error %lu", path.c_str(), GetLastError());
+		CloseHandle(h);
+		return ok;
+	}
+
+	bool SetMtime(const std::string &path, int64_t ns) override
+	{
+		HANDLE h = Open(path, FILE_WRITE_ATTRIBUTES, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS);
+		if (h == INVALID_HANDLE_VALUE)
+			return false;
+		ULARGE_INTEGER u;
+		u.QuadPart = static_cast<ULONGLONG>(ns / 100 + 116444736000000000LL);
+		FILETIME ft = { u.LowPart, u.HighPart };
+		bool ok = SetFileTime(h, nullptr, nullptr, &ft) != 0;
+		CHECK(ok, "SetFileTime %s: error %lu", path.c_str(), GetLastError());
+		CloseHandle(h);
+		return ok;
+	}
+
+	// only the read-only attribute: no write bits -> read-only
+	bool SetMode(const std::string &path, int mode) override
+	{
+		DWORD attrs = GetFileAttributesW(Win(path).c_str());
+		if (attrs == INVALID_FILE_ATTRIBUTES)
+			return false;
+		attrs = (mode & 0222) ? (attrs & ~FILE_ATTRIBUTE_READONLY) : (attrs | FILE_ATTRIBUTE_READONLY);
+		if (!attrs)
+			attrs = FILE_ATTRIBUTE_NORMAL;
+		bool ok = SetFileAttributesW(Win(path).c_str(), attrs) != 0;
+		CHECK(ok, "SetFileAttributes %s: error %lu", path.c_str(), GetLastError());
+		return ok;
+	}
+
+	bool CanChmod() const override { return false; }
+	// symlinks and hard links through the drive come with milestone W4
+	bool Symlink(const std::string &, const std::string &) override { return false; }
+	bool Link(const std::string &, const std::string &) override { return false; }
+	bool CanLink() const override { return false; }
+};
+
+Backend *g_be = nullptr;
 
 // WRITETEST_TRACE=1: print each operation and validate the heap after it
 bool g_trace = getenv("WRITETEST_TRACE") != nullptr;
@@ -211,7 +489,9 @@ struct TraceOp
 	}
 };
 
-// model updates mirror every operation
+// ---------------------------------------------------------------- operations
+// Each runs on the backend and mirrors its effect into the model.
+
 void ModelFile(const std::string &path, const std::vector<uint8_t> &data)
 {
 	Expect &e = g_model[path];
@@ -228,24 +508,18 @@ void ModelFile(const std::string &path, const std::vector<uint8_t> &data)
 void OpCreate(const std::string &path, const std::vector<uint8_t> &data, size_t chunk)
 {
 	TraceOp t("create", path);
-	apfsrw_node *dir = g_rw.Walk(Parent(path)), *n = nullptr;
-	std::string name = Base(path);
-	int err = dir ? apfsrw_create(dir, name.data(), name.size(), 0644, &n) : -2;
-	CHECK(err == 0, "create %s: %d", path.c_str(), err);
-	if (dir)
-		apfsrw_put(dir);
-	if (n)
-		apfsrw_put(n);
-	if (!data.empty())
-		g_rw.Write(path, 0, data, chunk);
+	if (g_be->Create(path) && !data.empty())
+		g_be->Write(path, 0, data, chunk);
 	ModelFile(path, data);
+	if (g_model[path].orig_mode < 0)
+		g_model[path].orig_mode = 0644;   // both backends create files 0644
 }
 
 void OpPatch(const std::string &path, uint64_t off, const std::vector<uint8_t> &patch, size_t chunk)
 {
 	TraceOp t("patch", path);
-	std::vector<uint8_t> cur = g_rw.ReadAll(path);
-	g_rw.Write(path, off, patch, chunk);
+	std::vector<uint8_t> cur = g_be->ReadAll(path);
+	g_be->Write(path, off, patch, chunk);
 	if (cur.size() < off + patch.size())
 		cur.resize(off + patch.size(), 0);
 	memcpy(cur.data() + off, patch.data(), patch.size());
@@ -255,15 +529,8 @@ void OpPatch(const std::string &path, uint64_t off, const std::vector<uint8_t> &
 void OpTruncate(const std::string &path, uint64_t size)
 {
 	TraceOp t("truncate", path);
-	std::vector<uint8_t> cur = g_rw.ReadAll(path);
-	apfsrw_node *n = g_rw.Walk(path);
-	apfsrw_setattr_t a = {};
-	a.mask = APFSRW_SET_SIZE;
-	a.size = size;
-	int err = n ? apfsrw_setattr(n, &a) : -2;
-	CHECK(err == 0, "truncate %s to %llu: %d", path.c_str(), (unsigned long long)size, err);
-	if (n)
-		apfsrw_put(n);
+	std::vector<uint8_t> cur = g_be->ReadAll(path);
+	g_be->SetSize(path, size);
 	cur.resize(size, 0);
 	ModelFile(path, cur);
 }
@@ -271,14 +538,7 @@ void OpTruncate(const std::string &path, uint64_t size)
 void OpMkdir(const std::string &path)
 {
 	TraceOp t("mkdir", path);
-	apfsrw_node *dir = g_rw.Walk(Parent(path)), *n = nullptr;
-	std::string name = Base(path);
-	int err = dir ? apfsrw_mkdir(dir, name.data(), name.size(), 0755, &n) : -2;
-	CHECK(err == 0, "mkdir %s: %d", path.c_str(), err);
-	if (dir)
-		apfsrw_put(dir);
-	if (n)
-		apfsrw_put(n);
+	g_be->Mkdir(path);
 	g_model[path] = Expect();
 	g_model[path].type = "dir";
 }
@@ -286,14 +546,7 @@ void OpMkdir(const std::string &path)
 void OpRename(const std::string &from, const std::string &to)
 {
 	TraceOp t("rename", from + " -> " + to);
-	apfsrw_node *od = g_rw.Walk(Parent(from)), *nd = g_rw.Walk(Parent(to));
-	std::string on = Base(from), nn = Base(to);
-	int err = (od && nd) ? apfsrw_rename(od, on.data(), on.size(), nd, nn.data(), nn.size(), 0) : -2;
-	CHECK(err == 0, "rename %s -> %s: %d", from.c_str(), to.c_str(), err);
-	if (od)
-		apfsrw_put(od);
-	if (nd)
-		apfsrw_put(nd);
+	g_be->Rename(from, to);
 	// move the entry and its subtree
 	std::map<std::string, Expect> moved;
 	for (auto it = g_model.begin(); it != g_model.end();)
@@ -314,24 +567,16 @@ void OpRename(const std::string &from, const std::string &to)
 void OpUnlink(const std::string &path, bool dir = false)
 {
 	TraceOp t(dir ? "rmdir" : "unlink", path);
-	apfsrw_node *d = g_rw.Walk(Parent(path));
-	std::string name = Base(path);
-	int err = d ? (dir ? apfsrw_rmdir(d, name.data(), name.size()) : apfsrw_unlink(d, name.data(), name.size())) : -2;
-	CHECK(err == 0, "%s %s: %d", dir ? "rmdir" : "unlink", path.c_str(), err);
-	if (d)
-		apfsrw_put(d);
+	g_be->Remove(path, dir);
 	g_model.erase(path);
 }
 
 void OpSymlink(const std::string &path, const std::string &target)
 {
 	TraceOp t("symlink", path);
-	apfsrw_node *dir = g_rw.Walk(Parent(path));
-	std::string name = Base(path);
-	int err = dir ? apfsrw_symlink(dir, name.data(), name.size(), target.c_str(), nullptr) : -2;
-	CHECK(err == 0, "symlink %s: %d", path.c_str(), err);
-	if (dir)
-		apfsrw_put(dir);
+	if (!g_be->CanLink())
+		return;
+	g_be->Symlink(path, target);
 	g_model[path] = Expect();
 	g_model[path].type = "symlink";
 	g_model[path].target = target;
@@ -340,40 +585,159 @@ void OpSymlink(const std::string &path, const std::string &target)
 void OpLink(const std::string &existing, const std::string &path)
 {
 	TraceOp t("link", path);
-	apfsrw_node *src = g_rw.Walk(existing), *dir = g_rw.Walk(Parent(path));
-	std::string name = Base(path);
-	int err = (src && dir) ? apfsrw_link(src, dir, name.data(), name.size(), nullptr) : -2;
-	CHECK(err == 0, "link %s -> %s: %d", existing.c_str(), path.c_str(), err);
-	if (src)
-		apfsrw_put(src);
-	if (dir)
-		apfsrw_put(dir);
+	if (!g_be->CanLink())
+		return;
+	g_be->Link(existing, path);
 	g_model[path] = g_model[existing];
 }
 
+// mode < 0 or mtime INT64_MIN: leave that alone. Without chmod support the
+// mode only toggles read-only, so the expected mode is derived from the old one.
 void OpSetattr(const std::string &path, int mode, int64_t mtime_ns)
 {
 	TraceOp t("setattr", path);
-	apfsrw_node *n = g_rw.Walk(path);
-	apfsrw_setattr_t a = {};
 	if (mode >= 0)
 	{
-		a.mask |= APFSRW_SET_MODE;
-		a.mode = static_cast<uint32_t>(mode);
+		g_be->SetMode(path, mode);
+		if (g_be->CanChmod())
+			g_model[path].mode = mode;
+		else if (g_model[path].mode >= 0 || g_model[path].orig_mode >= 0)
+		{
+			int old = g_model[path].mode >= 0 ? g_model[path].mode : g_model[path].orig_mode;
+			g_model[path].mode = (mode & 0222) ? ((old & 0222) ? old : (old | 0200)) : (old & ~0222);
+		}
 	}
 	if (mtime_ns != INT64_MIN)
 	{
-		a.mask |= APFSRW_SET_MTIME;
-		a.mtime_ns = mtime_ns;
-	}
-	int err = n ? apfsrw_setattr(n, &a) : -2;
-	CHECK(err == 0, "setattr %s: %d", path.c_str(), err);
-	if (n)
-		apfsrw_put(n);
-	if (mode >= 0)
-		g_model[path].mode = mode;
-	if (mtime_ns != INT64_MIN)
+		g_be->SetMtime(path, mtime_ns);
 		g_model[path].mtime_ns = mtime_ns;
+	}
+}
+
+// ---------------------------------------------------------------- crash phase
+//
+// After the synced main phase: churn under /crash (creates of up to 2 MiB,
+// patches, truncation, renames, deletes, subdirectories, a sync every 50
+// operations) while a simulated crash is armed. Whatever state /crash ends in
+// is acceptable; everything outside it was synced and must survive.
+
+bool g_ignore_crash = false;   // verification: entries under /crash may exist
+
+uint64_t FreeBytes(apfsrw_mount *m)
+{
+	apfsrw_statfs st = {};
+	apfsrw_get_statfs(m, &st);
+	return st.blocks_free * st.block_size;
+}
+
+void Churn(apfsrw_mount *m)
+{
+	std::mt19937 rng(1);
+	std::vector<std::string> files;
+	int dirs = 0;
+	// file sizes scale with the free space (the smallest test container has 31 MiB)
+	uint64_t free_bytes = FreeBytes(m);
+	size_t big_max = static_cast<size_t>(std::min<uint64_t>(2 * 1024 * 1024, free_bytes / 60));
+	size_t small_max = static_cast<size_t>(std::min<uint64_t>(40000, free_bytes / 600));
+	OpMkdir("/crash");
+	for (int i = 0; i < 400; i++)
+	{
+		unsigned what = rng() % 10;
+		char name[64];
+		snprintf(name, sizeof(name), "/crash/f%04d", i);
+		size_t pick = files.empty() ? 0 : rng() % files.size();
+		if (what < 4 || files.empty())
+		{
+			size_t size = rng() % (what == 0 ? big_max : small_max);
+			OpCreate(name, Pattern(1000 + i, size), 4096 + rng() % 60000);
+			files.push_back(name);
+		}
+		else if (what < 6)
+			OpPatch(files[pick], rng() % 50000, Pattern(5000 + i, 1 + rng() % 20000), 8192);
+		else if (what == 6)
+			OpTruncate(files[pick], rng() % 30000);
+		else if (what == 7)
+		{
+			OpRename(files[pick], files[pick] + "r");
+			files[pick] += "r";
+		}
+		else if (what == 8)
+		{
+			OpUnlink(files[pick]);
+			files.erase(files.begin() + pick);
+		}
+		else
+		{
+			std::string d = "/crash/d" + std::to_string(dirs++);
+			OpMkdir(d);
+			OpCreate(d + "/x", Pattern(9000 + i, rng() % 100000), 16384);
+			files.push_back(d + "/x");
+		}
+		if (i % 50 == 49)
+			apfsrw_sync(m);
+	}
+}
+
+// Disk full: write 1 MiB files under /crash until ENOSPC, delete them all,
+// check that the space comes back, and write again.
+void Fill(apfsrw_mount *m, RwBackend &be)
+{
+	OpMkdir("/crash");
+	uint64_t before = FreeBytes(m);
+	std::vector<uint8_t> chunk = Pattern(42, 1024 * 1024);
+	std::vector<std::string> made;
+	int err = 0;
+	apfsrw_node *dir = be.Walk("/crash");
+	CHECK(dir != nullptr, "no /crash");
+	for (int i = 0; dir && !err && i < 100000; i++)
+	{
+		std::string name = "fill" + std::to_string(i);
+		apfsrw_node *n = nullptr;
+		apfsrw_file *f = nullptr;
+		err = apfsrw_create(dir, name.data(), name.size(), 0644, &n);
+		if (err)
+			break;
+		made.push_back(name);
+		err = apfsrw_open(n, true, &f);
+		CHECK(err == 0, "open %s: %d", name.c_str(), err);
+		size_t w = 0;
+		for (uint64_t off = 0; !err && off < 8 * chunk.size(); off += w)
+		{
+			err = apfsrw_write(f, off, chunk.data(), chunk.size(), &w);
+			if (!err && w == 0)
+				err = -28;
+		}
+		if (f)
+			apfsrw_release(f);
+		apfsrw_put(n);
+	}
+	CHECK(err == -28, "filling the volume ended with %d, expected ENOSPC (-28)", err);
+	uint64_t full = FreeBytes(m);
+	for (const std::string &name : made)
+	{
+		int e = apfsrw_unlink(dir, name.data(), name.size());
+		CHECK(e == 0, "unlink %s after ENOSPC: %d", name.c_str(), e);
+	}
+	if (dir)
+		apfsrw_put(dir);
+	// the data of deleted files is freed by the driver's orphan cleanup in the
+	// background (as on Linux), and freed blocks only count once the free
+	// queue is flushed at the start of a later transaction
+	uint64_t after = 0;
+	for (int tries = 0; tries < 200; tries++)
+	{
+		CHECK(apfsrw_sync(m) == 0, "sync after deleting");
+		after = FreeBytes(m);
+		if (after + 256 * 1024 >= before)
+			break;
+		Sleep(100);
+	}
+	printf("disk full: %zu files, free %llu -> %llu -> %llu KiB\n", made.size(), (unsigned long long)before / 1024,
+		(unsigned long long)full / 1024, (unsigned long long)after / 1024);
+	CHECK(after + 256 * 1024 >= before, "space not given back: %llu KiB free, %llu before",
+		(unsigned long long)after / 1024, (unsigned long long)before / 1024);
+	OpCreate("/crash/after-full.bin", Pattern(43, 3 * 1024 * 1024 + 7), 65536);
+	CHECK(be.ReadAll("/crash/after-full.bin") == Pattern(43, 3 * 1024 * 1024 + 7), "write after disk full reads back wrong");
 }
 
 // ---------------------------------------------------------------- verification
@@ -462,8 +826,117 @@ void Compare(Volume &v)
 			CHECK(s.mtime_ns == e.mtime_ns, "[%s] %s: mtime %lld, expected %lld", v.EngineName(), kv.first.c_str(), (long long)s.mtime_ns, (long long)e.mtime_ns);
 	}
 	for (const auto &kv : seen)
-		CHECK(g_model.count(kv.first), "[%s] unexpected %s", v.EngineName(), kv.first.c_str());
+		CHECK(g_model.count(kv.first) || (g_ignore_crash && kv.first.compare(0, 6, "/crash") == 0),
+			"[%s] unexpected %s", v.EngineName(), kv.first.c_str());
 	printf("[%s] %zu entries checked, %d problems\n", v.EngineName(), seen.size(), g_failures - before);
+}
+
+// ---------------------------------------------------------------- model files
+// (the Win32 phase runs while the drive is mounted; checking comes after)
+
+std::string HexEncode(const std::string &s)
+{
+	static const char *hx = "0123456789abcdef";
+	std::string out;
+	for (unsigned char c : s)
+	{
+		out.push_back(hx[c >> 4]);
+		out.push_back(hx[c & 15]);
+	}
+	return out;
+}
+
+void SaveModel(const std::wstring &file)
+{
+	json doc = json::array();
+	for (const auto &kv : g_model)
+	{
+		const Expect &e = kv.second;
+		json j;
+		j["path_hex"] = HexEncode(kv.first);
+		j["type"] = e.type;
+		if (e.type == "file")
+		{
+			j["size"] = e.have_data ? e.data.size() : e.size;
+			j["sha256"] = e.have_data ? Sha256Hex(e.data.data(), e.data.size()) : e.sha256;
+		}
+		if (e.type == "symlink")
+			j["target"] = e.target;
+		if (e.mode >= 0)
+			j["mode"] = e.mode;
+		if (e.mtime_ns != INT64_MIN)
+			j["mtime_ns"] = e.mtime_ns;
+		doc.push_back(j);
+	}
+	std::ofstream(file) << doc.dump(1);
+}
+
+bool LoadModel(const std::wstring &file)
+{
+	std::ifstream in(file);
+	if (!in)
+		return false;
+	json doc = json::parse(in);
+	g_model.clear();
+	for (const auto &j : doc)
+	{
+		Expect e;
+		e.type = j["type"].get<std::string>();
+		if (j.contains("size"))
+			e.size = j["size"].get<uint64_t>();
+		if (j.contains("sha256"))
+			e.sha256 = j["sha256"].get<std::string>();
+		if (j.contains("target"))
+			e.target = j["target"].get<std::string>();
+		if (j.contains("mode"))
+			e.mode = j["mode"].get<int>();
+		if (j.contains("mtime_ns"))
+			e.mtime_ns = j["mtime_ns"].get<int64_t>();
+		g_model[HexDecode(j["path_hex"].get<std::string>())] = e;
+	}
+	return true;
+}
+
+// Walk the image through both engines and compare with the model.
+void ReadBack(const std::string &work, const std::string &volname)
+{
+	std::string err;
+	std::unique_ptr<Container> c = Container::Open(work, err);
+	if (!c)
+	{
+		CHECK(false, "reopen: %s", err.c_str());
+		return;
+	}
+	const VolumeInfo *vi = volname.empty() ? &c->Volumes().front() : c->FindVolume(volname);
+	if (!vi)
+	{
+		CHECK(false, "no volume %s", volname.c_str());
+		return;
+	}
+	{
+		std::unique_ptr<Volume> lib = c->OpenVolume(vi->fsid, "", err);
+		CHECK(lib != nullptr, "apfs-fuse open: %s", err.c_str());
+		if (lib)
+			Compare(*lib);
+	}
+	{
+		std::unique_ptr<Volume> rw = OpenRwVolume(*c, vi->fsid, false, err);
+		CHECK(rw != nullptr, "linux-apfs-rw reopen: %s", err.c_str());
+		if (rw)
+			Compare(*rw);
+	}
+}
+
+int VerifyPhase(const std::wstring &model, const std::string &work, const std::string &volname)
+{
+	if (!LoadModel(model))
+	{
+		fprintf(stderr, "cannot read model %ls\n", model.c_str());
+		return 2;
+	}
+	ReadBack(work, volname);
+	printf("%s: %d failures\n", g_failures ? "FAILED" : "OK", g_failures);
+	return g_failures ? 1 : 0;
 }
 
 // On a crash: print the exception and a symbolized stack (DbgHelp + PDBs).
@@ -524,23 +997,116 @@ int wmain(int argc, wchar_t **argv)
 	}
 #endif
 	SetUnhandledExceptionFilter(CrashHandler);
-	if (argc < 4)
+	// modes:
+	//   <manifest> <source.img> <work.img> [vol]            engine: copy, write, verify
+	//   --win32 <X:> <manifest> <work.img> <model.json> [vol] write through a mounted drive, save the model
+	//   --verify <manifest> <work.img> <model.json> [vol]     check an image against a saved model
+	//   --crash <count|kill|power|nobarrier|fill> <at> <seed> <manifest> <source.img> <work.img> <model.json> [vol]
+	//        engine writes, sync, save the model, then churn under /crash with a
+	//        simulated crash at device write <at> (exit 99); prints the write count
+	//   --verify-crash ...        like --verify, but entries under /crash may exist
+	//   --recover <work.img> [vol] mount read-write, write a file, unmount cleanly
+	enum { ENGINE, WIN32_DRIVE, VERIFY, CRASH, RECOVER } mode = ENGINE;
+	std::vector<std::wstring> args(argv + 1, argv + argc);
+	std::wstring drive;
+	int crash_how = 0;
+	uint64_t crash_at = 0;
+	uint32_t crash_seed = 0;
+	if (!args.empty() && args[0] == L"--win32" && args.size() >= 2)
 	{
-		fprintf(stderr, "usage: apfsrw-writetest <manifest.json> <source.img> <work.img> [volume]\n");
+		mode = WIN32_DRIVE;
+		drive = args[1];
+		args.erase(args.begin(), args.begin() + 2);
+	}
+	else if (!args.empty() && (args[0] == L"--verify" || args[0] == L"--verify-crash"))
+	{
+		mode = VERIFY;
+		g_ignore_crash = args[0] == L"--verify-crash";
+		args.erase(args.begin());
+	}
+	else if (!args.empty() && args[0] == L"--crash" && args.size() >= 4)
+	{
+		mode = CRASH;
+		crash_how = args[1] == L"kill" ? APFSRW_CRASH_KILL : args[1] == L"power" ? APFSRW_CRASH_POWER
+			: args[1] == L"nobarrier" ? APFSRW_CRASH_NOBARRIER : args[1] == L"fill" ? 0 : APFSRW_CRASH_COUNT;
+		crash_at = _wcstoui64(args[2].c_str(), nullptr, 10);
+		crash_seed = static_cast<uint32_t>(wcstoul(args[3].c_str(), nullptr, 10));
+		args.erase(args.begin(), args.begin() + 4);
+	}
+	else if (!args.empty() && args[0] == L"--recover")
+	{
+		mode = RECOVER;
+		args.erase(args.begin());
+		args.insert(args.begin(), L"");   // no manifest
+	}
+	const size_t need = mode == RECOVER ? 2 : mode == CRASH ? 4 : 3;
+	if (args.size() < need)
+	{
+		fprintf(stderr, "usage: apfsrw-writetest <manifest.json> <source.img> <work.img> [volume]\n"
+			"       apfsrw-writetest --win32 <X:> <manifest.json> <work.img> <model.json> [volume]\n"
+			"       apfsrw-writetest --verify[-crash] <manifest.json> <work.img> <model.json> [volume]\n"
+			"       apfsrw-writetest --crash <count|kill|power|nobarrier|fill> <at> <seed> <manifest.json> <source.img> <work.img> <model.json> [volume]\n"
+			"       apfsrw-writetest --recover <work.img> [volume]\n");
 		return 2;
 	}
-	std::string manifest = WideToUtf8(argv[1]), work = WideToUtf8(argv[3]);
-	std::string volname = argc > 4 ? WideToUtf8(argv[4]) : "";
+	std::wstring w_manifest = args[0];
+	std::wstring w_work = (mode == ENGINE || mode == CRASH) ? args[2] : args[1];
+	std::wstring w_model = mode == ENGINE || mode == RECOVER ? L"" : mode == CRASH ? args[3] : args[2];
+	size_t vol_arg = mode == RECOVER ? 2 : mode == CRASH ? 4 : 3;
+	std::string work = WideToUtf8(w_work);
+	std::string volname = args.size() > vol_arg ? WideToUtf8(args[vol_arg]) : "";
 	apfsrw_set_log(Log);
 
-	if (!CopyFileW(argv[2], argv[3], FALSE))
+	if (mode == VERIFY)
+		return VerifyPhase(w_model, work, volname);
+
+	auto mount_rw = [&](apfsrw_mount **out) {
+		std::string err;
+		std::unique_ptr<Container> c = Container::Open(work, err);
+		if (!c)
+		{
+			fprintf(stderr, "%s\n", err.c_str());
+			return -1;
+		}
+		const VolumeInfo *vi = volname.empty() ? &c->Volumes().front() : c->FindVolume(volname);
+		if (!vi)
+		{
+			fprintf(stderr, "no volume %s\n", volname.c_str());
+			return -1;
+		}
+		uint64_t offset = c->PartitionOffset(), size = c->PartitionSize();
+		unsigned fsid = vi->fsid;
+		c.reset();
+		int rc = apfsrw_mount_volume(w_work.c_str(), offset, size, fsid, true, nullptr, out);
+		if (rc)
+			fprintf(stderr, "read-write mount failed: %d\n", rc);
+		return rc;
+	};
+
+	if (mode == RECOVER)
+	{
+		// after a crash: the engine must mount the last checkpoint and write on
+		RwBackend rec;
+		if (mount_rw(&rec.m))
+			return 1;
+		g_be = &rec;
+		OpCreate("/crash-recovered.txt", Pattern(77, 12345), 4096);
+		std::vector<uint8_t> back = rec.ReadAll("/crash-recovered.txt");
+		CHECK(back == Pattern(77, 12345), "recovered write reads back wrong");
+		int rc = apfsrw_unmount(rec.m);
+		CHECK(rc == 0, "unmount: %d", rc);
+		printf("%s: remounted read-write, wrote, unmounted (%d failures)\n", g_failures ? "FAILED" : "OK", g_failures);
+		return g_failures ? 1 : 0;
+	}
+
+	if ((mode == ENGINE || mode == CRASH) && !CopyFileW(args[1].c_str(), w_work.c_str(), FALSE))
 	{
 		fprintf(stderr, "cannot copy image (error %lu)\n", GetLastError());
 		return 2;
 	}
 
 	// the untouched state, from the manifest
-	std::ifstream mf(argv[1]);
+	std::ifstream mf(w_manifest);
 	json doc = json::parse(mf);
 	for (const auto &j : doc["entries"])
 	{
@@ -555,27 +1121,29 @@ int wmain(int argc, wchar_t **argv)
 			e.sha256 = j["sha256"].get<std::string>();
 		if (j.contains("target"))
 			e.target = j["target"].get<std::string>();
+		if (j.contains("mode"))
+			e.orig_mode = static_cast<int>(strtol(j["mode"].get<std::string>().c_str() + 2, nullptr, 8));   // "0o755"
 		g_model[path] = e;
 	}
 
-	std::string err;
-	std::unique_ptr<Container> c = Container::Open(work, err);
-	if (!c)
-	{
-		fprintf(stderr, "%s\n", err.c_str());
-		return 2;
-	}
-	const VolumeInfo *vi = volname.empty() ? &c->Volumes().front() : c->FindVolume(volname);
-	uint64_t offset = c->PartitionOffset(), size = c->PartitionSize();
-	unsigned fsid = vi->fsid;
-	c.reset();
-
 	// ---- writes
-	int rc = apfsrw_mount_volume(argv[3], offset, size, fsid, true, nullptr, &g_rw.m);
-	if (rc)
+	RwBackend rw;
+	Win32Backend win;
+	int rc = 0;
+	if (mode == WIN32_DRIVE)
 	{
-		fprintf(stderr, "read-write mount failed: %d\n", rc);
-		return 1;
+		win.root = drive;
+		while (!win.root.empty() && (win.root.back() == L'\\' || win.root.back() == L'/'))
+			win.root.pop_back();
+		if (win.root.compare(0, 4, L"\\\\?\\") != 0)
+			win.root = L"\\\\?\\" + win.root;
+		g_be = &win;
+	}
+	else
+	{
+		if (mount_rw(&rw.m))
+			return 1;
+		g_be = &rw;
 	}
 
 	OpMkdir("/w3");
@@ -644,6 +1212,7 @@ int wmain(int argc, wchar_t **argv)
 		OpCreate("/w3/b.txt", Pattern(6, 400), 4096);
 		OpRename("/w3/a.txt", "/w3/b.txt");                                 // replace
 		OpRename("/w3/sub", "/w3/moved_sub");                               // directory with contents
+		OpSetattr("/w3/b.txt", 0444, INT64_MIN);                            // read-only (both backends)
 	}
 	if (has("/empty.txt"))
 		OpUnlink("/empty.txt");
@@ -659,7 +1228,7 @@ int wmain(int argc, wchar_t **argv)
 	if (has("/perms/script_0755.sh"))
 		OpSetattr("/perms/script_0755.sh", 0600, INT64_MIN);
 	if (has("/hello.txt"))
-		OpSetattr("/hello.txt", -1, 985392000LL * 1000000000LL + 123456789);
+		OpSetattr("/hello.txt", -1, 985392000LL * 1000000000LL + 123456700);   // 100 ns units: FILETIME resolution
 	if (!skip("links"))
 	{
 		OpSymlink("/w3/link", "moved_sub/renamed.txt");
@@ -686,31 +1255,40 @@ int wmain(int argc, wchar_t **argv)
 	OpCreate("/w3/\xf0\x9f\x99\x82.txt", Pattern(8, 20), 4096);
 	}
 
-	rc = apfsrw_unmount(g_rw.m);
+	if (mode == WIN32_DRIVE)
+	{
+		// the drive is unmounted (and the image checked) after this process exits
+		SaveModel(w_model);
+		printf("writes done through %ls, %d failures; model saved\n", drive.c_str(), g_failures);
+		return g_failures ? 1 : 0;
+	}
+
+	if (mode == CRASH)
+	{
+		rc = apfsrw_sync(rw.m);
+		CHECK(rc == 0, "sync: %d", rc);
+		SaveModel(w_model);
+		if (g_failures)
+			return 1;
+		if (crash_how == 0)
+			Fill(rw.m, rw);   // "fill": disk full instead of a crash
+		else
+		{
+			apfsrw_test_crash(crash_how, crash_at, crash_seed);
+			Churn(rw.m);
+		}
+		rc = apfsrw_unmount(rw.m);
+		CHECK(rc == 0, "unmount: %d", rc);
+		// reached only without a crash (the write count includes the unmount)
+		printf("crash phase: %llu writes, no crash; %d failures\n", (unsigned long long)apfsrw_test_writes(), g_failures);
+		return g_failures ? 1 : 0;
+	}
+
+	rc = apfsrw_unmount(rw.m);
 	CHECK(rc == 0, "unmount: %d", rc);
-	g_rw.m = nullptr;
+	rw.m = nullptr;
 	printf("writes done, %d failures so far\n", g_failures);
-
-	// ---- independent read-back
-	c = Container::Open(work, err);
-	if (!c)
-	{
-		fprintf(stderr, "reopen: %s\n", err.c_str());
-		return 1;
-	}
-	{
-		std::unique_ptr<Volume> lib = c->OpenVolume(fsid, "", err);
-		CHECK(lib != nullptr, "apfs-fuse open: %s", err.c_str());
-		if (lib)
-			Compare(*lib);
-	}
-	{
-		std::unique_ptr<Volume> rw = OpenRwVolume(*c, fsid, false, err);
-		CHECK(rw != nullptr, "linux-apfs-rw reopen: %s", err.c_str());
-		if (rw)
-			Compare(*rw);
-	}
-
+	ReadBack(work, volname);
 	printf("%s: %d failures\n", g_failures ? "FAILED" : "OK", g_failures);
 	return g_failures ? 1 : 0;
 }

@@ -185,3 +185,71 @@ foreach(v "basic.container.img|basic|Basic" "basic.img|basic|Basic" "casesensiti
 	add_test(NAME write_fsck_crash.${img} COMMAND winapfs-fsck -c ${work})
 	set_tests_properties(write_fsck.${img} write_fsck_crash.${img} PROPERTIES FIXTURES_REQUIRED w3-${img})
 endforeach()
+
+# W3b: the same writes through a read-write WinFsp mount with plain Win32
+# file APIs, then the image is checked after unmount.
+if(TARGET winapfs)
+	foreach(v "basic.container.img|basic|Basic" "basic.img|basic|Basic" "casesensitive.img|casesensitive|CaseSens" "multivol.img|multivol|VolB")
+		string(REPLACE "|" ";" f "${v}")
+		list(GET f 0 img)
+		list(GET f 1 prefix)
+		list(GET f 2 vol)
+		set(work ${CMAKE_CURRENT_BINARY_DIR}/w32-${img})
+		set(model ${CMAKE_CURRENT_BINARY_DIR}/w32-${img}.model.json)
+		add_test(NAME mountwrite_prepare.${img} COMMAND ${CMAKE_COMMAND} -E copy ${TD}/${img} ${work})
+		set_tests_properties(mountwrite_prepare.${img} PROPERTIES FIXTURES_SETUP w32prep-${img})
+		add_test(NAME mountwrite.${img}.${vol}
+			COMMAND winapfs mount ${work} * --rw --volume ${vol}
+				--run "\"$<TARGET_FILE:apfsrw-writetest>\" --win32 %MOUNT% \"${TD}/${prefix}.${vol}.manifest.json\" \"${work}\" \"${model}\" ${vol}")
+		set_tests_properties(mountwrite.${img}.${vol} PROPERTIES RESOURCE_LOCK winfsp_mount
+			FIXTURES_REQUIRED w32prep-${img} FIXTURES_SETUP w32-${img})
+		add_test(NAME mountwrite_verify.${img}
+			COMMAND apfsrw-writetest --verify ${TD}/${prefix}.${vol}.manifest.json ${work} ${model} ${vol})
+		add_test(NAME mountwrite_fsck.${img} COMMAND winapfs-fsck ${work})
+		add_test(NAME mountwrite_fsck_crash.${img} COMMAND winapfs-fsck -c ${work})
+		set_tests_properties(mountwrite_verify.${img} mountwrite_fsck.${img} mountwrite_fsck_crash.${img}
+			PROPERTIES FIXTURES_REQUIRED w32-${img})
+	endforeach()
+	# --rw is refused where it isn't safe yet
+	# (a \\.\ path to an image file goes through the raw-disk device; no admin needed)
+	add_test(NAME mountwrite_refuse.rawdisk COMMAND winapfs mount "${BS}${BS}.${BS}${TD_NATIVE}${BS}basic.img" * --rw --run "cmd /c exit 0")
+	add_test(NAME mountwrite_refuse.encrypted COMMAND winapfs mount ${TD}/encrypted.img * --rw --volume Secret --password ${TEST_PASSWORD} --run "cmd /c exit 0")
+	set_tests_properties(mountwrite_refuse.rawdisk mountwrite_refuse.encrypted PROPERTIES WILL_FAIL TRUE)
+endif()
+
+# W3c: crash safety. apfsrw-writetest crashes itself (process kill, power cut
+# with a volatile disk cache) at spread-out device writes; after each crash
+# fsck must be clean, the synced state intact, and the volume writable again.
+foreach(v "basic.img|basic|Basic" "casesensitive.img|casesensitive|CaseSens" "multivol.img|multivol|VolB")
+	string(REPLACE "|" ";" f "${v}")
+	list(GET f 0 img)
+	list(GET f 1 prefix)
+	list(GET f 2 vol)
+	add_test(NAME crash.${img}.${vol}
+		COMMAND powershell -NoProfile -ExecutionPolicy Bypass -File ${CMAKE_CURRENT_SOURCE_DIR}/crash_test.ps1
+			-Writetest $<TARGET_FILE:apfsrw-writetest> -Fsck $<TARGET_FILE:winapfs-fsck>
+			-Manifest ${TD}/${prefix}.${vol}.manifest.json -Image ${TD}/${img}
+			-Work ${CMAKE_CURRENT_BINARY_DIR}/crash-${img} -Volume ${vol} -Points 6)
+endforeach()
+# the same crashes on a disk that ignores flushes must be caught
+add_test(NAME crash_detects.basic.img
+	COMMAND powershell -NoProfile -ExecutionPolicy Bypass -File ${CMAKE_CURRENT_SOURCE_DIR}/crash_test.ps1
+		-Writetest $<TARGET_FILE:apfsrw-writetest> -Fsck $<TARGET_FILE:winapfs-fsck>
+		-Manifest ${TD}/basic.Basic.manifest.json -Image ${TD}/basic.img
+		-Work ${CMAKE_CURRENT_BINARY_DIR}/crash-nobarrier-basic.img -Volume Basic -Points 3 -Modes nobarrier -ExpectBroken)
+
+# disk full: fill the volume to ENOSPC, delete, check the space comes back,
+# write again; then the image must be intact and fsck-clean
+foreach(v "basic.img|basic|Basic" "casesensitive.img|casesensitive|CaseSens")
+	string(REPLACE "|" ";" f "${v}")
+	list(GET f 0 img)
+	list(GET f 1 prefix)
+	list(GET f 2 vol)
+	set(work ${CMAKE_CURRENT_BINARY_DIR}/full-${img})
+	add_test(NAME diskfull.${img}.${vol}
+		COMMAND apfsrw-writetest --crash fill 0 0 ${TD}/${prefix}.${vol}.manifest.json ${TD}/${img} ${work} ${work}.model.json ${vol})
+	set_tests_properties(diskfull.${img}.${vol} PROPERTIES FIXTURES_SETUP full-${img})
+	add_test(NAME diskfull_verify.${img} COMMAND apfsrw-writetest --verify-crash ${TD}/${prefix}.${vol}.manifest.json ${work} ${work}.model.json ${vol})
+	add_test(NAME diskfull_fsck.${img} COMMAND winapfs-fsck -c ${work})
+	set_tests_properties(diskfull_verify.${img} diskfull_fsck.${img} PROPERTIES FIXTURES_REQUIRED full-${img})
+endforeach()

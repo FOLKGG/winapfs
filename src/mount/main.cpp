@@ -40,6 +40,7 @@ static void Usage()
 		"                             instead of a free drive letter\n"
 		"  -p, --password <pw>        password or recovery key for encrypted volumes\n"
 		"  --ask                      prompt for the password of encrypted volumes\n"
+		"  --rw                       mount read-write (experimental; image files only)\n"
 		"  --engine auto|rw|lib       auto (default): linux-apfs-rw, or apfs-fuse for\n"
 		"                             encrypted volumes; rw or lib forces one\n"
 		"  --hide-dotfiles            mark names starting with '.' hidden\n"
@@ -67,6 +68,7 @@ struct Args
 	bool ask = false;
 	int partition = -1;
 	std::string engine = "auto";
+	bool rw = false;
 	MountOptions opts;
 };
 
@@ -88,6 +90,7 @@ static bool ParseArgs(const std::vector<std::wstring> &argv, Args &a)
 		else if (s == L"--dir") { if (!next(a.dir)) return false; }
 		else if (s == L"--run") { if (!next(a.run)) return false; }
 		else if (s == L"--engine") { if (!next(v)) return false; a.engine = WideToUtf8(v); if (a.engine != "auto" && a.engine != "rw" && a.engine != "lib") return false; }
+		else if (s == L"--rw") a.rw = true;
 		else if (s == L"--ask") a.ask = true;
 		else if (s == L"--hide-dotfiles") a.opts.hide_dotfiles = true;
 		else if (s == L"-d" || s == L"--debug") a.opts.debug = true;
@@ -162,6 +165,30 @@ static std::unique_ptr<Volume> OpenVolume(Container &c, const VolumeInfo &vi, co
 	std::string pw = a.password;
 	std::string err;
 
+	if (a.rw)
+	{
+		// read-write: images only until physical-disk writes are proven (W5)
+		if (c.Path().compare(0, 4, "\\\\.\\") == 0)
+		{
+			fprintf(stderr, "%s: writing to physical disks is not enabled yet; --rw works on image files\n", vi.name.c_str());
+			return nullptr;
+		}
+		if (a.engine == "lib")
+		{
+			fprintf(stderr, "%s: --rw needs the linux-apfs-rw engine\n", vi.name.c_str());
+			return nullptr;
+		}
+		if (vi.encrypted)
+		{
+			fprintf(stderr, "%s: encrypted volumes can't be written yet\n", vi.name.c_str());
+			return nullptr;
+		}
+		std::unique_ptr<Volume> v = OpenRwVolume(c, vi.fsid, true, err);
+		if (!v)
+			fprintf(stderr, "%s: %s\n", vi.name.c_str(), err.c_str());
+		return v;
+	}
+
 	// linux-apfs-rw for everything it supports; ApfsLib for encrypted volumes
 	if (a.engine == "rw" || (a.engine == "auto" && !vi.encrypted))
 	{
@@ -212,7 +239,8 @@ static bool MountOne(Session &s, std::unique_ptr<Volume> vol, const std::wstring
 		return false;
 	}
 	std::wstring mp = fs->MountPoint();
-	fprintf(stderr, "mounted %s at %ls (read-only, %s)\n", name.c_str(), mp.c_str(), fs->Vol().EngineName());
+	fprintf(stderr, "mounted %s at %ls (%s, %s)\n", name.c_str(), mp.c_str(),
+		fs->Vol().Writable() ? "read-write, experimental" : "read-only", fs->Vol().EngineName());
 	SetEnvironmentVariableW(Utf8ToWide(EnvName(name)).c_str(), mp.c_str());
 	s.mounts.push_back(std::move(fs));
 	return true;

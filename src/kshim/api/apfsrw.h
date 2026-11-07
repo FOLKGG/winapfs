@@ -93,6 +93,7 @@ int apfsrw_readdir(apfsrw_node *dir, apfsrw_dir_cb cb, void *ctx);
 int apfsrw_open(apfsrw_node *n, bool write, apfsrw_file **out);
 int apfsrw_read(apfsrw_file *f, uint64_t off, void *buf, size_t len, size_t *got);
 int apfsrw_release(apfsrw_file *f);
+uint64_t apfsrw_file_size(apfsrw_file *f);   /* current size (changes as the file is written) */
 
 /* Returns the target length, or a negative errno; buf gets a NUL-terminated prefix. */
 int apfsrw_readlink(apfsrw_node *n, char *buf, size_t size);
@@ -138,6 +139,23 @@ typedef struct apfsrw_setattr_t {
 } apfsrw_setattr_t;
 /* ctime is always set to now, as the Linux VFS does. */
 int apfsrw_setattr(apfsrw_node *n, const apfsrw_setattr_t *a);
+
+/*
+ * Crash simulation, for tests only. From now on device writes are counted
+ * (starting at 1); on write number `at` the process dies with exit code 99:
+ *   APFSRW_CRASH_COUNT  never crash, only count
+ *   APFSRW_CRASH_KILL   the writes before `at` all reached the device (a
+ *                       process crash; the OS keeps what was written)
+ *   APFSRW_CRASH_POWER  writes since the last flush are held back, and a
+ *                       random subset of them (seeded) reaches the device (a
+ *                       power cut with a volatile disk cache)
+ */
+#define APFSRW_CRASH_COUNT	1
+#define APFSRW_CRASH_KILL	2
+#define APFSRW_CRASH_POWER	3
+#define APFSRW_CRASH_NOBARRIER	4	/* POWER on a disk that ignores flushes (must corrupt) */
+void apfsrw_test_crash(int how, uint64_t at, uint32_t seed);
+uint64_t apfsrw_test_writes(void);
 
 #ifdef __cplusplus
 }

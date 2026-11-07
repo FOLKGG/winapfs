@@ -76,12 +76,12 @@ tests/verify.cpp         winapfs-verify: manifest checker (image or mounted dir)
   APFS's own hashing (case/normalization-insensitive per volume flags).
 - **Case**: `CaseSensitiveSearch` follows the volume. On case-insensitive
   volumes, Open returns the stored name as the NormalizedName.
-- **Mount**: `ApfsFs` caches directory path → inode. Metadata is cached forever
-  (`FileInfoTimeout = ~0`) since nothing changes. Fixed SD
-  `O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFX;;;WD)`; `ReadOnlyVolume = 1`.
-  WinFsp requires `Create`/`Overwrite` callbacks even when read-only; they
-  return STATUS_MEDIA_WRITE_PROTECTED. winfsp-x64.dll is delay-loaded via
-  `FspLoad`.
+- **Mount**: `ApfsFs` caches directory path → inode. Read-only: metadata is
+  cached forever (`FileInfoTimeout = ~0`), SD
+  `O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFX;;;WD)`, `ReadOnlyVolume = 1`,
+  and the write callbacks return STATUS_MEDIA_WRITE_PROTECTED. With `--rw`
+  (see W3): `FileInfoTimeout = 1000`, Everyone gets FA, the cache is
+  invalidated on rename/delete. winfsp-x64.dll is delay-loaded via `FspLoad`.
 - **Timestamps**: APFS ns since 1970 (pre-1970 stored as negative int64) →
   FILETIME with floor division.
 
@@ -253,7 +253,7 @@ requires fsck to fail. Encrypted containers aren't checked: apfsck can't
 decrypt, so Secret's encrypted metadata fails checksums (presumably block
 0x324 is Secret's; W6). `winapfs-cli list -l --flags` shows BSD/internal flags.
 
-### W3 status: engine writes done, mount write side next
+### W3 done: writes on images (engine, WinFsp `--rw`, crash safety)
 
 apfsrw write API (`src/kshim/apfsrw_write.c`, declared in `apfsrw.h`): create,
 mkdir, symlink, link, unlink, rmdir, rename (NOREPLACE), write, fsync,
@@ -291,7 +291,59 @@ Shim bugs the write tests found (all fixed):
    at unmount, so "unmounted cleanly" was lost nondeterministically.
 3. __block_write_begin marks a new block dirty when the folio is uptodate.
 
-Next: WinFsp write callbacks and `--rw`, then the crash test.
+**Mount write side.** `winapfs::Volume` has write virtuals (Create, Remove,
+Rename, Write, SetSize, SetTimes, SetMode, Sync; default -EROFS), implemented
+by RwVolume (Remove/Rename drop map nodes of inodes whose nlink hits 0, so
+they can be evicted and their orphans cleaned). `winapfs mount|mount-all
+--rw` opens the volume read-write on linux-apfs-rw; it is refused for `\\.\`
+paths (physical disks wait for W5), `--engine lib` and encrypted volumes.
+ApfsFs implements Create (file/dir, mode 0644/0755, 0444 with
+FILE_ATTRIBUTE_READONLY), Overwrite, Write (constrained I/O never extends),
+SetFileSize (allocation size only shrinks), SetBasicInfo (READONLY ↔ write
+bits, atime/mtime), CanDelete, Cleanup-delete, Rename (with replace), Flush
+(= sync); errno → NTSTATUS in one table. Not yet: setting creation time, the
+hidden attribute, writing to compressed files (EOPNOTSUPP), symlinks and hard
+links from Windows (W4).
+
+writetest backends: the same operations run on the engine (RwBackend) or
+through a mounted drive with plain Win32 calls (Win32Backend: CreateFileW,
+WriteFile, MoveFileExW, SetFileInformationByHandle, SetFileTime,
+SetFileAttributesW; no chmod/links, so it skips those). Modes:
+- `--win32 <X:> <manifest> <work.img> <model.json> [vol]`, run under `winapfs
+  mount <work> * --rw --run ...`, saves the model; `--verify <manifest>
+  <work.img> <model.json> [vol]` checks it afterwards through both engines.
+- `--crash <count|kill|power|nobarrier|fill> <at> <seed> <manifest> <src>
+  <work> <model> [vol]`: engine writes, sync, save model, then a churn of 400
+  ops under /crash with a simulated crash armed; `fill` instead fills the disk
+  to ENOSPC, deletes, waits for the space to come back and writes again.
+- `--verify-crash` (entries under /crash may exist), `--recover <work> [vol]`.
+
+**Crash simulation** (`apfsrw_test_crash`, kshim_bdev.c): device writes are
+counted after arming; at write N the process exits 99. `kill`: every earlier
+write reached the file. `power`: writes since the last flush are held in
+memory (reads see them), and a seeded random subset is applied at the crash:
+a power cut with a volatile cache, which checks the barriers. `nobarrier`:
+the same, but flushes don't release anything; this must corrupt the image,
+and it does (proves the checks can see damage). `tests/crash_test.ps1` counts
+the churn's writes, then crashes at 6 evenly spread points per mode and
+requires: fsck clean, the synced state exact through both engines, a
+read-write remount that writes, then `fsck -c` clean and the state still exact.
+
+CTest (104 tests, ~100 s): `mountwrite.*` (Win32 through the drive on basic
+bare/GPT, casesensitive, multivol VolB, each + verify, fsck, fsck -c),
+`mountwrite_refuse.{rawdisk,encrypted}`, `crash.*` (basic, casesensitive,
+VolB: 12 crashes each), `crash_detects.basic.img`, `diskfull.*` (basic,
+casesensitive) + verify + fsck -c.
+
+Findings: ENOSPC mid-churn leaves a consistent image. Deleted files' space
+comes back asynchronously (the driver's orphan cleanup work frees extents,
+and freed blocks count once the free queue is flushed at the next transaction
+start), as on Linux. apfsck can crash (access violation) on images corrupted
+by `nobarrier` (robustness bug, upstream too presumably).
+
+Next: W4 (fidelity writes), then the user's macOS `fsck_apfs` check of images
+written here (`build/tests/w32-*.img`, `crash-*.img`, `full-*.img` after a
+test run) before W5.
 
 ## Milestones (read path)
 
@@ -333,3 +385,9 @@ Next: WinFsp write callbacks and `--rw`, then the crash test.
 - Vendored upstream files have CRLF line endings (Git for Windows autocrlf):
   use the Edit tool, not perl/sed with `\n`, on files under third_party/.
 - No sealed-volume (signed system volume) testing; ApfsLib reads the fext tree.
+- `--rw` mounts: the creation time can't be set, FILE_ATTRIBUTE_HIDDEN is not
+  stored, compressed files can't be written, symlinks/hard links can't be made
+  from Windows, the SD is a fixed "Everyone: full access" (W4/W7). No refusal
+  yet for unclean/hibernated containers or sealed volumes (W5 list).
+- No Python in this environment (the Microsoft Store alias only); script with
+  PowerShell (.ps1 files) or the Edit tool.

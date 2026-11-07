@@ -438,3 +438,8 @@ int apfsrw_lookup_stored(apfsrw_node *dir_node, const char *name, size_t len, ap
 	}
 	return apfsrw_lookup(dir_node, name, len, out);
 }
+
+uint64_t apfsrw_file_size(apfsrw_file *af)
+{
+	return (uint64_t)i_size_read(af->f.f_inode);
+}

@@ -12,9 +12,11 @@
 
 namespace winapfs {
 
-// Fixed security descriptor: everything is readable by everyone; the volume
-// itself is read-only, so the write rights granted here are never usable.
-static const wchar_t *kSddl = L"O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFX;;;WD)";
+// Fixed security descriptors. macOS owners don't correspond to Windows
+// accounts, so like FAT/exFAT there are no per-file ACLs: read-only mounts
+// are readable by everyone, writable mounts writable by everyone.
+static const wchar_t *kSddlReadOnly = L"O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFX;;;WD)";
+static const wchar_t *kSddlWritable = L"O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)";
 
 constexpr size_t kDirCacheMax = 65536;
 
@@ -44,7 +46,7 @@ static uint64_t NsToFileTime(int64_t ns)
 
 ApfsFs::ApfsFs(std::unique_ptr<Volume> vol, const MountOptions &opts) : m_vol(std::move(vol)), m_opts(opts)
 {
-	ConvertStringSecurityDescriptorToSecurityDescriptorW(kSddl, SDDL_REVISION_1, &m_sd, &m_sd_size);
+	ConvertStringSecurityDescriptorToSecurityDescriptorW(m_vol->Writable() ? kSddlWritable : kSddlReadOnly, SDDL_REVISION_1, &m_sd, &m_sd_size);
 	VolumeSpace space;
 	if (m_vol->GetSpace(space) && space.block_size)
 		m_block_size = space.block_size;
@@ -214,6 +216,66 @@ NTSTATUS ApfsFs::Resolve(const wchar_t *path, Stat &st, std::wstring *normalized
 	return STATUS_SUCCESS;
 }
 
+NTSTATUS ApfsFs::ResolveParent(const wchar_t *path, uint64_t &parent, std::string &name, std::wstring *parent_normalized)
+{
+	std::wstring p = path ? path : L"";
+	while (p.size() > 1 && p.back() == L'\\')
+		p.pop_back();
+	size_t slash = p.rfind(L'\\');
+	if (slash == std::wstring::npos || slash + 1 >= p.size())
+		return STATUS_OBJECT_NAME_INVALID;
+	std::wstring last = p.substr(slash + 1);
+	if (last.find(L':') != std::wstring::npos)
+		return STATUS_OBJECT_NAME_INVALID;   // no named streams yet
+	Stat st;
+	std::wstring norm;
+	NTSTATUS r = Resolve(slash == 0 ? L"\\" : p.substr(0, slash).c_str(), st, &norm, nullptr);
+	if (!NT_SUCCESS(r))
+		return r == STATUS_OBJECT_NAME_NOT_FOUND ? STATUS_OBJECT_PATH_NOT_FOUND : r;
+	if (st.type != FileType::Dir)
+		return STATUS_OBJECT_PATH_NOT_FOUND;
+	parent = st.inode;
+	name = WindowsNameToApfs(last);
+	if (parent_normalized)
+		*parent_normalized = norm == L"\\" ? L"" : norm;
+	return STATUS_SUCCESS;
+}
+
+void ApfsFs::InvalidateCache()
+{
+	std::lock_guard<std::mutex> lock(m_cache_mutex);
+	m_dir_cache.clear();
+}
+
+// errno from the engine -> NTSTATUS
+static NTSTATUS Errno(int err)
+{
+	switch (-err)
+	{
+	case 0: return STATUS_SUCCESS;
+	case 1:  /* EPERM */
+	case 13: /* EACCES */ return STATUS_ACCESS_DENIED;
+	case 2:  /* ENOENT */ return STATUS_OBJECT_NAME_NOT_FOUND;
+	case 17: /* EEXIST */ return STATUS_OBJECT_NAME_COLLISION;
+	case 20: /* ENOTDIR */ return STATUS_NOT_A_DIRECTORY;
+	case 21: /* EISDIR */ return STATUS_FILE_IS_A_DIRECTORY;
+	case 22: /* EINVAL */ return STATUS_INVALID_PARAMETER;
+	case 27: /* EFBIG */
+	case 28: /* ENOSPC */ return STATUS_DISK_FULL;
+	case 30: /* EROFS */ return STATUS_MEDIA_WRITE_PROTECTED;
+	case 36: /* ENAMETOOLONG */ return STATUS_OBJECT_NAME_INVALID;
+	case 39: /* ENOTEMPTY */ return STATUS_DIRECTORY_NOT_EMPTY;
+	case 95: /* EOPNOTSUPP */ return STATUS_NOT_SUPPORTED;
+	case 12: /* ENOMEM */ return STATUS_INSUFFICIENT_RESOURCES;
+	default: return STATUS_UNEXPECTED_IO_ERROR;
+	}
+}
+
+static int64_t FileTimeToNs(uint64_t ft)
+{
+	return (static_cast<int64_t>(ft) - 116444736000000000LL) * 100;
+}
+
 // ---------------------------------------------------------------- WinFsp callbacks
 
 static NTSTATUS GetVolumeInfo(FSP_FILE_SYSTEM *fs, FSP_FSCTL_VOLUME_INFO *vi)
@@ -282,16 +344,211 @@ static NTSTATUS Open(FSP_FILE_SYSTEM *fs, PWSTR name, UINT32 create_options, UIN
 	return STATUS_SUCCESS;
 }
 
-// The create dispatcher requires these even on a read-only volume.
+// ---------------------------------------------------------------- writing
+// (the create dispatcher needs Create/Overwrite even on read-only volumes)
+
+static void Refresh(ApfsFs *self, ApfsFs::Node *node)
+{
+	Stat st;
+	if (self->Vol().GetStat(node->st.inode, st))
+		node->st = st;
+}
+
+static uint32_t ModeForAttributes(uint32_t mode, uint32_t attrs)
+{
+	mode &= 07777;
+	if (attrs & FILE_ATTRIBUTE_READONLY)
+		return mode & ~0222u;
+	if (!(mode & 0222))
+		return mode | 0200;
+	return mode;
+}
+
 static NTSTATUS Create(FSP_FILE_SYSTEM *fs, PWSTR name, UINT32 create_options, UINT32 granted_access, UINT32 attrs,
 	PSECURITY_DESCRIPTOR sd, UINT64 alloc, PVOID *ctx, FSP_FSCTL_FILE_INFO *fi)
 {
-	return STATUS_MEDIA_WRITE_PROTECTED;
+	ApfsFs *self = Self(fs);
+	if (!self->Vol().Writable())
+		return STATUS_MEDIA_WRITE_PROTECTED;
+
+	uint64_t parent;
+	std::string aname;
+	std::wstring pnorm;
+	NTSTATUS r = self->ResolveParent(name, parent, aname, &pnorm);
+	if (!NT_SUCCESS(r))
+		return r;
+	bool dir = (create_options & FILE_DIRECTORY_FILE) != 0;
+	uint32_t mode = dir ? 0755 : ((attrs & FILE_ATTRIBUTE_READONLY) ? 0444 : 0644);
+	DirEntry e;
+	int err = self->Vol().Create(parent, aname, dir, mode, e);
+	if (err)
+		return Errno(err);
+
+	std::unique_ptr<ApfsFs::Node> node(new ApfsFs::Node());
+	if (!self->Vol().GetStat(e.inode, node->st))
+		return STATUS_FILE_CORRUPT_ERROR;
+	node->name = aname;
+	self->FillFileInfo(node->st, node->name, *fi);
+
+	std::wstring norm = pnorm + L"\\" + ApfsNameToWindows(aname);
+	FSP_FSCTL_OPEN_FILE_INFO *ofi = FspFileSystemGetOpenFileInfo(fi);
+	size_t bytes = norm.size() * sizeof(wchar_t);
+	if (ofi->NormalizedName && bytes <= ofi->NormalizedNameSize)
+	{
+		memcpy(ofi->NormalizedName, norm.data(), bytes);
+		ofi->NormalizedNameSize = static_cast<UINT16>(bytes);
+	}
+	*ctx = node.release();
+	return STATUS_SUCCESS;
 }
 
 static NTSTATUS Overwrite(FSP_FILE_SYSTEM *fs, PVOID ctx, UINT32 attrs, BOOLEAN replace, UINT64 alloc, FSP_FSCTL_FILE_INFO *fi)
 {
-	return STATUS_MEDIA_WRITE_PROTECTED;
+	ApfsFs *self = Self(fs);
+	ApfsFs::Node *node = static_cast<ApfsFs::Node *>(ctx);
+	if (!self->Vol().Writable())
+		return STATUS_MEDIA_WRITE_PROTECTED;
+	int err = self->Vol().SetSize(node->st.inode, 0);
+	if (!err)
+	{
+		uint32_t mode = ModeForAttributes(node->st.mode, replace ? attrs : (attrs | self->Attributes(node->st, node->name)));
+		if (mode != (node->st.mode & 07777u))
+			err = self->Vol().SetMode(node->st.inode, mode);
+	}
+	Refresh(self, node);
+	self->FillFileInfo(node->st, node->name, *fi);
+	return Errno(err);
+}
+
+static NTSTATUS Write(FSP_FILE_SYSTEM *fs, PVOID ctx, PVOID buf, UINT64 off, ULONG len, BOOLEAN to_eof, BOOLEAN constrained,
+	PULONG transferred, FSP_FSCTL_FILE_INFO *fi)
+{
+	ApfsFs *self = Self(fs);
+	ApfsFs::Node *node = static_cast<ApfsFs::Node *>(ctx);
+	*transferred = 0;
+	if (node->st.type == FileType::Dir)
+		return STATUS_INVALID_DEVICE_REQUEST;
+	Refresh(self, node);
+	if (to_eof)
+		off = node->st.size;
+	if (constrained)
+	{
+		// paging I/O: never extends the file
+		if (off >= node->st.size)
+		{
+			self->FillFileInfo(node->st, node->name, *fi);
+			return STATUS_SUCCESS;
+		}
+		len = static_cast<ULONG>(std::min<uint64_t>(len, node->st.size - off));
+	}
+	size_t written = 0;
+	int err = self->Vol().Write(node->st.inode, off, buf, len, written);
+	*transferred = static_cast<ULONG>(written);
+	Refresh(self, node);
+	self->FillFileInfo(node->st, node->name, *fi);
+	return written ? STATUS_SUCCESS : Errno(err);
+}
+
+static NTSTATUS SetFileSize(FSP_FILE_SYSTEM *fs, PVOID ctx, UINT64 size, BOOLEAN set_alloc, FSP_FSCTL_FILE_INFO *fi)
+{
+	ApfsFs *self = Self(fs);
+	ApfsFs::Node *node = static_cast<ApfsFs::Node *>(ctx);
+	int err = 0;
+	Refresh(self, node);
+	// an allocation size below the file size truncates (NTFS semantics);
+	// otherwise allocation requests are hints the engine doesn't need
+	if (!set_alloc || size < node->st.size)
+		err = self->Vol().SetSize(node->st.inode, size);
+	Refresh(self, node);
+	self->FillFileInfo(node->st, node->name, *fi);
+	return Errno(err);
+}
+
+static NTSTATUS SetBasicInfo(FSP_FILE_SYSTEM *fs, PVOID ctx, UINT32 attrs, UINT64 ctime, UINT64 atime, UINT64 mtime, UINT64 chtime,
+	FSP_FSCTL_FILE_INFO *fi)
+{
+	ApfsFs *self = Self(fs);
+	ApfsFs::Node *node = static_cast<ApfsFs::Node *>(ctx);
+	int err = 0;
+	Refresh(self, node);
+	if (attrs != INVALID_FILE_ATTRIBUTES)
+	{
+		uint32_t mode = ModeForAttributes(node->st.mode, attrs);
+		if (mode != (node->st.mode & 07777u))
+			err = self->Vol().SetMode(node->st.inode, mode);
+	}
+	// creation time can't be set through the engine yet (see CLAUDE.md)
+	if (!err && (atime || mtime))
+		err = self->Vol().SetTimes(node->st.inode, atime ? FileTimeToNs(atime) : INT64_MIN, mtime ? FileTimeToNs(mtime) : INT64_MIN);
+	Refresh(self, node);
+	self->FillFileInfo(node->st, node->name, *fi);
+	return Errno(err);
+}
+
+static NTSTATUS CanDelete(FSP_FILE_SYSTEM *fs, PVOID ctx, PWSTR name)
+{
+	ApfsFs *self = Self(fs);
+	ApfsFs::Node *node = static_cast<ApfsFs::Node *>(ctx);
+	if (!self->Vol().Writable())
+		return STATUS_MEDIA_WRITE_PROTECTED;
+	if (node->st.type == FileType::Dir)
+	{
+		std::vector<DirEntry> ents;
+		if (!self->Vol().ListDir(node->st.inode, ents))
+			return STATUS_FILE_CORRUPT_ERROR;
+		if (!ents.empty())
+			return STATUS_DIRECTORY_NOT_EMPTY;
+	}
+	return STATUS_SUCCESS;
+}
+
+static VOID Cleanup(FSP_FILE_SYSTEM *fs, PVOID ctx, PWSTR name, ULONG flags)
+{
+	ApfsFs *self = Self(fs);
+	ApfsFs::Node *node = static_cast<ApfsFs::Node *>(ctx);
+	if (!(flags & FspCleanupDelete) || !name)
+		return;
+	uint64_t parent;
+	std::string aname;
+	if (!NT_SUCCESS(self->ResolveParent(name, parent, aname, nullptr)))
+		return;
+	int err = self->Vol().Remove(parent, aname, node->st.type == FileType::Dir);
+	if (err && self->Options().debug)
+		fprintf(stderr, "delete %ls: errno %d\n", name, -err);
+	self->InvalidateCache();
+}
+
+static NTSTATUS Rename(FSP_FILE_SYSTEM *fs, PVOID ctx, PWSTR name, PWSTR new_name, BOOLEAN replace)
+{
+	ApfsFs *self = Self(fs);
+	ApfsFs::Node *node = static_cast<ApfsFs::Node *>(ctx);
+	uint64_t op = 0, np = 0;
+	std::string on, nn;
+	NTSTATUS r = self->ResolveParent(name, op, on, nullptr);
+	if (NT_SUCCESS(r))
+		r = self->ResolveParent(new_name, np, nn, nullptr);
+	if (!NT_SUCCESS(r))
+		return r;
+	int err = self->Vol().Rename(op, on, np, nn, replace != FALSE);
+	if (err == -21 || err == -20)   /* EISDIR/ENOTDIR: replacing across file and directory */
+		return STATUS_ACCESS_DENIED;
+	if (!err)
+		node->name = nn;
+	self->InvalidateCache();
+	return Errno(err);
+}
+
+static NTSTATUS Flush(FSP_FILE_SYSTEM *fs, PVOID ctx, FSP_FSCTL_FILE_INFO *fi)
+{
+	ApfsFs *self = Self(fs);
+	int err = self->Vol().Writable() ? self->Vol().Sync() : 0;
+	if (ctx)
+	{
+		ApfsFs::Node *node = static_cast<ApfsFs::Node *>(ctx);
+		Refresh(self, node);
+		self->FillFileInfo(node->st, node->name, *fi);
+	}
+	return Errno(err);
 }
 
 static VOID Close(FSP_FILE_SYSTEM *fs, PVOID ctx)
@@ -339,8 +596,11 @@ static NTSTATUS Read(FSP_FILE_SYSTEM *fs, PVOID ctx, PVOID buf, UINT64 off, ULON
 
 static NTSTATUS GetFileInfo(FSP_FILE_SYSTEM *fs, PVOID ctx, FSP_FSCTL_FILE_INFO *fi)
 {
+	ApfsFs *self = Self(fs);
 	ApfsFs::Node *node = static_cast<ApfsFs::Node *>(ctx);
-	Self(fs)->FillFileInfo(node->st, node->name, *fi);
+	if (self->Vol().Writable())
+		Refresh(self, node);
+	self->FillFileInfo(node->st, node->name, *fi);
 	return STATUS_SUCCESS;
 }
 
@@ -412,9 +672,16 @@ static FSP_FILE_SYSTEM_INTERFACE g_interface = [] {
 	i.Create = Create;
 	i.Open = Open;
 	i.Overwrite = Overwrite;
+	i.Cleanup = Cleanup;
 	i.Close = Close;
 	i.Read = Read;
+	i.Write = Write;
+	i.Flush = Flush;
 	i.GetFileInfo = GetFileInfo;
+	i.SetBasicInfo = SetBasicInfo;
+	i.SetFileSize = SetFileSize;
+	i.CanDelete = CanDelete;
+	i.Rename = Rename;
 	i.GetSecurity = GetSecurity;
 	i.ReadDirectory = ReadDirectory;
 	return i;
@@ -431,12 +698,13 @@ NTSTATUS ApfsFs::Start(const wchar_t *mount_point)
 	vp.MaxComponentLength = 255;
 	vp.VolumeCreationTime = NsToFileTime(info.last_mod_ns);
 	vp.VolumeSerialNumber = static_cast<UINT32>(std::hash<std::string>()(info.uuid));
-	vp.FileInfoTimeout = 0xFFFFFFFF;  // read-only: metadata never changes
+	// read-only: metadata never changes, cache it forever
+	vp.FileInfoTimeout = m_vol->Writable() ? 1000 : 0xFFFFFFFF;
 	vp.CaseSensitiveSearch = info.case_sensitive ? 1 : 0;
 	vp.CasePreservedNames = 1;
 	vp.UnicodeOnDisk = 1;
 	vp.PersistentAcls = 1;
-	vp.ReadOnlyVolume = 1;
+	vp.ReadOnlyVolume = m_vol->Writable() ? 0 : 1;
 	vp.PostCleanupWhenModifiedOnly = 1;
 	vp.UmFileContextIsUserContext2 = 1;
 	wcscpy_s(vp.FileSystemName, L"APFS");

@@ -2,7 +2,8 @@
 // Copyright (C) 2026 winapfs contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
-// WinFsp file system for one APFS volume (native WinFsp API, read-only).
+// WinFsp file system for one APFS volume (native WinFsp API; read-only, or
+// read-write when the volume is writable).
 
 #pragma once
 
@@ -39,6 +40,10 @@ public:
 	// Shared with the WinFsp callbacks in ApfsFs.cpp.
 	struct Node;
 	NTSTATUS Resolve(const wchar_t *path, Stat &st, std::wstring *normalized, std::string *stream);
+	// Parent directory inode and last component (APFS bytes) of a path.
+	NTSTATUS ResolveParent(const wchar_t *path, uint64_t &parent, std::string &name, std::wstring *parent_normalized);
+	// Forget cached path -> inode mappings (after a rename or delete).
+	void InvalidateCache();
 	void FillFileInfo(const Stat &st, const std::string &name, FSP_FSCTL_FILE_INFO &fi);
 	NTSTATUS CopySecurity(PSECURITY_DESCRIPTOR sd, SIZE_T *size);
 	uint32_t Attributes(const Stat &st, const std::string &name);
