@@ -79,11 +79,19 @@ static int utf8_to_utf32(const u8 *s, int inlen, unicode_t *pu)
  */
 
 /* The arrays of unicode data are defined at the bottom of the file */
+#ifdef _MSC_VER /* winapfs: MSVC rejects static arrays of unknown size */
+static u16 nfd_trie[4016];
+static unicode_t nfd_values[3404];
+static u16 cf_trie[2944];
+static unicode_t cf_values[1521];
+static u8 ccc_trie[3520];
+#else
 static u16 nfd_trie[];
 static unicode_t nfd_values[];
 static u16 cf_trie[];
 static unicode_t cf_values[];
 static u8 ccc_trie[];
+#endif
 
 #define TRIE_HEIGHT		5
 

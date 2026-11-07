@@ -126,7 +126,7 @@ static bool node_is_valid(struct node *node)
 static void node_parse_key_free_list(struct node *node)
 {
 	struct apfs_nloc *free = &node->raw->btn_key_free_list;
-	void *area_raw = (void *)node->raw + node->key;
+	void *area_raw = (void *)((char *)node->raw + node->key);
 	int area_len = node->free - node->key;
 	int total = le16_to_cpu(free->len);
 	int off;
@@ -149,7 +149,7 @@ static void node_parse_key_free_list(struct node *node)
 			report("B-tree node",
 			       "no room for free list entry in key area.");
 
-		free = area_raw + off;
+		free = (void *)((char *)area_raw + off);
 		len = le16_to_cpu(free->len);
 		if (len < sizeof(*free))
 			report("B-tree node", "free key is too small.");
@@ -192,7 +192,7 @@ static void node_parse_val_free_list(struct node *node)
 	/* Only the root has a footer */
 	area_len = sb->s_blocksize - node->data -
 		   (node_is_root(node) ? sizeof(struct apfs_btree_info) : 0);
-	end_raw = (void *)node->raw + node->data + area_len;
+	end_raw = (void *)((char *)node->raw + node->data + area_len);
 
 	/* Each bit represents a byte in the value area */
 	node->free_val_bmap = malloc(DIV_ROUND_UP(area_len, 8));
@@ -212,7 +212,7 @@ static void node_parse_val_free_list(struct node *node)
 			report("B-tree node",
 			       "no room for free list entry in value area.");
 
-		free = end_raw - off;
+		free = (void *)((char *)end_raw - off);
 		len = le16_to_cpu(free->len);
 		if (len < sizeof(*free))
 			report("B-tree node", "free value is too small.");
@@ -983,7 +983,7 @@ static void parse_subtree(struct node *root,
 		if (len > btree->longest_key)
 			btree->longest_key = len;
 		bmap_mark_as_used(root->used_key_bmap, off - root->key, len);
-		raw_key = raw + off;
+		raw_key = (void *)((char *)raw + off);
 
 		if (btree_is_omap(btree)) {
 			read_omap_key(raw_key, len, &curr_key);
@@ -1020,7 +1020,7 @@ static void parse_subtree(struct node *root,
 
 		len = node_locate_data(root, i, &off);
 		bmap_mark_as_used(root->used_val_bmap, off - root->data, len);
-		raw_val = raw + off;
+		raw_val = (void *)((char *)raw + off);
 
 		if (node_is_leaf(root)) {
 			if (len > btree->longest_val)
@@ -1177,7 +1177,7 @@ static void check_btree_footer(struct btree *btree)
 	if (!node_is_root(root))
 		report(ctx, "wrong flag in root node.");
 
-	info = (void *)root->raw + sb->s_blocksize - sizeof(*info);
+	info = (void *)((char *)root->raw + sb->s_blocksize - sizeof(*info));
 	if (le32_to_cpu(info->bt_fixed.bt_node_size) != sb->s_blocksize)
 		report_unknown("Objects with more than one block");
 
@@ -1583,7 +1583,7 @@ static u64 child_from_query(struct query *query)
 	if (query->len != 8) /* The data on a nonleaf node is the child id */
 		report("B-tree", "wrong size of nonleaf record value.");
 
-	return le64_to_cpu(*(__le64 *)(raw + query->off));
+	return le64_to_cpu(*(__le64 *)((void *)((char *)raw + query->off)));
 }
 
 /**
@@ -1602,8 +1602,8 @@ static void extref_rec_from_query(struct query *query,
 	if (query->len != sizeof(*extref_val))
 		report("Extent reference record", "wrong size of value.");
 
-	extref_val = (struct apfs_phys_ext_val *)(raw + query->off);
-	extref_key = (struct apfs_phys_ext_key *)(raw + query->key_off);
+	extref_val = (struct apfs_phys_ext_val *)((void *)((char *)raw + query->off));
+	extref_key = (struct apfs_phys_ext_key *)((void *)((char *)raw + query->key_off));
 
 	/* The physical address is used as the id in the extentref tree */
 	extref->phys_addr = cat_cnid(&extref_key->hdr);
@@ -1639,8 +1639,8 @@ static void fext_rec_from_query(struct query *query, struct fext_record *fext)
 	if (query->len != sizeof(*fext_val))
 		report("Fext record", "wrong size of value.");
 
-	fext_val = (struct apfs_fext_tree_val *)(raw + query->off);
-	fext_key = (struct apfs_fext_tree_key *)(raw + query->key_off);
+	fext_val = (struct apfs_fext_tree_val *)((void *)((char *)raw + query->off));
+	fext_key = (struct apfs_fext_tree_key *)((void *)((char *)raw + query->key_off));
 
 	fext->log_addr = le64_to_cpu(fext_key->logical_addr);
 	fext->phys_bno = le64_to_cpu(fext_val->phys_block_num);
@@ -1707,8 +1707,8 @@ static void extent_from_query(struct query *query, struct fext_record *fext)
 	if (query->len != sizeof(*ext))
 		report("File extent record", "wrong size of value.");
 
-	ext = (struct apfs_file_extent_val *)(raw + query->off);
-	ext_key = (struct apfs_file_extent_key *)(raw + query->key_off);
+	ext = (struct apfs_file_extent_val *)((void *)((char *)raw + query->off));
+	ext_key = (struct apfs_file_extent_key *)((void *)((char *)raw + query->key_off));
 
 	fext->log_addr = le64_to_cpu(ext_key->logical_addr);
 	fext->phys_bno = le64_to_cpu(ext->phys_block_num);
@@ -1875,7 +1875,7 @@ void free_query(struct query *query)
 static void key_from_query(struct query *query, struct key *key)
 {
 	void *raw = query->node->raw;
-	void *raw_key = (void *)(raw + query->key_off);
+	void *raw_key = (void *)((void *)((char *)raw + query->key_off));
 
 	switch (query->flags & QUERY_TREE_MASK) {
 	case QUERY_CAT:

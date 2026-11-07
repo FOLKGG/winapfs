@@ -105,8 +105,18 @@ static void check_inode_stats(struct inode *inode)
 		report("Inode record",
 		       "symlink inode should come with target xattr.");
 	if ((bool)(inode->i_xattr_bmap & XATTR_BMAP_RSRC_FORK) !=
-	    (bool)(inode->i_flags & APFS_INODE_HAS_RSRC_FORK))
-		report("Inode record", "wrong flag for resource fork.");
+	    (bool)(inode->i_flags & APFS_INODE_HAS_RSRC_FORK)) {
+		/*
+		 * winapfs (upstream candidate): macOS keeps an empty resource fork
+		 * xattr with both fork flags clear on files ditto found
+		 * incompressible; see check_inode_internal_flags().
+		 */
+		if ((inode->i_xattr_bmap & XATTR_BMAP_RSRC_FORK) &&
+		    !(inode->i_flags & (APFS_INODE_HAS_RSRC_FORK | APFS_INODE_NO_RSRC_FORK)))
+			report_weird("Inode record resource fork flags");
+		else
+			report("Inode record", "wrong flag for resource fork.");
+	}
 	if ((bool)(inode->i_xattr_bmap & XATTR_BMAP_SECURITY) !=
 	    (bool)(inode->i_flags & APFS_INODE_HAS_SECURITY_EA))
 		report("Inode record", "wrong flag for access control list.");
@@ -775,8 +785,15 @@ static void check_inode_internal_flags(u64 flags, u64 ino)
 	if ((flags & APFS_INODE_DIR_STATS_ORIGIN) &&
 	    !(flags & APFS_INODE_MAINTAIN_DIR_STATS))
 		report("Inode record", "incompatible directory stats flags.");
-	if ((bool)(flags & APFS_INODE_HAS_RSRC_FORK) == (bool)(flags & APFS_INODE_NO_RSRC_FORK))
+	/*
+	 * winapfs (upstream candidate): macOS itself leaves both flags clear on
+	 * a file that ditto --hfsCompression found incompressible (it keeps an
+	 * empty resource fork xattr). Only both set is a contradiction.
+	 */
+	if ((flags & APFS_INODE_HAS_RSRC_FORK) && (flags & APFS_INODE_NO_RSRC_FORK))
 		report("Inode record", "incompatible resource fork flags.");
+	if (!(flags & (APFS_INODE_HAS_RSRC_FORK | APFS_INODE_NO_RSRC_FORK)))
+		report_weird("Inode record resource fork flags");
 
 	if (flags & APFS_INODE_BEING_TRUNCATED)
 		report_crash("Inode internal flags");

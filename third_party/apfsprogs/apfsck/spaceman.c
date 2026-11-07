@@ -169,7 +169,7 @@ static void *read_chunk_bitmap(u64 addr, u64 bmap, struct spaceman_device *dev)
 	if (addr >= sb->s_block_count)
 		report("Chunk-info", "chunk address is out of bounds.");
 
-	ret = buf = dev->sm_bitmap + chunk_number * sb->s_blocksize;
+	ret = buf = (void *)((char *)dev->sm_bitmap + chunk_number * sb->s_blocksize);
 	if (!bmap) /* The whole chunk is free, so leave this block as zero */
 		return ret;
 
@@ -179,7 +179,7 @@ static void *read_chunk_bitmap(u64 addr, u64 bmap, struct spaceman_device *dev)
 		read_bytes = apfs_pread(buf, count, offset);
 		if (read_bytes < 0)
 			system_error();
-		buf += read_bytes;
+		buf = (char *)buf + read_bytes; /* winapfs: no void* arithmetic in MSVC */
 		count -= read_bytes;
 		offset += read_bytes;
 	} while (read_bytes > 0);
@@ -199,7 +199,7 @@ static int count_chunk_free(void *bmap, u32 blks)
 	unsigned long long *curr, *end;
 	int free = blks;
 
-	end = bmap + sb->s_blocksize;
+	end = (void *)((char *)bmap + sb->s_blocksize);
 	for (curr = bmap; curr < end; ++curr)
 		free -= __builtin_popcountll(*curr);
 	return free;
@@ -425,7 +425,7 @@ static u16 spaceman_16_from_off(struct apfs_spaceman_phys *raw, u32 offset)
 static __le16 *spaceman_16_array_from_off(struct apfs_spaceman_phys *raw, u32 offset, u32 len)
 {
 	struct spaceman *sm = &sb->s_spaceman;
-	__le16 *array_p = (void *)raw + offset;
+	__le16 *array_p = (void *)((char *)raw + offset);
 
 	assert(sm->sm_struct_size);
 

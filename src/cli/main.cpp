@@ -19,6 +19,8 @@
 
 using namespace winapfs;
 
+static bool g_show_flags;  // list -l --flags: BSD and internal inode flags (debugging)
+
 static void Usage()
 {
 	fprintf(stderr,
@@ -77,6 +79,12 @@ static std::string FormatEntry(Volume &vol, const std::string &display, const Di
 		if (vol.GetStat(e.inode, st))
 			snprintf(buf, sizeof(buf), "%10llu %06o %3llu %12llu %s ", static_cast<unsigned long long>(st.inode), st.mode,
 				static_cast<unsigned long long>(st.nlink), static_cast<unsigned long long>(st.size), FormatTime(st.mod_ns).c_str());
+		if (g_show_flags && vol.GetStat(e.inode, st))
+		{
+			char fb[48];
+			snprintf(fb, sizeof(fb), "bsd=%08x int=%08llx ", st.bsd_flags, static_cast<unsigned long long>(st.internal_flags));
+			strcat_s(buf, fb);
+		}
 		else
 			snprintf(buf, sizeof(buf), "%10llu ?????? ? ? ? ", static_cast<unsigned long long>(e.inode));
 		line += buf;
@@ -389,6 +397,8 @@ int wmain(int argc, wchar_t **wargv)
 			o.recursive = true;
 		else if (a == "-l")
 			o.long_fmt = true;
+		else if (a == "--flags")
+			g_show_flags = o.long_fmt = true;
 		else if (a == "-h" || a == "--help")
 			return Usage(), 0;
 		else if (o.cmd.empty())

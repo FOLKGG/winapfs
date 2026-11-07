@@ -1391,7 +1391,11 @@ struct apfs_kb_locker {
 	__le16				kl_nkeys;
 	__le32				kl_nbytes;
 	__le64				padding;
+#ifdef _MSC_VER /* winapfs: MSVC rejects arrays of structs ending in a flexible array */
+	u8				kl_entries[];
+#else
 	struct apfs_keybag_entry	kl_entries[0];
+#endif
 } __packed;
 
 /*
@@ -1516,8 +1520,13 @@ struct apfs_compress_hdr {
 
 #define APFS_COMPRESS_ZLIB_ATTR		3
 #define APFS_COMPRESS_ZLIB_RSRC		4
+#define APFS_COMPRESS_LZVN_ATTR		7	/* winapfs (upstream candidate) */
+#define APFS_COMPRESS_LZVN_RSRC		8	/* winapfs */
 #define APFS_COMPRESS_PLAIN_ATTR	9
 #define APFS_COMPRESS_PLAIN_RSRC	10
+#define APFS_COMPRESS_LZFSE_ATTR	11	/* winapfs */
+#define APFS_COMPRESS_LZFSE_RSRC	12	/* winapfs */
+#define APFS_COMPRESS_LZBITMAP_ATTR	13	/* winapfs */
 #define APFS_COMPRESS_LZBITMAP_RSRC	14
 
 struct apfs_compress_rsrc_hdr {

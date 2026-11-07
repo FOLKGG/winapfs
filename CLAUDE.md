@@ -119,7 +119,29 @@ Read-write milestones (after M1–M3):
   attributes) and a crash test (kill mid-write → previous checkpoint is clean)
 - W4 writing the fidelity features (xattrs/ADS, symlinks, hard links, names)
 - W5 opt-in physical-disk writes with the refusals above
-- W6 encrypted RW, snapshots, installer, auto-mount service
+- W6 encrypted RW (engine decryption, then encrypted writes), snapshots
+- W7 installer and native-like behaviour (user request, 2026-11-07): one
+  `winapfs-setup.exe` (WiX Burn bundle) that installs WinFsp and a winapfs MSI,
+  after which APFS disks behave almost like NTFS ones:
+  - auto-mount service (LocalSystem): mounts every APFS volume on disk arrival
+    at a drive letter visible to all users, unmounts cleanly on removal,
+    shutdown and "Safely remove"; remembers drive letters per volume UUID
+  - encrypted volumes: a per-user tray helper asks for the password or
+    recovery key (a service can't prompt), optional remembering in the
+    Windows Credential Manager
+  - Explorer: label, capacity, icon, This PC entry, Eject; change
+    notifications so windows refresh after writes
+  - NTFS-like semantics on the mount: read-write by default once W5 is proven
+    (per-volume read-only switch), hard links, symlinks as reparse points,
+    xattrs as alternate data streams, sparse files, file IDs, timestamps,
+    sensible ACLs derived from POSIX owner/mode
+  - settings UI (per volume: read-only, drive letter, hide dotfiles), event log
+  - clean uninstall; MSI upgrades in place
+  - signing: WinFsp's kernel driver is already signed by its author, so
+    winapfs needs no driver signing; the installer itself should be
+    Authenticode-signed to avoid SmartScreen warnings (needs a certificate)
+  - licensing to check before shipping: WinFsp is GPLv3 with a FLOSS
+    exception; bundling it next to GPL-2.0-or-later winapfs
 
 ### W1 status: engine reads, not yet behind the mount
 
@@ -186,8 +208,43 @@ a folded hash match, so no case-insensitive lookup ever worked through it
 (open of `HELLO.TXT` failed; `dir` worked only because WinFsp matches patterns
 itself). Fixed with `StrCmpUtf8NormalizedFolded` (marked `winapfs:`).
 
-Next: W2 (apfsck as winapfs-fsck), then W3 writes (apfsrw write API, WinFsp
-write callbacks, ReadOnlyVolume off with `--rw`).
+### W2 done: winapfs-fsck
+
+apfsprogs' apfsck @ 1bd1c1c built with MSVC (`src/fsck/`):
+- `compat/` shadows POSIX headers for the C sources only (per-source include
+  paths; the VS generator can't do `$<COMPILE_LANGUAGE>` include dirs):
+  mmap = aligned buffer + positional read (apfsck only maps private,
+  read-only), pread/open/fstat/ioctl on Win32 handles with a page-aligned
+  bounce buffer (raw disks work), getopt, zlib_inflate_blob on real zlib,
+  `apfs/raw.h` wrapper adding `#pragma pack(1)`, 64-bit `off_t`.
+- `main.cpp` finds the APFS GPT partition (core library) and gives apfsck a
+  bare container; apfsck's `main` is renamed `apfsck_main`.
+- MSVC patches like the engine's (void* arithmetic, unicode table sizes,
+  kl_entries).
+
+apfsck bugs found against macOS-made images, fixed and marked
+`winapfs (upstream candidate)` (worth sending to apfsprogs):
+1. keybag entries are padded to 16 bytes, and kl_nbytes counts the 16-byte
+   locker header: the unpadded walk misread every macOS keybag whose first
+   key length isn't a multiple of 16.
+2. no LZVN/LZFSE support at all (constants, decmpfs parsing, decoding; now via
+   Apple's lzfse), and LZVN/LZFSE resource forks were parsed with the zlib
+   resource-fork header, so every ditto-compressed file was "corrupt".
+3. macOS leaves both resource-fork inode flags clear on files ditto found
+   incompressible (empty ResourceFork xattr): now a -w "weird" report, not
+   corruption.
+4. container keybag volume-key entries from macOS are DER blobs (0x7c), not
+   bare 0x28 key wraps: now report_unknown.
+
+Tests: `fsck.*` and `fsck_crash.*` (-c) on every unencrypted image are clean;
+`fsck_detects.*` builds damaged copies with `apfs-corrupt` (a flipped byte in
+the omap root; a misdirected omap record with a fixed-up checksum) and
+requires fsck to fail. Encrypted containers aren't checked: apfsck can't
+decrypt, so Secret's encrypted metadata fails checksums (presumably block
+0x324 is Secret's; W6). `winapfs-cli list -l --flags` shows BSD/internal flags.
+
+Next: W3 writes (apfsrw write API, WinFsp write callbacks, ReadOnlyVolume off
+with `--rw`), each write test ending in winapfs-fsck clean + ApfsLib re-read.
 
 ## Milestones (read path)
 

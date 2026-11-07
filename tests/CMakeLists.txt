@@ -148,3 +148,20 @@ if(TARGET winapfs)
 			--run "\"$<TARGET_FILE:winapfs-verify>\" \"${TD}/basic.Basic.manifest.json\" --dir %MOUNT% --fields ${MOUNT_FIELDS}")
 	set_tests_properties(mount_lib.basic.img PROPERTIES RESOURCE_LOCK winfsp_mount)
 endif()
+
+# W2: winapfs-fsck (apfsprogs' apfsck). Every unencrypted image must check
+# clean; apfsck cannot decrypt, so encrypted containers wait for W6.
+add_executable(apfs-corrupt apfs_corrupt.cpp)
+foreach(img basic.container basic compressed links casesensitive multivol)
+	add_test(NAME fsck.${img} COMMAND winapfs-fsck ${TD}/${img}.img)
+	add_test(NAME fsck_crash.${img} COMMAND winapfs-fsck -c ${TD}/${img}.img)
+endforeach()
+# and it must notice damage: a flipped byte, and a misdirected omap record
+# whose checksum has been fixed up
+foreach(mode omap-flip omap-misdirect)
+	add_test(NAME fsck_detects.${mode}.prepare
+		COMMAND apfs-corrupt ${TD}/basic.container.img ${CMAKE_CURRENT_BINARY_DIR}/corrupt-${mode}.img ${mode})
+	set_tests_properties(fsck_detects.${mode}.prepare PROPERTIES FIXTURES_SETUP corrupt-${mode})
+	add_test(NAME fsck_detects.${mode} COMMAND winapfs-fsck ${CMAKE_CURRENT_BINARY_DIR}/corrupt-${mode}.img)
+	set_tests_properties(fsck_detects.${mode} PROPERTIES WILL_FAIL TRUE FIXTURES_REQUIRED corrupt-${mode})
+endforeach()

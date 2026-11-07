@@ -70,6 +70,7 @@ target_compile_options(apfsrw PRIVATE /W3 /wd4244 /wd4267 /wd4018 /wd4146)
 # ---------------------------------------------------------------- winapfs
 add_subdirectory(src/core)
 add_subdirectory(src/cli)
+add_subdirectory(src/fsck)
 
 find_path(WINFSP_INCLUDE_DIR winfsp/winfsp.h
 	HINTS "$ENV{ProgramFiles\(x86\)}/WinFsp/inc" "C:/Program Files (x86)/WinFsp/inc")

@@ -161,7 +161,7 @@ static void fusion_super_compare(struct apfs_nx_superblock *mainsb)
 	to_read = sb->s_blocksize;
 	offset = 0;
 	do {
-		ret = pread(fd_tier2, (void *)tier2sb + offset, to_read, offset);
+		ret = pread(fd_tier2, (void *)((char *)tier2sb + offset), to_read, offset);
 		if (ret < 0)
 			system_error();
 		to_read -= ret;

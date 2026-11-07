@@ -11,8 +11,14 @@
 
 static void check_volume_key_entry(const u8 *keydata, u16 keylen)
 {
+	/*
+	 * winapfs (upstream candidate): 0x28 is a bare RFC 3394 wrapped key.
+	 * macOS-made software-encrypted volumes carry a DER-encoded wrapped VEK
+	 * here instead (0x7c bytes in the test images; apfs-fuse decodes it), so
+	 * another size is an unknown format, not corruption.
+	 */
 	if (keylen != 0x28)
-		report("Volume key entry in keybag", "wrong size.");
+		report_unknown("DER-encoded volume key entry in keybag");
 }
 
 static void check_volume_unlock_records_entry(const u8 *keydata, u16 keylen)
@@ -62,7 +68,13 @@ static u16 check_keybag_entry(struct apfs_keybag_entry *entry, u16 remaining)
 	keylen = le16_to_cpu(entry->ke_keylen);
 	if (keylen > APFS_VOL_KEYBAG_ENTRY_MAX_SIZE - sizeof(*entry))
 		report("Keybag entry", "is too big.");
-	entry_len = keylen + sizeof(*entry);
+	/*
+	 * winapfs (upstream candidate): entries in a locker are padded to a
+	 * multiple of 16 bytes. Without this, a keybag whose first key length is
+	 * not a multiple of 16 (macOS-made software-encrypted volumes) has its
+	 * second entry read at the wrong offset.
+	 */
+	entry_len = ROUND_UP(keylen + sizeof(*entry), 16);
 	if (entry_len > remaining)
 		report("Keybag entry", "too big for allocated bytes.");
 
@@ -123,21 +135,23 @@ static void check_keybag_locker(struct apfs_kb_locker *locker)
 	if (nbytes > sb->s_blocksize - sizeof(*locker))
 		report("Keybag locker", "won't fit in block.");
 
-	entry = &locker->kl_entries[0];
+	entry = (void *)&locker->kl_entries[0]; /* winapfs: kl_entries is u8[] on MSVC */
 	for (i = 0; i < nkeys; ++i) {
 		u16 entry_len;
 
 		entry_len = check_keybag_entry(entry, nbytes);
-		entry = (void *)entry + entry_len;
+		entry = (void *)((char *)entry + entry_len);
 		nbytes -= entry_len;
 	}
 
 	/*
-	 * So far I've always seen a leftover of 0x18 bytes here. I'm guessing
-	 * it's a terminating null entry.
+	 * winapfs (upstream candidate): kl_nbytes counts the locker header plus
+	 * the entries, each padded to 16 bytes, so the header size is what is
+	 * left. (The 0x18 seen before was that header plus the last entry's 8
+	 * bytes of padding, which the unpadded walk didn't consume.)
 	 */
-	if (nbytes != sizeof(*entry))
-		report("Keybag locker", "bad byte count.");
+	if (nbytes != sizeof(*locker))
+		report("Keybag locker", "bad byte count (%u left, %u keys).", nbytes, nkeys);
 	if (!keybag_entry_is_null(entry))
 		report("Keybag locker", "missing null termination.");
 }
@@ -160,7 +174,7 @@ static void check_keybag_plaintext(void *raw)
 	if (!obj->o_xid || le64_to_cpu(obj->o_xid) > sb->s_xid)
 		report("Keybag header", "bad transaction id.");
 
-	check_keybag_locker(raw + sizeof(*obj));
+	check_keybag_locker((void *)((char *)raw + sizeof(*obj)));
 }
 
 static void check_keybag_plaintext_block(u64 bno)

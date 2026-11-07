@@ -104,6 +104,8 @@ static void parse_decmpfs(struct inode *inode, u8 *xdata, int len)
 	switch (algo) {
 	case APFS_COMPRESS_PLAIN_ATTR:
 	case APFS_COMPRESS_ZLIB_ATTR:
+	case APFS_COMPRESS_LZVN_ATTR:	/* winapfs (upstream candidate): LZVN/LZFSE */
+	case APFS_COMPRESS_LZFSE_ATTR:
 		if (compress->rsrc_dstream)
 			report("Compressed inode", "should not have a resource fork.");
 		if (apfs_volume_is_sealed()) {
@@ -114,6 +116,8 @@ static void parse_decmpfs(struct inode *inode, u8 *xdata, int len)
 	case APFS_COMPRESS_PLAIN_RSRC:
 	case APFS_COMPRESS_ZLIB_RSRC:
 	case APFS_COMPRESS_LZBITMAP_RSRC:
+	case APFS_COMPRESS_LZVN_RSRC:	/* winapfs */
+	case APFS_COMPRESS_LZFSE_RSRC:
 		if (len != sizeof(*hdr))
 			report("Decmpfs xattr", "too big for non-inline.");
 		if (!compress->rsrc_dstream)
