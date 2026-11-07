@@ -126,6 +126,7 @@ public:
 	uint64_t FreeBlocks() const;
 	const std::string &Path() const { return m_path; }
 	uint64_t PartitionOffset() const { return m_offset; }
+	uint64_t PartitionSize() const { return m_size; }
 
 private:
 	Container() = default;
@@ -139,49 +140,89 @@ private:
 	std::mutex m_open_mutex;  // GetVolume stores the passphrase in the container
 };
 
+struct VolumeSpace
+{
+	uint32_t block_size = 4096;
+	uint64_t total_bytes = 0;
+	uint64_t free_bytes = 0;
+};
+
+// A mounted APFS volume, independent of the engine behind it: ApfsLib
+// (LibVolume, read-only, supports encryption) or linux-apfs-rw (RwVolume).
+// Inode numbers are the APFS object ids. Thread-safe.
 class Volume
 {
 public:
-	~Volume();
+	virtual ~Volume() = default;
 
 	const VolumeInfo &Info() const { return m_info; }
-	Container &GetContainer() const { return m_container; }
+	virtual const char *EngineName() const = 0;
+	virtual bool GetSpace(VolumeSpace &space) = 0;
 
-	bool GetStat(uint64_t inode, Stat &st);
+	virtual bool GetStat(uint64_t inode, Stat &st) = 0;
 
 	// One path component, matched the way APFS does on this volume
-	// (case/normalization-insensitive where the volume says so).
-	bool Lookup(uint64_t parent, const std::string &name, DirEntry &out);
+	// (case/normalization-insensitive where the volume says so). out.name is
+	// the stored name.
+	virtual bool Lookup(uint64_t parent, const std::string &name, DirEntry &out) = 0;
 
 	// "/a/b/c" (or "" / "/" for the root). Does not follow symlinks.
 	bool ResolvePath(const std::string &path, uint64_t &inode);
 
-	bool ListDir(uint64_t dir_inode, std::vector<DirEntry> &entries);
+	virtual bool ListDir(uint64_t dir_inode, std::vector<DirEntry> &entries) = 0;
 
-	std::unique_ptr<FileReader> OpenFile(const Stat &st, std::string &err);
+	virtual std::unique_ptr<FileReader> OpenFile(const Stat &st, std::string &err) = 0;
 
 	// Extended attributes as macOS userland sees them: the decmpfs xattr,
-	// a compressed file's resource fork and com.apple.fs.* are hidden.
-	bool ListXattrs(uint64_t inode, const Stat &st, std::vector<std::string> &names);
-	bool GetXattr(uint64_t inode, const std::string &name, std::vector<uint8_t> &data);
-	bool GetXattrSize(uint64_t inode, const std::string &name, uint64_t &size);
-	// Ranged read of an xattr value; stream-backed xattrs are read in place.
-	bool ReadXattr(uint64_t inode, const std::string &name, uint64_t off, void *buf, size_t len, size_t &got);
-	bool ReadLink(uint64_t inode, std::string &target);
+	// a compressed file's resource fork, empty resource forks and
+	// com.apple.fs.* are hidden.
+	virtual bool ListXattrs(uint64_t inode, const Stat &st, std::vector<std::string> &names) = 0;
+	virtual bool GetXattr(uint64_t inode, const std::string &name, std::vector<uint8_t> &data) = 0;
+	virtual bool GetXattrSize(uint64_t inode, const std::string &name, uint64_t &size) = 0;
+	virtual bool ReadXattr(uint64_t inode, const std::string &name, uint64_t off, void *buf, size_t len, size_t &got) = 0;
+	virtual bool ReadLink(uint64_t inode, std::string &target) = 0;
+
+protected:
+	explicit Volume(const VolumeInfo &info) : m_info(info) {}
+	VolumeInfo m_info;
+};
+
+// ApfsLib-backed volume (read-only; the only engine that decrypts).
+class LibVolume : public Volume
+{
+public:
+	~LibVolume() override;
+
+	const char *EngineName() const override { return "apfs-fuse"; }
+	bool GetSpace(VolumeSpace &space) override;
+	bool GetStat(uint64_t inode, Stat &st) override;
+	bool Lookup(uint64_t parent, const std::string &name, DirEntry &out) override;
+	bool ListDir(uint64_t dir_inode, std::vector<DirEntry> &entries) override;
+	std::unique_ptr<FileReader> OpenFile(const Stat &st, std::string &err) override;
+	bool ListXattrs(uint64_t inode, const Stat &st, std::vector<std::string> &names) override;
+	bool GetXattr(uint64_t inode, const std::string &name, std::vector<uint8_t> &data) override;
+	bool GetXattrSize(uint64_t inode, const std::string &name, uint64_t &size) override;
+	// Stream-backed xattrs are read in place.
+	bool ReadXattr(uint64_t inode, const std::string &name, uint64_t off, void *buf, size_t len, size_t &got) override;
+	bool ReadLink(uint64_t inode, std::string &target) override;
 
 	// Raw data-stream read (no decompression), used by FileReader.
 	bool ReadStream(uint64_t private_id, uint64_t off, void *buf, size_t len);
-
 	ApfsVolume &Raw() { return *m_vol; }
+	Container &GetContainer() const { return m_container; }
 
 private:
 	friend class Container;
-	Volume(Container &c, std::unique_ptr<ApfsVolume> v, const VolumeInfo &info);
+	LibVolume(Container &c, std::unique_ptr<ApfsVolume> v, const VolumeInfo &info);
 
 	Container &m_container;
 	std::unique_ptr<ApfsVolume> m_vol;
-	VolumeInfo m_info;
 };
+
+// Opens volume fsid of the container with the linux-apfs-rw engine. The
+// volume keeps its own device handle, so the Container may be closed after.
+// Encrypted volumes are not supported by that engine (err says so).
+std::unique_ptr<Volume> OpenRwVolume(const Container &c, unsigned fsid, bool readwrite, std::string &err);
 
 struct PhysicalDrive
 {

@@ -423,3 +423,29 @@ long apfsrw_getxattr(apfsrw_node *n, const char *name, void *buf, size_t size)
 		return -EOPNOTSUPP;
 	return h->get(h, d, d->d_inode, name, buf, size);
 }
+
+/* dir.c (winapfs addition) */
+int apfs_stored_name_by_name(struct inode *dir, const struct qstr *child, u64 *ino, char *buf, size_t size);
+
+int apfsrw_lookup_stored(apfsrw_node *dir_node, const char *name, size_t len, apfsrw_node **out, char *stored, size_t stored_size)
+{
+	struct dentry *dir = D(dir_node);
+	struct inode *di = dir->d_inode;
+	struct qstr q;
+	u64 ino;
+	int err;
+
+	if (stored_size) {
+		if (len == 0 || len > NAME_MAX || !S_ISDIR(di->i_mode))
+			return apfsrw_lookup(dir_node, name, len, out);
+		q.hash_len = 0;
+		q.len = (u32)len;
+		q.name = (const unsigned char *)name;
+		inode_lock_shared(di);
+		err = apfs_stored_name_by_name(di, &q, &ino, stored, stored_size);
+		inode_unlock_shared(di);
+		if (err)
+			return err;
+	}
+	return apfsrw_lookup(dir_node, name, len, out);
+}

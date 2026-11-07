@@ -40,6 +40,8 @@ static void Usage()
 		"                             instead of a free drive letter\n"
 		"  -p, --password <pw>        password or recovery key for encrypted volumes\n"
 		"  --ask                      prompt for the password of encrypted volumes\n"
+		"  --engine auto|rw|lib       auto (default): linux-apfs-rw, or apfs-fuse for\n"
+		"                             encrypted volumes; rw or lib forces one\n"
 		"  --hide-dotfiles            mark names starting with '.' hidden\n"
 		"  --run <command>            mount, run command, unmount, and exit with its exit\n"
 		"                             code. %%MOUNT%% is the mount point (mount); the\n"
@@ -64,6 +66,7 @@ struct Args
 	std::wstring dir;
 	bool ask = false;
 	int partition = -1;
+	std::string engine = "auto";
 	MountOptions opts;
 };
 
@@ -84,6 +87,7 @@ static bool ParseArgs(const std::vector<std::wstring> &argv, Args &a)
 		else if (s == L"--partition") { if (!next(v)) return false; a.partition = _wtoi(v.c_str()); }
 		else if (s == L"--dir") { if (!next(a.dir)) return false; }
 		else if (s == L"--run") { if (!next(a.run)) return false; }
+		else if (s == L"--engine") { if (!next(v)) return false; a.engine = WideToUtf8(v); if (a.engine != "auto" && a.engine != "rw" && a.engine != "lib") return false; }
 		else if (s == L"--ask") a.ask = true;
 		else if (s == L"--hide-dotfiles") a.opts.hide_dotfiles = true;
 		else if (s == L"-d" || s == L"--debug") a.opts.debug = true;
@@ -157,6 +161,20 @@ static std::unique_ptr<Volume> OpenVolume(Container &c, const VolumeInfo &vi, co
 {
 	std::string pw = a.password;
 	std::string err;
+
+	// linux-apfs-rw for everything it supports; ApfsLib for encrypted volumes
+	if (a.engine == "rw" || (a.engine == "auto" && !vi.encrypted))
+	{
+		std::unique_ptr<Volume> v = OpenRwVolume(c, vi.fsid, false, err);
+		if (v || a.engine == "rw")
+		{
+			if (!v)
+				fprintf(stderr, "%s: %s\n", vi.name.c_str(), err.c_str());
+			return v;
+		}
+		fprintf(stderr, "%s: %s; falling back to apfs-fuse\n", vi.name.c_str(), err.c_str());
+	}
+
 	for (int attempt = 0; attempt < 3; attempt++)
 	{
 		if (vi.encrypted && pw.empty() && a.ask)
@@ -194,7 +212,7 @@ static bool MountOne(Session &s, std::unique_ptr<Volume> vol, const std::wstring
 		return false;
 	}
 	std::wstring mp = fs->MountPoint();
-	fprintf(stderr, "mounted %s at %ls (read-only)\n", name.c_str(), mp.c_str());
+	fprintf(stderr, "mounted %s at %ls (read-only, %s)\n", name.c_str(), mp.c_str(), fs->Vol().EngineName());
 	SetEnvironmentVariableW(Utf8ToWide(EnvName(name)).c_str(), mp.c_str());
 	s.mounts.push_back(std::move(fs));
 	return true;

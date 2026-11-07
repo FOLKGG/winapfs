@@ -136,7 +136,7 @@ public:
 // Byte source for the resource fork: embedded xattr bytes or a data stream.
 struct RsrcSource
 {
-	Volume *vol = nullptr;
+	LibVolume *vol = nullptr;
 	bool stream = false;
 	uint64_t obj_id = 0;
 	uint64_t size = 0;
@@ -239,7 +239,7 @@ uint32_t Be32(const uint8_t *p) { return (static_cast<uint32_t>(p[0]) << 24) | (
 
 } // namespace
 
-std::unique_ptr<FileReader> OpenCompressedFile(Volume &vol, const Stat &st, std::string &err)
+std::unique_ptr<FileReader> OpenCompressedFile(LibVolume &vol, const Stat &st, std::string &err)
 {
 	std::vector<uint8_t> hdr;
 	if (!vol.GetXattr(st.inode, "com.apple.decmpfs", hdr) || hdr.size() < sizeof(CompressionHeader))

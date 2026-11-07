@@ -398,6 +398,11 @@ struct address_space_operations {
 #define buffer_migrate_folio	NULL
 
 /* ------------------------------------------------------------ inode */
+#undef S_IFMT
+#undef S_IFDIR
+#undef S_IFCHR
+#undef S_IFREG
+#undef S_IFIFO
 #define S_IFMT		00170000
 #define S_IFSOCK	0140000
 #define S_IFLNK		0120000

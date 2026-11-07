@@ -247,7 +247,7 @@ std::unique_ptr<Volume> Container::OpenVolume(unsigned fsid, const std::string &
 			err = "cannot load volume " + info->name;
 		return nullptr;
 	}
-	return std::unique_ptr<Volume>(new Volume(*this, std::move(vol), *info));
+	return std::unique_ptr<Volume>(new LibVolume(*this, std::move(vol), *info));
 }
 
 uint32_t Container::BlockSize() const { return m_nx->GetBlocksize(); }
@@ -256,14 +256,29 @@ uint64_t Container::FreeBlocks() const { return m_nx->GetFreeBlocks(); }
 
 // ---------------------------------------------------------------- Volume
 
-Volume::Volume(Container &c, std::unique_ptr<ApfsVolume> v, const VolumeInfo &info)
-	: m_container(c), m_vol(std::move(v)), m_info(info)
+LibVolume::LibVolume(Container &c, std::unique_ptr<ApfsVolume> v, const VolumeInfo &info)
+	: Volume(info), m_container(c), m_vol(std::move(v))
 {
 }
 
-Volume::~Volume() = default;
+LibVolume::~LibVolume() = default;
 
-bool Volume::GetStat(uint64_t inode, Stat &st)
+bool LibVolume::GetSpace(VolumeSpace &space)
+{
+	uint64_t bs = m_container.BlockSize();
+	space.block_size = static_cast<uint32_t>(bs);
+	space.total_bytes = m_container.BlockCount() * bs;
+	space.free_bytes = m_container.FreeBlocks() * bs;
+	if (m_info.quota_bytes)
+	{
+		space.total_bytes = m_info.quota_bytes;
+		uint64_t left = m_info.quota_bytes > m_info.bytes_used ? m_info.quota_bytes - m_info.bytes_used : 0;
+		space.free_bytes = std::min(space.free_bytes, left);
+	}
+	return true;
+}
+
+bool LibVolume::GetStat(uint64_t inode, Stat &st)
 {
 	ApfsDir dir(*m_vol);
 	ApfsDir::Inode rec;
@@ -320,7 +335,7 @@ bool Volume::GetStat(uint64_t inode, Stat &st)
 	return true;
 }
 
-bool Volume::Lookup(uint64_t parent, const std::string &name, DirEntry &out)
+bool LibVolume::Lookup(uint64_t parent, const std::string &name, DirEntry &out)
 {
 	ApfsDir dir(*m_vol);
 	ApfsDir::DirRec rec;
@@ -359,7 +374,7 @@ bool Volume::ResolvePath(const std::string &path, uint64_t &inode)
 	return true;
 }
 
-bool Volume::ListDir(uint64_t dir_inode, std::vector<DirEntry> &entries)
+bool LibVolume::ListDir(uint64_t dir_inode, std::vector<DirEntry> &entries)
 {
 	ApfsDir dir(*m_vol);
 	std::vector<ApfsDir::DirRec> recs;
@@ -379,7 +394,7 @@ bool Volume::ListDir(uint64_t dir_inode, std::vector<DirEntry> &entries)
 	return true;
 }
 
-bool Volume::ReadStream(uint64_t private_id, uint64_t off, void *buf, size_t len)
+bool LibVolume::ReadStream(uint64_t private_id, uint64_t off, void *buf, size_t len)
 {
 	ApfsDir dir(*m_vol);
 	return dir.ReadFile(buf, private_id, off, len);
@@ -390,7 +405,7 @@ namespace {
 class PlainReader : public FileReader
 {
 public:
-	PlainReader(Volume &v, uint64_t private_id, uint64_t size) : m_vol(v), m_id(private_id), m_size(size) {}
+	PlainReader(LibVolume &v, uint64_t private_id, uint64_t size) : m_vol(v), m_id(private_id), m_size(size) {}
 
 	uint64_t Size() const override { return m_size; }
 
@@ -410,14 +425,14 @@ public:
 	}
 
 private:
-	Volume &m_vol;
+	LibVolume &m_vol;
 	uint64_t m_id;
 	uint64_t m_size;
 };
 
 } // namespace
 
-std::unique_ptr<FileReader> Volume::OpenFile(const Stat &st, std::string &err)
+std::unique_ptr<FileReader> LibVolume::OpenFile(const Stat &st, std::string &err)
 {
 	if (st.type != FileType::File)
 	{
@@ -429,7 +444,7 @@ std::unique_ptr<FileReader> Volume::OpenFile(const Stat &st, std::string &err)
 	return std::unique_ptr<FileReader>(new PlainReader(*this, st.private_id, st.size));
 }
 
-bool Volume::ListXattrs(uint64_t inode, const Stat &st, std::vector<std::string> &names)
+bool LibVolume::ListXattrs(uint64_t inode, const Stat &st, std::vector<std::string> &names)
 {
 	ApfsDir dir(*m_vol);
 	std::vector<std::string> all;
@@ -455,13 +470,13 @@ bool Volume::ListXattrs(uint64_t inode, const Stat &st, std::vector<std::string>
 	return true;
 }
 
-bool Volume::GetXattr(uint64_t inode, const std::string &name, std::vector<uint8_t> &data)
+bool LibVolume::GetXattr(uint64_t inode, const std::string &name, std::vector<uint8_t> &data)
 {
 	ApfsDir dir(*m_vol);
 	return dir.GetAttribute(data, inode, name.c_str());
 }
 
-bool Volume::GetXattrSize(uint64_t inode, const std::string &name, uint64_t &size)
+bool LibVolume::GetXattrSize(uint64_t inode, const std::string &name, uint64_t &size)
 {
 	ApfsDir dir(*m_vol);
 	ApfsDir::XAttr xa;
@@ -471,7 +486,7 @@ bool Volume::GetXattrSize(uint64_t inode, const std::string &name, uint64_t &siz
 	return true;
 }
 
-bool Volume::ReadXattr(uint64_t inode, const std::string &name, uint64_t off, void *buf, size_t len, size_t &got)
+bool LibVolume::ReadXattr(uint64_t inode, const std::string &name, uint64_t off, void *buf, size_t len, size_t &got)
 {
 	ApfsDir dir(*m_vol);
 	ApfsDir::XAttr xa;
@@ -499,7 +514,7 @@ bool Volume::ReadXattr(uint64_t inode, const std::string &name, uint64_t off, vo
 	return true;
 }
 
-bool Volume::ReadLink(uint64_t inode, std::string &target)
+bool LibVolume::ReadLink(uint64_t inode, std::string &target)
 {
 	std::vector<uint8_t> data;
 	if (!GetXattr(inode, "com.apple.fs.symlink", data))

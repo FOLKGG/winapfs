@@ -839,7 +839,10 @@ int ApfsDir::CompareStdDirKey(const void *skey, size_t skey_len, const void *eke
 				if ((e->name_len_and_hash & J_DREC_HASH_MASK) > (s->name_len_and_hash & J_DREC_HASH_MASK))
 					return 1;
 
-				return apfs_strncmp(e->name, e->name_len_and_hash & J_DREC_LEN_MASK, s->name, s->name_len_and_hash & J_DREC_LEN_MASK);
+				// winapfs: same hash; names are equal under the volume's
+				// normalization (and case folding when insensitive). Upstream
+				// compared bytes, so "HELLO.TXT" never found "hello.txt".
+				return StrCmpUtf8NormalizedFolded(e->name, s->name, (dir->m_txt_fmt & APFS_INCOMPAT_CASE_INSENSITIVE) != 0);
 			}
 			else
 			{

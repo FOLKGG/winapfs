@@ -10,6 +10,6 @@ namespace winapfs {
 
 // Reader for decmpfs (UF_COMPRESSED) files: zlib, LZVN, LZFSE, LZBITMAP and
 // stored-raw, inline in com.apple.decmpfs or chunked in the resource fork.
-std::unique_ptr<FileReader> OpenCompressedFile(Volume &vol, const Stat &st, std::string &err);
+std::unique_ptr<FileReader> OpenCompressedFile(LibVolume &vol, const Stat &st, std::string &err);
 
 } // namespace winapfs

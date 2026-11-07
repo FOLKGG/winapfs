@@ -28,6 +28,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
+#include <sys/stat.h>   /* first, so the kernel S_IF* below replace the CRT ones */
 
 #ifdef __cplusplus
 extern "C" {
@@ -189,6 +191,8 @@ __declspec(noreturn) void kshim_bug(const char *file, int line);
 #define cond_resched()	((void)0)
 
 /* ------------------------------------------------------------ arithmetic */
+#undef min
+#undef max
 #define min(a, b)	((a) < (b) ? (a) : (b))
 #define max(a, b)	((a) > (b) ? (a) : (b))
 #define min_t(t, a, b)	((t)(a) < (t)(b) ? (t)(a) : (t)(b))
@@ -326,6 +330,7 @@ char *strsep(char **s, const char *ct);
 int kstrtouint(const char *s, unsigned int base, unsigned int *res);
 #define strnicmp	_strnicmp
 static inline bool isascii_(int c) { return (unsigned)c < 128; }
+#undef isascii
 #define isascii isascii_
 
 /* ------------------------------------------------------------ lists */

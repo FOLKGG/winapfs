@@ -166,9 +166,28 @@ Patches to vendored linux-apfs-rw (all marked `winapfs:`), needed only for MSVC:
   btree.c, extents.c, inode.c, node.c, spaceman.c, super.c, xattr.c, xfield.c.
   Regenerate the list with `git diff` against upstream before syncing.
 
-Next for W1: an engine interface in the WinFsp front-end (rw engine for
-unencrypted volumes, ApfsLib for encrypted), and the `mount.*` tests on it.
-Then W2 (apfsck port) and W3 writes.
+### W1b done: the mount runs on linux-apfs-rw
+
+`winapfs::Volume` (src/core/winapfs/Apfs.h) is now an interface:
+- `LibVolume`: ApfsLib, read-only, the only engine that decrypts.
+- `RwVolume` (RwVolume.cpp): linux-apfs-rw via the apfsrw API. Keeps an
+  inode -> node map (the engine works on looked-up dentries); `ListDir` looks
+  every child up so the following `GetStat` finds it. Stored names come from
+  `apfsrw_lookup_stored` (driver helper `apfs_stored_name_by_name`, a winapfs
+  addition in dir.c).
+- `winapfs mount|mount-all --engine auto|rw|lib`; auto = linux-apfs-rw, or
+  ApfsLib for encrypted volumes. The mount message names the engine.
+- Tests: `mount.*` now run on linux-apfs-rw; `mount_lib.basic.img` keeps the
+  ApfsLib mount covered; `mount_case.{rw,lib}.{insensitive,sensitive}` and
+  `cli.cat_case` check name matching. 44 tests.
+
+Found on the way: ApfsLib's drec comparator compared names byte-for-byte after
+a folded hash match, so no case-insensitive lookup ever worked through it
+(open of `HELLO.TXT` failed; `dir` worked only because WinFsp matches patterns
+itself). Fixed with `StrCmpUtf8NormalizedFolded` (marked `winapfs:`).
+
+Next: W2 (apfsck as winapfs-fsck), then W3 writes (apfsrw write API, WinFsp
+write callbacks, ReadOnlyVolume off with `--rw`).
 
 ## Milestones (read path)
 
@@ -198,6 +217,10 @@ Then W2 (apfsck port) and W3 writes.
 - Hard links appear as independent files (same IndexNumber); WinFsp has no
   hard-link count (`HardLinks` is unimplemented).
 - Fusion drives (two devices) are not exposed by the front-ends.
+- RwVolume's inode -> node map holds every node it has seen until unmount
+  (fine for tests; a big volume walk will grow memory; needs an LRU).
+- Git Bash rewrites "/path" arguments to C:/Program Files/Git/...; use
+  `MSYS_NO_PATHCONV=1` or PowerShell when passing APFS paths to the tools.
 - kshim: unreferenced inodes stay cached until unmount (no inode reclaim yet);
   ioctl `unsigned long arg` is 32-bit on Windows, so pointer ioctls must not go
   through the driver's ioctl handlers; `pgoff_t` is 32-bit (16 TiB file limit).

@@ -55,6 +55,7 @@ private:
 	FSP_FILE_SYSTEM *m_fs = nullptr;
 	PSECURITY_DESCRIPTOR m_sd = nullptr;
 	DWORD m_sd_size = 0;
+	uint32_t m_block_size = 4096;
 
 	// Directory path -> (inode, normalized path). Only directories are cached
 	// (the hot part of path resolution); entries never go stale on a read-only

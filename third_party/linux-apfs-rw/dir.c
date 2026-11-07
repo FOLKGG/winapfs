@@ -176,6 +176,41 @@ out:
 	return err;
 }
 
+/*
+ * winapfs: like apfs_inode_by_name(), but also return the name as stored on
+ * disk, which differs from @child on case- or normalization-insensitive
+ * volumes. Windows needs it to report the real case of a name. @buf gets a
+ * NUL-terminated copy (truncated to @size). Returns 0 or a negative errno.
+ */
+int apfs_stored_name_by_name(struct inode *dir, const struct qstr *child, u64 *ino, char *buf, size_t size)
+{
+	struct super_block *sb = dir->i_sb;
+	struct apfs_nxsb_info *nxi = APFS_NXI(sb);
+	struct apfs_query *query;
+	struct apfs_drec drec;
+	size_t len;
+	int err = 0;
+
+	down_read(&nxi->nx_big_sem);
+	query = apfs_dentry_lookup(dir, child, &drec);
+	if (IS_ERR(query)) {
+		err = PTR_ERR(query);
+		goto out;
+	}
+	*ino = drec.ino;
+	if (size) {
+		len = strnlen((char *)drec.name, drec.name_len);
+		if (len >= size)
+			len = size - 1;
+		memcpy(buf, drec.name, len);
+		buf[len] = 0;
+	}
+	apfs_free_query(query);
+out:
+	up_read(&nxi->nx_big_sem);
+	return err;
+}
+
 static int apfs_readdir(struct file *file, struct dir_context *ctx)
 {
 	struct inode *inode = file_inode(file);

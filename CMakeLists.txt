@@ -64,6 +64,7 @@ set_target_properties(apfsrw PROPERTIES C_STANDARD 23)
 target_include_directories(apfsrw BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/kshim/include ${TP}/linux-apfs-rw)
 target_include_directories(apfsrw PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/kshim/api)
 target_link_libraries(apfsrw PRIVATE lzfse zlib)
+target_compile_definitions(apfsrw PRIVATE NOMINMAX)
 target_compile_options(apfsrw PRIVATE /W3 /wd4244 /wd4267 /wd4018 /wd4146)
 
 # ---------------------------------------------------------------- winapfs

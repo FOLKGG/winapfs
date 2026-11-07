@@ -1078,7 +1078,7 @@ sector_t generic_block_bmap(struct address_space *m, sector_t block, get_block_t
 {
 	struct buffer_head tmp;
 	memset(&tmp, 0, sizeof(tmp));
-	tmp.b_size = 1u << m->host->i_blkbits;
+	tmp.b_size = (size_t)1 << m->host->i_blkbits;
 	get_block(m->host, block, &tmp, 0);
 	return tmp.b_blocknr;
 }

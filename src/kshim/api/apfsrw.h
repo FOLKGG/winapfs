@@ -78,6 +78,9 @@ bool apfsrw_is_readwrite(apfsrw_mount *m);
 int apfsrw_root(apfsrw_mount *m, apfsrw_node **out);
 /* -ENOENT if the name does not exist */
 int apfsrw_lookup(apfsrw_node *dir, const char *name, size_t len, apfsrw_node **out);
+/* Like apfsrw_lookup, but also returns the name as stored on disk (its case and
+ * normalization may differ from name on insensitive volumes). */
+int apfsrw_lookup_stored(apfsrw_node *dir, const char *name, size_t len, apfsrw_node **out, char *stored, size_t stored_size);
 apfsrw_node *apfsrw_get(apfsrw_node *n);
 void apfsrw_put(apfsrw_node *n);
 int apfsrw_getattr(apfsrw_node *n, apfsrw_stat *st);

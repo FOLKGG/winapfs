@@ -128,3 +128,23 @@ foreach(v ${VOLUMES})
 		set_tests_properties(rwengine.${img}.${vol} PROPERTIES WILL_FAIL TRUE)
 	endif()
 endforeach()
+
+# Name matching: case/normalization-insensitive volumes find any spelling,
+# case-sensitive ones only the exact one. Both engines, CLI and mount.
+add_test(NAME cli.cat_case COMMAND winapfs-cli cat ${TD}/basic.container.img /HELLO.TXT)
+set_tests_properties(cli.cat_case PROPERTIES PASS_REGULAR_EXPRESSION "^Hello, APFS!\n$")
+if(TARGET winapfs)
+	foreach(engine rw lib)
+		add_test(NAME mount_case.${engine}.insensitive
+			COMMAND winapfs mount ${TD}/basic.container.img * --engine ${engine} --run "cmd /c type %MOUNT%${BS}HELLO.TXT")
+		set_tests_properties(mount_case.${engine}.insensitive PROPERTIES PASS_REGULAR_EXPRESSION "Hello, APFS!" RESOURCE_LOCK winfsp_mount)
+		add_test(NAME mount_case.${engine}.sensitive
+			COMMAND winapfs mount ${TD}/casesensitive.img * --engine ${engine} --run "cmd /c type %MOUNT%${BS}README.TXT")
+		set_tests_properties(mount_case.${engine}.sensitive PROPERTIES WILL_FAIL TRUE RESOURCE_LOCK winfsp_mount)
+	endforeach()
+	# auto picks linux-apfs-rw for unencrypted volumes; keep the apfs-fuse mount path covered
+	add_test(NAME mount_lib.basic.img
+		COMMAND winapfs mount ${TD}/basic.img * --engine lib
+			--run "\"$<TARGET_FILE:winapfs-verify>\" \"${TD}/basic.Basic.manifest.json\" --dir %MOUNT% --fields ${MOUNT_FIELDS}")
+	set_tests_properties(mount_lib.basic.img PROPERTIES RESOURCE_LOCK winfsp_mount)
+endif()

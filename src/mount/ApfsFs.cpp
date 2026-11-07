@@ -45,6 +45,9 @@ static uint64_t NsToFileTime(int64_t ns)
 ApfsFs::ApfsFs(std::unique_ptr<Volume> vol, const MountOptions &opts) : m_vol(std::move(vol)), m_opts(opts)
 {
 	ConvertStringSecurityDescriptorToSecurityDescriptorW(kSddl, SDDL_REVISION_1, &m_sd, &m_sd_size);
+	VolumeSpace space;
+	if (m_vol->GetSpace(space) && space.block_size)
+		m_block_size = space.block_size;
 }
 
 ApfsFs::~ApfsFs()
@@ -72,7 +75,7 @@ uint32_t ApfsFs::Attributes(const Stat &st, const std::string &name)
 
 void ApfsFs::FillFileInfo(const Stat &st, const std::string &name, FSP_FSCTL_FILE_INFO &fi)
 {
-	uint64_t bs = m_vol->GetContainer().BlockSize();
+	uint64_t bs = m_block_size;
 	memset(&fi, 0, sizeof(fi));
 	fi.FileAttributes = Attributes(st, name);
 	fi.ReparseTag = 0;
@@ -216,19 +219,12 @@ NTSTATUS ApfsFs::Resolve(const wchar_t *path, Stat &st, std::wstring *normalized
 static NTSTATUS GetVolumeInfo(FSP_FILE_SYSTEM *fs, FSP_FSCTL_VOLUME_INFO *vi)
 {
 	ApfsFs *self = Self(fs);
-	Container &c = self->Vol().GetContainer();
 	const VolumeInfo &info = self->Vol().Info();
-	uint64_t bs = c.BlockSize();
+	VolumeSpace space;
 
-	uint64_t total = c.BlockCount() * bs;
-	uint64_t free_bytes = c.FreeBlocks() * bs;
-	if (info.quota_bytes)
-	{
-		total = info.quota_bytes;
-		free_bytes = info.quota_bytes > info.bytes_used ? std::min(free_bytes, info.quota_bytes - info.bytes_used) : 0;
-	}
-	vi->TotalSize = total;
-	vi->FreeSize = free_bytes;
+	self->Vol().GetSpace(space);
+	vi->TotalSize = space.total_bytes;
+	vi->FreeSize = space.free_bytes;
 
 	std::wstring label = Utf8ToWide(info.name);
 	if (label.size() > 32)
@@ -431,7 +427,7 @@ NTSTATUS ApfsFs::Start(const wchar_t *mount_point)
 	memset(&vp, 0, sizeof(vp));
 	vp.Version = sizeof(FSP_FSCTL_VOLUME_PARAMS);
 	vp.SectorSize = 4096;
-	vp.SectorsPerAllocationUnit = static_cast<UINT16>(std::max<uint32_t>(1, m_vol->GetContainer().BlockSize() / 4096));
+	vp.SectorsPerAllocationUnit = static_cast<UINT16>(std::max<uint32_t>(1, m_block_size / 4096));
 	vp.MaxComponentLength = 255;
 	vp.VolumeCreationTime = NsToFileTime(info.last_mod_ns);
 	vp.VolumeSerialNumber = static_cast<UINT32>(std::hash<std::string>()(info.uuid));
