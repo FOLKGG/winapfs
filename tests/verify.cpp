@@ -254,8 +254,45 @@ struct DirWalker
 {
 	std::wstring root;  // \\?\X:
 	bool want_hash;
+	bool want_xattrs;   // named streams = xattrs
 	std::map<std::string, Entry> out;
 	int errors = 0;
+
+	void Streams(const std::wstring &wp, Entry &e)
+	{
+		e.has_xattrs = true;
+		WIN32_FIND_STREAM_DATA sd;
+		HANDLE fh = FindFirstStreamW(wp.c_str(), FindStreamInfoStandard, &sd, 0);
+		if (fh == INVALID_HANDLE_VALUE)
+			return;   // ERROR_HANDLE_EOF: no streams (directories without xattrs)
+		do
+		{
+			std::wstring s = sd.cStreamName;   // ":name:$DATA", "::$DATA" for the data
+			if (s.size() < 7 || s.compare(s.size() - 6, 6, L":$DATA") != 0 || s == L"::$DATA")
+				continue;
+			std::wstring sname = s.substr(1, s.size() - 7);
+			HANDLE h = CreateFileW((wp + L":" + sname).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+				FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+			if (h == INVALID_HANDLE_VALUE)
+			{
+				fprintf(stderr, "open stream failed: %ls:%ls (error %lu)\n", wp.c_str(), sname.c_str(), GetLastError());
+				errors++;
+				continue;
+			}
+			Sha256 sha;
+			std::vector<uint8_t> buf(1 << 16);
+			uint64_t total = 0;
+			DWORD got = 0;
+			while (ReadFile(h, buf.data(), static_cast<DWORD>(buf.size()), &got, nullptr) && got)
+			{
+				sha.Update(buf.data(), got);
+				total += got;
+			}
+			CloseHandle(h);
+			e.xattrs[WindowsNameToApfs(sname)] = { total, sha.Hex() };
+		} while (FindNextStreamW(fh, &sd));
+		FindClose(fh);
+	}
 
 	void Hash(const std::wstring &wp, const std::string &path, Entry &e)
 	{
@@ -339,6 +376,8 @@ struct DirWalker
 				if (want_hash)
 					Hash(ToWinPath(root, p), p, e);
 			}
+			if (want_xattrs && e.type != "symlink" && e.type != "fifo")
+				Streams(ToWinPath(root, p), e);
 			out[p] = e;
 			if (e.type == "dir" && depth < 512)
 				Walk(p, depth + 1);
@@ -366,7 +405,9 @@ struct DirWalker
 				WCHAR path[1];
 			};
 			const Rdb *r = reinterpret_cast<const Rdb *>(buf.data());
-			std::wstring sub(r->path + r->sub_off / 2, r->sub_len / 2);
+			// the print name carries the stored target (the substitute name may be
+			// rewritten so that Windows can follow it)
+			std::wstring sub(r->path + r->print_off / 2, r->print_len / 2);
 			// winapfs stores POSIX-style targets with '\' separators; map back
 			for (auto &c : sub)
 				if (c == L'\\')
@@ -715,7 +756,7 @@ int wmain(int argc, wchar_t **wargv)
 			root.pop_back();
 		if (root.compare(0, 4, L"\\\\?\\") != 0)
 			root = L"\\\\?\\" + root;
-		DirWalker w{ root, want_hash };
+		DirWalker w{ root, want_hash, fields.count("xattrs") != 0 };
 		w.Walk("/", 0);
 		actual = std::move(w.out);
 		walk_errors += w.errors;

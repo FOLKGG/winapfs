@@ -20,14 +20,48 @@ static const wchar_t *kSddlWritable = L"O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;F
 
 constexpr size_t kDirCacheMax = 65536;
 
+// WSL's reparse tags for special files (not in the SDK headers)
+constexpr ULONG kTagLxFifo = 0x80000024;
+constexpr ULONG kTagLxChr = 0x80000025;
+constexpr ULONG kTagLxBlk = 0x80000026;
+constexpr ULONG kTagAfUnix = 0x80000023;
+
 struct ApfsFs::Node
 {
 	Stat st;
 	std::string name;           // last path component (APFS bytes)
+	std::string stream;         // named stream = this xattr; empty = the file's data
 	std::mutex mutex;
-	std::unique_ptr<FileReader> reader;
+	std::shared_ptr<FileReader> reader;   // shared: Read uses it outside the lock
 	PVOID dir_buffer = nullptr;
 };
+
+// "\dir\file:stream:$DATA" -> ("\dir\file", "stream"). false if the type isn't $DATA.
+static bool SplitStream(const std::wstring &path, std::wstring &base, std::wstring &stream)
+{
+	size_t slash = path.rfind(L'\\');
+	size_t colon = path.find(L':', slash == std::wstring::npos ? 0 : slash);
+	base = path;
+	stream.clear();
+	if (colon == std::wstring::npos)
+		return true;
+	base = path.substr(0, colon);
+	stream = path.substr(colon + 1);
+	size_t type = stream.find(L':');
+	if (type != std::wstring::npos)
+	{
+		if (_wcsicmp(stream.c_str() + type + 1, L"$DATA") != 0)
+			return false;
+		stream.resize(type);
+	}
+	return true;
+}
+
+// FILETIME values that mean "leave unchanged" in SetBasicInfo
+static bool TimeGiven(UINT64 ft)
+{
+	return ft != 0 && ft < 0xFFFFFFFFFFFFFFFEull;
+}
 
 static ApfsFs *Self(FSP_FILE_SYSTEM *fs)
 {
@@ -64,15 +98,254 @@ uint32_t ApfsFs::Attributes(const Stat &st, const std::string &name)
 	uint32_t a = 0;
 	if (st.type == FileType::Dir)
 		a |= FILE_ATTRIBUTE_DIRECTORY;
+	if (ReparseTag(st))
+	{
+		a |= FILE_ATTRIBUTE_REPARSE_POINT;
+		if (st.type == FileType::Symlink && SymlinkIsDir(st))
+			a |= FILE_ATTRIBUTE_DIRECTORY;   // a directory link, as mklink /d makes
+	}
 	if (st.bsd_flags & kUF_HIDDEN)
 		a |= FILE_ATTRIBUTE_HIDDEN;
 	if (m_opts.hide_dotfiles && !name.empty() && name[0] == '.')
 		a |= FILE_ATTRIBUTE_HIDDEN;
 	if (st.bsd_flags & (kUF_IMMUTABLE | kSF_IMMUTABLE))
 		a |= FILE_ATTRIBUTE_READONLY;
+	// writable mounts: "read-only" is a file without write permission bits
+	if (m_vol->Writable() && st.type == FileType::File && !(st.mode & 0222))
+		a |= FILE_ATTRIBUTE_READONLY;
 	if (a == 0)
 		a = FILE_ATTRIBUTE_ARCHIVE;
 	return a;
+}
+
+uint32_t ApfsFs::ReparseTag(const Stat &st)
+{
+	switch (st.type)
+	{
+	case FileType::Symlink: return IO_REPARSE_TAG_SYMLINK;
+	case FileType::Fifo: return kTagLxFifo;
+	case FileType::CharDev: return kTagLxChr;
+	case FileType::BlockDev: return kTagLxBlk;
+	case FileType::Socket: return kTagAfUnix;
+	default: return 0;
+	}
+}
+
+// Resolves a symlink target relative to directory dir, following further
+// symlinks (at most 8 deep). Targets that leave the volume fail.
+// macOS mounts volumes at /Volumes/<name>; absolute targets into this volume
+// become volume-rooted ("/x").
+std::string ApfsFs::LocalTarget(const std::string &t)
+{
+	std::string prefix = "/Volumes/" + m_vol->Info().name;
+	if (t.compare(0, prefix.size(), prefix) == 0 && (t.size() == prefix.size() || t[prefix.size()] == '/'))
+		return t.size() == prefix.size() ? "/" : t.substr(prefix.size());
+	return t;
+}
+
+bool ApfsFs::FollowLink(uint64_t dir, const std::string &t_in, int depth, Stat &out)
+{
+	std::string t = LocalTarget(t_in);
+	if (depth > 8 || t.empty() || (t.size() >= 2 && t[1] == ':'))
+		return false;
+	uint64_t cur = t[0] == '/' ? kRootInode : dir;
+	Stat cst;
+	if (!m_vol->GetStat(cur, cst))
+		return false;
+	size_t pos = 0;
+	while (pos <= t.size())
+	{
+		size_t next = t.find('/', pos);
+		if (next == std::string::npos)
+			next = t.size();
+		std::string c = t.substr(pos, next - pos);
+		pos = next + 1;
+		if (c.empty() || c == ".")
+			continue;
+		if (cst.type != FileType::Dir)
+			return false;
+		if (c == "..")
+		{
+			if (cur != kRootInode)
+				cur = cst.parent;
+			if (!m_vol->GetStat(cur, cst))
+				return false;
+			continue;
+		}
+		DirEntry e;
+		Stat s;
+		if (!m_vol->Lookup(cur, c, e) || !m_vol->GetStat(e.inode, s))
+			return false;
+		if (s.type == FileType::Symlink)
+		{
+			std::string t2;
+			if (!m_vol->ReadLink(s.inode, t2) || !FollowLink(cur, t2, depth + 1, s))
+				return false;
+		}
+		cur = s.inode;
+		cst = s;
+	}
+	out = cst;
+	return true;
+}
+
+bool ApfsFs::SymlinkIsDir(const Stat &st)
+{
+	std::string t;
+	Stat target;
+	return m_vol->ReadLink(st.inode, t) && FollowLink(st.parent, t, 0, target) && target.type == FileType::Dir;
+}
+
+// POSIX target -> Windows. Components are name-mapped like file names;
+// "/x" (relative to the volume root on Windows: rooted relative link) keeps
+// its leading separator; "C:/x" (a link made on Windows to another drive) is
+// absolute again.
+void ApfsFs::PosixTargetToWindows(const std::string &target, std::wstring &sub, std::wstring &print, bool &relative)
+{
+	bool drive = target.size() >= 2 && isalpha(static_cast<unsigned char>(target[0])) && target[1] == ':' &&
+		(target.size() == 2 || target[2] == '/');
+	std::wstring w;
+	size_t pos = 0;
+	bool first = true;
+	while (pos <= target.size())
+	{
+		size_t next = target.find('/', pos);
+		if (next == std::string::npos)
+			next = target.size();
+		std::string c = target.substr(pos, next - pos);
+		if (!first)
+			w.push_back(L'\\');
+		if (first && drive)
+			w += Utf8ToWide(c);
+		else if (c == "." || c == "..")
+			w += Utf8ToWide(c);
+		else
+			w += ApfsNameToWindows(c);
+		first = false;
+		pos = next + 1;
+	}
+	relative = !drive;
+	print = w;
+	sub = drive ? L"\\??\\" + w : w;
+}
+
+std::string ApfsFs::WindowsTargetToPosix(const std::wstring &sub_in, bool relative, const std::wstring &link_dir)
+{
+	auto split = [](const std::wstring &s) {
+		std::vector<std::wstring> v;
+		size_t pos = 0;
+		while (pos <= s.size())
+		{
+			size_t next = s.find(L'\\', pos);
+			if (next == std::wstring::npos)
+				next = s.size();
+			v.push_back(s.substr(pos, next - pos));
+			pos = next + 1;
+		}
+		return v;
+	};
+	auto join = [](const std::vector<std::wstring> &comps, size_t from, bool keep_first_raw) {
+		std::string out;
+		for (size_t i = from; i < comps.size(); i++)
+		{
+			if (i > from)
+				out.push_back('/');
+			const std::wstring &c = comps[i];
+			out += (c == L"." || c == L".." || c.empty() || (keep_first_raw && i == from)) ? WideToUtf8(c) : WindowsNameToApfs(c);
+		}
+		return out;
+	};
+	std::wstring sub = sub_in;
+	for (auto &c : sub)
+		if (c == L'/')
+			c = L'\\';
+	if (relative)
+		return join(split(sub), 0, false);
+
+	if (sub.compare(0, 4, L"\\??\\") == 0 || sub.compare(0, 4, L"\\\\?\\") == 0)
+		sub = sub.substr(4);
+	// inside this volume: store it relative to the link, so it works on macOS too
+	std::wstring mp = MountPoint();
+	if (!mp.empty() && sub.size() >= mp.size() && _wcsnicmp(sub.c_str(), mp.c_str(), mp.size()) == 0 &&
+		(sub.size() == mp.size() || sub[mp.size()] == L'\\'))
+	{
+		std::vector<std::wstring> t, d;
+		for (const auto &c : split(sub.substr(mp.size())))
+			if (!c.empty())
+				t.push_back(c);
+		for (const auto &c : split(link_dir))
+			if (!c.empty())
+				d.push_back(c);
+		bool ci = !m_vol->Info().case_sensitive;
+		size_t common = 0;
+		while (common < t.size() && common < d.size() &&
+			(ci ? _wcsicmp(t[common].c_str(), d[common].c_str()) == 0 : t[common] == d[common]))
+			common++;
+		std::vector<std::wstring> rel;
+		for (size_t i = common; i < d.size(); i++)
+			rel.push_back(L"..");
+		for (size_t i = common; i < t.size(); i++)
+			rel.push_back(t[i]);
+		return rel.empty() ? "." : join(rel, 0, false);
+	}
+	if (sub.compare(0, 4, L"UNC\\") == 0)
+		return "/" + join(split(sub.substr(3)), 0, false);   // //server/share/...
+	return join(split(sub), 0, true);                        // C:/x/y
+}
+
+NTSTATUS ApfsFs::MakeReparseData(const Stat &st, PVOID buf, PSIZE_T size)
+{
+	uint32_t tag = ReparseTag(st);
+	if (!tag)
+		return STATUS_NOT_A_REPARSE_POINT;
+	std::vector<uint8_t> data(REPARSE_DATA_BUFFER_HEADER_SIZE);
+	if (tag == IO_REPARSE_TAG_SYMLINK)
+	{
+		std::string target;
+		if (!m_vol->ReadLink(st.inode, target))
+			return STATUS_FILE_CORRUPT_ERROR;
+		// the substitute name (what Windows follows) has /Volumes/<this
+		// volume>/... rooted at the volume; the print name keeps the stored target
+		std::wstring sub, print, unused;
+		bool relative, unused_rel;
+		PosixTargetToWindows(LocalTarget(target), sub, unused, relative);
+		PosixTargetToWindows(target, unused, print, unused_rel);
+		size_t head = FIELD_OFFSET(REPARSE_DATA_BUFFER, SymbolicLinkReparseBuffer.PathBuffer);
+		size_t sub_b = sub.size() * sizeof(WCHAR), print_b = print.size() * sizeof(WCHAR);
+		if (head + sub_b + print_b > MAXIMUM_REPARSE_DATA_BUFFER_SIZE)
+			return STATUS_IO_REPARSE_DATA_INVALID;
+		data.assign(head + sub_b + print_b, 0);
+		REPARSE_DATA_BUFFER *r = reinterpret_cast<REPARSE_DATA_BUFFER *>(data.data());
+		r->SymbolicLinkReparseBuffer.SubstituteNameOffset = 0;
+		r->SymbolicLinkReparseBuffer.SubstituteNameLength = static_cast<USHORT>(sub_b);
+		r->SymbolicLinkReparseBuffer.PrintNameOffset = static_cast<USHORT>(sub_b);
+		r->SymbolicLinkReparseBuffer.PrintNameLength = static_cast<USHORT>(print_b);
+		r->SymbolicLinkReparseBuffer.Flags = relative ? SYMLINK_FLAG_RELATIVE : 0;
+		memcpy(r->SymbolicLinkReparseBuffer.PathBuffer, sub.data(), sub_b);
+		memcpy(reinterpret_cast<uint8_t *>(r->SymbolicLinkReparseBuffer.PathBuffer) + sub_b, print.data(), print_b);
+	}
+	REPARSE_DATA_BUFFER *r = reinterpret_cast<REPARSE_DATA_BUFFER *>(data.data());
+	r->ReparseTag = tag;
+	r->ReparseDataLength = static_cast<USHORT>(data.size() - REPARSE_DATA_BUFFER_HEADER_SIZE);
+	if (*size < data.size())
+	{
+		*size = data.size();
+		return STATUS_BUFFER_TOO_SMALL;
+	}
+	memcpy(buf, data.data(), data.size());
+	*size = data.size();
+	return STATUS_SUCCESS;
+}
+
+bool ApfsFs::StreamVisible(const Stat &st, const std::string &xattr)
+{
+	std::vector<std::string> names;
+	if (!m_vol->ListXattrs(st.inode, st, names))
+		return false;
+	for (const auto &n : names)
+		if (n == xattr)
+			return true;
+	return false;
 }
 
 void ApfsFs::FillFileInfo(const Stat &st, const std::string &name, FSP_FSCTL_FILE_INFO &fi)
@@ -80,8 +353,8 @@ void ApfsFs::FillFileInfo(const Stat &st, const std::string &name, FSP_FSCTL_FIL
 	uint64_t bs = m_block_size;
 	memset(&fi, 0, sizeof(fi));
 	fi.FileAttributes = Attributes(st, name);
-	fi.ReparseTag = 0;
-	if (st.type != FileType::Dir)
+	fi.ReparseTag = ReparseTag(st);
+	if (st.type == FileType::File)
 	{
 		fi.FileSize = st.size;
 		fi.AllocationSize = st.compressed ? (st.size + bs - 1) / bs * bs : st.alloc_size;
@@ -213,6 +486,8 @@ NTSTATUS ApfsFs::Resolve(const wchar_t *path, Stat &st, std::wstring *normalized
 		return STATUS_FILE_CORRUPT_ERROR;
 	if (normalized)
 		*normalized = norm.empty() ? L"\\" : norm;
+	if (stream && !stream_name.empty() && !StreamVisible(st, stream_name))
+		return STATUS_OBJECT_NAME_NOT_FOUND;
 	return STATUS_SUCCESS;
 }
 
@@ -236,6 +511,8 @@ NTSTATUS ApfsFs::ResolveParent(const wchar_t *path, uint64_t &parent, std::strin
 		return STATUS_OBJECT_PATH_NOT_FOUND;
 	parent = st.inode;
 	name = WindowsNameToApfs(last);
+	if (last.size() > 255 || name.size() > 255)
+		return STATUS_OBJECT_NAME_INVALID;   // APFS: 255 UTF-8 bytes
 	if (parent_normalized)
 		*parent_normalized = norm == L"\\" ? L"" : norm;
 	return STATUS_SUCCESS;
@@ -296,12 +573,33 @@ static NTSTATUS GetVolumeInfo(FSP_FILE_SYSTEM *fs, FSP_FSCTL_VOLUME_INFO *vi)
 	return STATUS_SUCCESS;
 }
 
+static NTSTATUS GetReparsePointByName(FSP_FILE_SYSTEM *fs, PVOID, PWSTR name, BOOLEAN is_dir, PVOID buf, PSIZE_T size)
+{
+	ApfsFs *self = Self(fs);
+	Stat st;
+	NTSTATUS r = self->Resolve(name, st, nullptr, nullptr);
+	if (!NT_SUCCESS(r))
+		return r;
+	if (!ApfsFs::ReparseTag(st))
+		return STATUS_NOT_A_REPARSE_POINT;
+	if (!buf)
+		return STATUS_SUCCESS;
+	return self->MakeReparseData(st, buf, size);
+}
+
 static NTSTATUS GetSecurityByName(FSP_FILE_SYSTEM *fs, PWSTR name, PUINT32 attrs, PSECURITY_DESCRIPTOR sd, SIZE_T *sd_size)
 {
 	ApfsFs *self = Self(fs);
 	Stat st;
 	std::wstring norm;
-	NTSTATUS r = self->Resolve(name, st, &norm, nullptr);
+	std::string stream;
+	NTSTATUS r = self->Resolve(name, st, &norm, &stream);
+	if (r == STATUS_OBJECT_PATH_NOT_FOUND || r == STATUS_OBJECT_NAME_NOT_FOUND)
+	{
+		// a symlink in the middle of the path: let WinFsp resolve it
+		if (FspFileSystemFindReparsePoint(fs, GetReparsePointByName, nullptr, name, attrs))
+			return STATUS_REPARSE;
+	}
 	if (!NT_SUCCESS(r))
 		return r;
 	if (attrs)
@@ -312,17 +610,33 @@ static NTSTATUS GetSecurityByName(FSP_FILE_SYSTEM *fs, PWSTR name, PUINT32 attrs
 	return self->CopySecurity(sd, sd_size);
 }
 
+// File info of an open node; a named stream reports the xattr's size.
+static void FillNodeInfo(ApfsFs *self, ApfsFs::Node *node, FSP_FSCTL_FILE_INFO &fi)
+{
+	self->FillFileInfo(node->st, node->name, fi);
+	if (node->stream.empty())
+		return;
+	uint64_t size = 0, bs = 4096;
+	self->Vol().GetXattrSize(node->st.inode, node->stream, size);
+	fi.FileAttributes &= ~(FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT);
+	if (!fi.FileAttributes)
+		fi.FileAttributes = FILE_ATTRIBUTE_ARCHIVE;
+	fi.ReparseTag = 0;
+	fi.FileSize = size;
+	fi.AllocationSize = (size + bs - 1) / bs * bs;
+}
+
 static NTSTATUS Open(FSP_FILE_SYSTEM *fs, PWSTR name, UINT32 create_options, UINT32 granted_access, PVOID *ctx, FSP_FSCTL_FILE_INFO *fi)
 {
 	ApfsFs *self = Self(fs);
 	std::unique_ptr<ApfsFs::Node> node(new ApfsFs::Node());
 	std::wstring norm;
 
-	NTSTATUS r = self->Resolve(name, node->st, &norm, nullptr);
+	NTSTATUS r = self->Resolve(name, node->st, &norm, &node->stream);
 	if (!NT_SUCCESS(r))
 		return r;
 
-	bool is_dir = node->st.type == FileType::Dir;
+	bool is_dir = node->st.type == FileType::Dir && node->stream.empty();
 	if ((create_options & FILE_DIRECTORY_FILE) && !is_dir)
 		return STATUS_NOT_A_DIRECTORY;
 	if ((create_options & FILE_NON_DIRECTORY_FILE) && is_dir)
@@ -330,7 +644,9 @@ static NTSTATUS Open(FSP_FILE_SYSTEM *fs, PWSTR name, UINT32 create_options, UIN
 
 	size_t slash = norm.rfind(L'\\');
 	node->name = WindowsNameToApfs(norm.substr(slash + 1));
-	self->FillFileInfo(node->st, node->name, *fi);
+	FillNodeInfo(self, node.get(), *fi);
+	if (!node->stream.empty())
+		norm += L":" + ApfsNameToWindows(node->stream);
 
 	FSP_FSCTL_OPEN_FILE_INFO *ofi = FspFileSystemGetOpenFileInfo(fi);
 	size_t bytes = norm.size() * sizeof(wchar_t);
@@ -364,6 +680,62 @@ static uint32_t ModeForAttributes(uint32_t mode, uint32_t attrs)
 	return mode;
 }
 
+// UF_HIDDEN follows FILE_ATTRIBUTE_HIDDEN (unless --hide-dotfiles already shows it)
+static int SetHidden(ApfsFs *self, ApfsFs::Node *node, uint32_t attrs)
+{
+	bool want = (attrs & FILE_ATTRIBUTE_HIDDEN) != 0;
+	bool have = (self->Attributes(node->st, node->name) & FILE_ATTRIBUTE_HIDDEN) != 0;
+	if (want == have)
+		return 0;
+	return self->Vol().SetFlags(node->st.inode, want ? kUF_HIDDEN : 0, kUF_HIDDEN);
+}
+
+static void SetNormalizedName(FSP_FSCTL_FILE_INFO *fi, const std::wstring &norm)
+{
+	FSP_FSCTL_OPEN_FILE_INFO *ofi = FspFileSystemGetOpenFileInfo(fi);
+	size_t bytes = norm.size() * sizeof(wchar_t);
+	if (ofi->NormalizedName && bytes <= ofi->NormalizedNameSize)
+	{
+		memcpy(ofi->NormalizedName, norm.data(), bytes);
+		ofi->NormalizedNameSize = static_cast<UINT16>(bytes);
+	}
+}
+
+// "file:stream": a new xattr. Like NTFS, the file is created too if needed.
+static NTSTATUS CreateStream(ApfsFs *self, const std::wstring &base, const std::wstring &wstream, PVOID *ctx, FSP_FSCTL_FILE_INFO *fi)
+{
+	std::unique_ptr<ApfsFs::Node> node(new ApfsFs::Node());
+	std::wstring norm;
+	NTSTATUS r = self->Resolve(base.c_str(), node->st, &norm, nullptr);
+	if (r == STATUS_OBJECT_NAME_NOT_FOUND)
+	{
+		uint64_t parent;
+		std::string aname;
+		std::wstring pnorm;
+		r = self->ResolveParent(base.c_str(), parent, aname, &pnorm);
+		if (!NT_SUCCESS(r))
+			return r;
+		DirEntry e;
+		int err = self->Vol().Create(parent, aname, false, 0644, e);
+		if (err)
+			return Errno(err);
+		if (!self->Vol().GetStat(e.inode, node->st))
+			return STATUS_FILE_CORRUPT_ERROR;
+		norm = pnorm + L"\\" + ApfsNameToWindows(aname);
+	}
+	else if (!NT_SUCCESS(r))
+		return r;
+	node->name = WindowsNameToApfs(norm.substr(norm.rfind(L'\\') + 1));
+	node->stream = WindowsNameToApfs(wstream);
+	int err = self->Vol().SetXattr(node->st.inode, node->stream, "", 0, kXattrCreate);
+	if (err)
+		return Errno(err);
+	FillNodeInfo(self, node.get(), *fi);
+	SetNormalizedName(fi, norm + L":" + wstream);
+	*ctx = node.release();
+	return STATUS_SUCCESS;
+}
+
 static NTSTATUS Create(FSP_FILE_SYSTEM *fs, PWSTR name, UINT32 create_options, UINT32 granted_access, UINT32 attrs,
 	PSECURITY_DESCRIPTOR sd, UINT64 alloc, PVOID *ctx, FSP_FSCTL_FILE_INFO *fi)
 {
@@ -371,10 +743,16 @@ static NTSTATUS Create(FSP_FILE_SYSTEM *fs, PWSTR name, UINT32 create_options, U
 	if (!self->Vol().Writable())
 		return STATUS_MEDIA_WRITE_PROTECTED;
 
+	std::wstring base, wstream;
+	if (!SplitStream(name, base, wstream))
+		return STATUS_OBJECT_NAME_INVALID;
+	if (!wstream.empty())
+		return CreateStream(self, base, wstream, ctx, fi);
+
 	uint64_t parent;
 	std::string aname;
 	std::wstring pnorm;
-	NTSTATUS r = self->ResolveParent(name, parent, aname, &pnorm);
+	NTSTATUS r = self->ResolveParent(base.c_str(), parent, aname, &pnorm);
 	if (!NT_SUCCESS(r))
 		return r;
 	bool dir = (create_options & FILE_DIRECTORY_FILE) != 0;
@@ -388,16 +766,13 @@ static NTSTATUS Create(FSP_FILE_SYSTEM *fs, PWSTR name, UINT32 create_options, U
 	if (!self->Vol().GetStat(e.inode, node->st))
 		return STATUS_FILE_CORRUPT_ERROR;
 	node->name = aname;
-	self->FillFileInfo(node->st, node->name, *fi);
-
-	std::wstring norm = pnorm + L"\\" + ApfsNameToWindows(aname);
-	FSP_FSCTL_OPEN_FILE_INFO *ofi = FspFileSystemGetOpenFileInfo(fi);
-	size_t bytes = norm.size() * sizeof(wchar_t);
-	if (ofi->NormalizedName && bytes <= ofi->NormalizedNameSize)
+	if (attrs & FILE_ATTRIBUTE_HIDDEN)
 	{
-		memcpy(ofi->NormalizedName, norm.data(), bytes);
-		ofi->NormalizedNameSize = static_cast<UINT16>(bytes);
+		SetHidden(self, node.get(), attrs);
+		Refresh(self, node.get());
 	}
+	self->FillFileInfo(node->st, node->name, *fi);
+	SetNormalizedName(fi, pnorm + L"\\" + ApfsNameToWindows(aname));
 	*ctx = node.release();
 	return STATUS_SUCCESS;
 }
@@ -408,15 +783,57 @@ static NTSTATUS Overwrite(FSP_FILE_SYSTEM *fs, PVOID ctx, UINT32 attrs, BOOLEAN 
 	ApfsFs::Node *node = static_cast<ApfsFs::Node *>(ctx);
 	if (!self->Vol().Writable())
 		return STATUS_MEDIA_WRITE_PROTECTED;
-	int err = self->Vol().SetSize(node->st.inode, 0);
+	int err;
+	if (!node->stream.empty())
+	{
+		err = self->Vol().SetXattr(node->st.inode, node->stream, "", 0, 0);
+		FillNodeInfo(self, node, *fi);
+		return Errno(err);
+	}
+	err = self->Vol().SetSize(node->st.inode, 0);
+	Refresh(self, node);   // a compressed file is now a new inode
 	if (!err)
 	{
-		uint32_t mode = ModeForAttributes(node->st.mode, replace ? attrs : (attrs | self->Attributes(node->st, node->name)));
+		uint32_t all = replace ? attrs : (attrs | self->Attributes(node->st, node->name));
+		uint32_t mode = ModeForAttributes(node->st.mode, all);
 		if (mode != (node->st.mode & 07777u))
 			err = self->Vol().SetMode(node->st.inode, mode);
+		if (!err)
+			err = SetHidden(self, node, all);
 	}
 	Refresh(self, node);
 	self->FillFileInfo(node->st, node->name, *fi);
+	return Errno(err);
+}
+
+// Named stream writes: the whole xattr is read, patched and written back.
+static NTSTATUS WriteStream(ApfsFs *self, ApfsFs::Node *node, PVOID buf, UINT64 off, ULONG len, BOOLEAN to_eof, BOOLEAN constrained,
+	PULONG transferred, FSP_FSCTL_FILE_INFO *fi)
+{
+	std::lock_guard<std::mutex> lock(node->mutex);
+	std::vector<uint8_t> data;
+	if (!self->Vol().GetXattr(node->st.inode, node->stream, data))
+		return STATUS_OBJECT_NAME_NOT_FOUND;
+	if (to_eof)
+		off = data.size();
+	if (constrained)
+	{
+		if (off >= data.size())
+		{
+			FillNodeInfo(self, node, *fi);
+			return STATUS_SUCCESS;
+		}
+		len = static_cast<ULONG>(std::min<uint64_t>(len, data.size() - off));
+	}
+	if (off + len > (256ull << 20))
+		return STATUS_DISK_FULL;   // the engine's xattr size limit
+	if (off + len > data.size())
+		data.resize(static_cast<size_t>(off + len));
+	memcpy(data.data() + off, buf, len);
+	int err = self->Vol().SetXattr(node->st.inode, node->stream, data.data(), data.size(), 0);
+	if (!err)
+		*transferred = len;
+	FillNodeInfo(self, node, *fi);
 	return Errno(err);
 }
 
@@ -426,7 +843,9 @@ static NTSTATUS Write(FSP_FILE_SYSTEM *fs, PVOID ctx, PVOID buf, UINT64 off, ULO
 	ApfsFs *self = Self(fs);
 	ApfsFs::Node *node = static_cast<ApfsFs::Node *>(ctx);
 	*transferred = 0;
-	if (node->st.type == FileType::Dir)
+	if (!node->stream.empty())
+		return WriteStream(self, node, buf, off, len, to_eof, constrained, transferred, fi);
+	if (node->st.type != FileType::File)
 		return STATUS_INVALID_DEVICE_REQUEST;
 	Refresh(self, node);
 	if (to_eof)
@@ -444,6 +863,10 @@ static NTSTATUS Write(FSP_FILE_SYSTEM *fs, PVOID ctx, PVOID buf, UINT64 off, ULO
 	size_t written = 0;
 	int err = self->Vol().Write(node->st.inode, off, buf, len, written);
 	*transferred = static_cast<ULONG>(written);
+	{
+		std::lock_guard<std::mutex> lock(node->mutex);
+		node->reader.reset();   // a compressed file was replaced by a plain copy
+	}
 	Refresh(self, node);
 	self->FillFileInfo(node->st, node->name, *fi);
 	return written ? STATUS_SUCCESS : Errno(err);
@@ -454,11 +877,31 @@ static NTSTATUS SetFileSize(FSP_FILE_SYSTEM *fs, PVOID ctx, UINT64 size, BOOLEAN
 	ApfsFs *self = Self(fs);
 	ApfsFs::Node *node = static_cast<ApfsFs::Node *>(ctx);
 	int err = 0;
+	if (!node->stream.empty())
+	{
+		std::lock_guard<std::mutex> lock(node->mutex);
+		std::vector<uint8_t> data;
+		if (!self->Vol().GetXattr(node->st.inode, node->stream, data))
+			return STATUS_OBJECT_NAME_NOT_FOUND;
+		if ((!set_alloc || size < data.size()) && size != data.size())
+		{
+			if (size > (256ull << 20))
+				return STATUS_DISK_FULL;
+			data.resize(static_cast<size_t>(size));
+			err = self->Vol().SetXattr(node->st.inode, node->stream, data.data(), data.size(), 0);
+		}
+		FillNodeInfo(self, node, *fi);
+		return Errno(err);
+	}
 	Refresh(self, node);
 	// an allocation size below the file size truncates (NTFS semantics);
 	// otherwise allocation requests are hints the engine doesn't need
 	if (!set_alloc || size < node->st.size)
 		err = self->Vol().SetSize(node->st.inode, size);
+	{
+		std::lock_guard<std::mutex> lock(node->mutex);
+		node->reader.reset();
+	}
 	Refresh(self, node);
 	self->FillFileInfo(node->st, node->name, *fi);
 	return Errno(err);
@@ -473,15 +916,22 @@ static NTSTATUS SetBasicInfo(FSP_FILE_SYSTEM *fs, PVOID ctx, UINT32 attrs, UINT6
 	Refresh(self, node);
 	if (attrs != INVALID_FILE_ATTRIBUTES)
 	{
-		uint32_t mode = ModeForAttributes(node->st.mode, attrs);
-		if (mode != (node->st.mode & 07777u))
-			err = self->Vol().SetMode(node->st.inode, mode);
+		if (node->st.type == FileType::File || node->st.type == FileType::Dir)
+		{
+			uint32_t mode = ModeForAttributes(node->st.mode, attrs);
+			if (node->st.type == FileType::File && mode != (node->st.mode & 07777u))
+				err = self->Vol().SetMode(node->st.inode, mode);
+		}
+		if (!err)
+			err = SetHidden(self, node, attrs);
 	}
-	// creation time can't be set through the engine yet (see CLAUDE.md)
-	if (!err && (atime || mtime))
-		err = self->Vol().SetTimes(node->st.inode, atime ? FileTimeToNs(atime) : INT64_MIN, mtime ? FileTimeToNs(mtime) : INT64_MIN);
+	if (!err && TimeGiven(ctime))
+		err = self->Vol().SetCreateTime(node->st.inode, FileTimeToNs(ctime));
+	if (!err && (TimeGiven(atime) || TimeGiven(mtime)))
+		err = self->Vol().SetTimes(node->st.inode, TimeGiven(atime) ? FileTimeToNs(atime) : INT64_MIN,
+			TimeGiven(mtime) ? FileTimeToNs(mtime) : INT64_MIN);
 	Refresh(self, node);
-	self->FillFileInfo(node->st, node->name, *fi);
+	FillNodeInfo(self, node, *fi);
 	return Errno(err);
 }
 
@@ -491,7 +941,7 @@ static NTSTATUS CanDelete(FSP_FILE_SYSTEM *fs, PVOID ctx, PWSTR name)
 	ApfsFs::Node *node = static_cast<ApfsFs::Node *>(ctx);
 	if (!self->Vol().Writable())
 		return STATUS_MEDIA_WRITE_PROTECTED;
-	if (node->st.type == FileType::Dir)
+	if (node->st.type == FileType::Dir && node->stream.empty())
 	{
 		std::vector<DirEntry> ents;
 		if (!self->Vol().ListDir(node->st.inode, ents))
@@ -508,6 +958,13 @@ static VOID Cleanup(FSP_FILE_SYSTEM *fs, PVOID ctx, PWSTR name, ULONG flags)
 	ApfsFs::Node *node = static_cast<ApfsFs::Node *>(ctx);
 	if (!(flags & FspCleanupDelete) || !name)
 		return;
+	if (!node->stream.empty())
+	{
+		int err = self->Vol().RemoveXattr(node->st.inode, node->stream);
+		if (err && self->Options().debug)
+			fprintf(stderr, "delete stream %ls: errno %d\n", name, -err);
+		return;
+	}
 	uint64_t parent;
 	std::string aname;
 	if (!NT_SUCCESS(self->ResolveParent(name, parent, aname, nullptr)))
@@ -522,6 +979,8 @@ static NTSTATUS Rename(FSP_FILE_SYSTEM *fs, PVOID ctx, PWSTR name, PWSTR new_nam
 {
 	ApfsFs *self = Self(fs);
 	ApfsFs::Node *node = static_cast<ApfsFs::Node *>(ctx);
+	if (!node->stream.empty())
+		return STATUS_NOT_SUPPORTED;   // renaming a stream
 	uint64_t op = 0, np = 0;
 	std::string on, nn;
 	NTSTATUS r = self->ResolveParent(name, op, on, nullptr);
@@ -546,7 +1005,7 @@ static NTSTATUS Flush(FSP_FILE_SYSTEM *fs, PVOID ctx, FSP_FSCTL_FILE_INFO *fi)
 	{
 		ApfsFs::Node *node = static_cast<ApfsFs::Node *>(ctx);
 		Refresh(self, node);
-		self->FillFileInfo(node->st, node->name, *fi);
+		FillNodeInfo(self, node, *fi);
 	}
 	return Errno(err);
 }
@@ -564,10 +1023,23 @@ static NTSTATUS Read(FSP_FILE_SYSTEM *fs, PVOID ctx, PVOID buf, UINT64 off, ULON
 	ApfsFs::Node *node = static_cast<ApfsFs::Node *>(ctx);
 	*transferred = 0;
 
-	if (node->st.type == FileType::Dir)
+	if (!node->stream.empty())
+	{
+		uint64_t size = 0;
+		size_t got = 0;
+		if (!self->Vol().GetXattrSize(node->st.inode, node->stream, size))
+			return STATUS_OBJECT_NAME_NOT_FOUND;
+		if (off >= size)
+			return STATUS_END_OF_FILE;
+		if (!self->Vol().ReadXattr(node->st.inode, node->stream, off, buf, len, got))
+			return STATUS_FILE_CORRUPT_ERROR;
+		*transferred = static_cast<ULONG>(got);
+		return STATUS_SUCCESS;
+	}
+	if (node->st.type != FileType::File)
 		return STATUS_INVALID_DEVICE_REQUEST;
 
-	FileReader *reader;
+	std::shared_ptr<FileReader> reader;
 	{
 		std::lock_guard<std::mutex> lock(node->mutex);
 		if (!node->reader)
@@ -581,7 +1053,7 @@ static NTSTATUS Read(FSP_FILE_SYSTEM *fs, PVOID ctx, PVOID buf, UINT64 off, ULON
 				return STATUS_FILE_CORRUPT_ERROR;
 			}
 		}
-		reader = node->reader.get();
+		reader = node->reader;
 	}
 
 	if (off >= reader->Size())
@@ -600,8 +1072,155 @@ static NTSTATUS GetFileInfo(FSP_FILE_SYSTEM *fs, PVOID ctx, FSP_FSCTL_FILE_INFO 
 	ApfsFs::Node *node = static_cast<ApfsFs::Node *>(ctx);
 	if (self->Vol().Writable())
 		Refresh(self, node);
-	self->FillFileInfo(node->st, node->name, *fi);
+	FillNodeInfo(self, node, *fi);
 	return STATUS_SUCCESS;
+}
+
+static NTSTATUS GetStreamInfo(FSP_FILE_SYSTEM *fs, PVOID ctx, PVOID buf, ULONG len, PULONG transferred)
+{
+	ApfsFs *self = Self(fs);
+	ApfsFs::Node *node = static_cast<ApfsFs::Node *>(ctx);
+	alignas(8) UINT8 raw[sizeof(FSP_FSCTL_STREAM_INFO) + 256 * sizeof(WCHAR)];
+	FSP_FSCTL_STREAM_INFO *si = reinterpret_cast<FSP_FSCTL_STREAM_INFO *>(raw);
+	if (self->Vol().Writable())
+		Refresh(self, node);
+	*transferred = 0;
+	if (node->st.type == FileType::File)
+	{
+		FSP_FSCTL_FILE_INFO fi;
+		self->FillFileInfo(node->st, node->name, fi);
+		si->Size = sizeof(FSP_FSCTL_STREAM_INFO);   // the unnamed data stream
+		si->StreamSize = fi.FileSize;
+		si->StreamAllocationSize = fi.AllocationSize;
+		if (!FspFileSystemAddStreamInfo(si, buf, len, transferred))
+			return STATUS_SUCCESS;
+	}
+	std::vector<std::string> names;
+	self->Vol().ListXattrs(node->st.inode, node->st, names);
+	for (const auto &n : names)
+	{
+		std::wstring w = ApfsNameToWindows(n);
+		uint64_t size = 0;
+		if (w.empty() || w.size() > 255 || !self->Vol().GetXattrSize(node->st.inode, n, size))
+			continue;
+		si->Size = static_cast<UINT16>(sizeof(FSP_FSCTL_STREAM_INFO) + w.size() * sizeof(WCHAR));
+		si->StreamSize = size;
+		si->StreamAllocationSize = (size + 4095) / 4096 * 4096;
+		memcpy(si->StreamNameBuf, w.data(), w.size() * sizeof(WCHAR));
+		if (!FspFileSystemAddStreamInfo(si, buf, len, transferred))
+			return STATUS_SUCCESS;
+	}
+	FspFileSystemAddStreamInfo(nullptr, buf, len, transferred);
+	return STATUS_SUCCESS;
+}
+
+// ---------------------------------------------------------------- reparse points
+
+static NTSTATUS ResolveReparsePoints(FSP_FILE_SYSTEM *fs, PWSTR name, UINT32 index, BOOLEAN resolve_last, PIO_STATUS_BLOCK ios,
+	PVOID buf, PSIZE_T size)
+{
+	return FspFileSystemResolveReparsePoints(fs, GetReparsePointByName, nullptr, name, index, resolve_last, ios, buf, size);
+}
+
+static NTSTATUS GetReparsePoint(FSP_FILE_SYSTEM *fs, PVOID ctx, PWSTR name, PVOID buf, PSIZE_T size)
+{
+	ApfsFs *self = Self(fs);
+	ApfsFs::Node *node = static_cast<ApfsFs::Node *>(ctx);
+	if (self->Vol().Writable())
+		Refresh(self, node);
+	return self->MakeReparseData(node->st, buf, size);
+}
+
+// A symlink made on Windows (CreateSymbolicLink creates an empty file or
+// directory, then sets the reparse point): the empty object is replaced by an
+// APFS symlink with the target converted to POSIX form.
+static NTSTATUS SetReparsePoint(FSP_FILE_SYSTEM *fs, PVOID ctx, PWSTR name, PVOID buf, SIZE_T size)
+{
+	ApfsFs *self = Self(fs);
+	ApfsFs::Node *node = static_cast<ApfsFs::Node *>(ctx);
+	if (!self->Vol().Writable())
+		return STATUS_MEDIA_WRITE_PROTECTED;
+	if (!node->stream.empty())
+		return STATUS_INVALID_PARAMETER;
+	const REPARSE_DATA_BUFFER *r = static_cast<const REPARSE_DATA_BUFFER *>(buf);
+	size_t head = FIELD_OFFSET(REPARSE_DATA_BUFFER, SymbolicLinkReparseBuffer.PathBuffer);
+	if (size < REPARSE_DATA_BUFFER_HEADER_SIZE)
+		return STATUS_IO_REPARSE_DATA_INVALID;
+	if (r->ReparseTag != IO_REPARSE_TAG_SYMLINK)
+		return STATUS_NOT_SUPPORTED;   // APFS has nowhere to keep other reparse data
+	const auto &s = r->SymbolicLinkReparseBuffer;
+	if (size < head || s.SubstituteNameLength == 0 || head + s.SubstituteNameOffset + s.SubstituteNameLength > size)
+		return STATUS_IO_REPARSE_DATA_INVALID;
+	std::wstring sub(reinterpret_cast<const WCHAR *>(reinterpret_cast<const uint8_t *>(s.PathBuffer) + s.SubstituteNameOffset),
+		s.SubstituteNameLength / sizeof(WCHAR));
+
+	Refresh(self, node);
+	bool was_dir = node->st.type == FileType::Dir;
+	if (node->st.type == FileType::File && node->st.size != 0)
+		return STATUS_NOT_SUPPORTED;   // the data would be lost
+	if (was_dir)
+	{
+		std::vector<DirEntry> ents;
+		if (!self->Vol().ListDir(node->st.inode, ents))
+			return STATUS_FILE_CORRUPT_ERROR;
+		if (!ents.empty())
+			return STATUS_DIRECTORY_NOT_EMPTY;
+	}
+	else if (node->st.type != FileType::File && node->st.type != FileType::Symlink)
+		return STATUS_NOT_SUPPORTED;
+
+	uint64_t parent;
+	std::string aname;
+	std::wstring pnorm;
+	NTSTATUS st = self->ResolveParent(name, parent, aname, &pnorm);
+	if (!NT_SUCCESS(st))
+		return st;
+	std::string target = self->WindowsTargetToPosix(sub, (s.Flags & SYMLINK_FLAG_RELATIVE) != 0, pnorm);
+	if (target.empty())
+		return STATUS_IO_REPARSE_DATA_INVALID;
+	int err = self->Vol().Remove(parent, aname, was_dir);
+	if (err)
+		return Errno(err);
+	DirEntry e;
+	err = self->Vol().Symlink(parent, aname, target, e);
+	if (err)
+	{
+		DirEntry back;   // put the empty file or directory back
+		if (self->Vol().Create(parent, aname, was_dir, node->st.mode & 07777, back) == 0)
+			self->Vol().GetStat(back.inode, node->st);
+		self->InvalidateCache();
+		return Errno(err);
+	}
+	self->Vol().GetStat(e.inode, node->st);
+	self->InvalidateCache();
+	return STATUS_SUCCESS;
+}
+
+// Removing a symlink's reparse point leaves an empty file (or directory, for
+// a link to a directory), as on NTFS.
+static NTSTATUS DeleteReparsePoint(FSP_FILE_SYSTEM *fs, PVOID ctx, PWSTR name, PVOID buf, SIZE_T size)
+{
+	ApfsFs *self = Self(fs);
+	ApfsFs::Node *node = static_cast<ApfsFs::Node *>(ctx);
+	if (!self->Vol().Writable())
+		return STATUS_MEDIA_WRITE_PROTECTED;
+	Refresh(self, node);
+	if (node->st.type != FileType::Symlink)
+		return STATUS_NOT_A_REPARSE_POINT;
+	bool dir = self->SymlinkIsDir(node->st);
+	uint64_t parent;
+	std::string aname;
+	NTSTATUS st = self->ResolveParent(name, parent, aname, nullptr);
+	if (!NT_SUCCESS(st))
+		return st;
+	int err = self->Vol().Remove(parent, aname, false);
+	DirEntry e;
+	if (!err)
+		err = self->Vol().Create(parent, aname, dir, dir ? 0755 : 0644, e);
+	if (!err)
+		self->Vol().GetStat(e.inode, node->st);
+	self->InvalidateCache();
+	return Errno(err);
 }
 
 static NTSTATUS GetSecurity(FSP_FILE_SYSTEM *fs, PVOID ctx, PSECURITY_DESCRIPTOR sd, SIZE_T *sd_size)
@@ -684,8 +1303,39 @@ static FSP_FILE_SYSTEM_INTERFACE g_interface = [] {
 	i.Rename = Rename;
 	i.GetSecurity = GetSecurity;
 	i.ReadDirectory = ReadDirectory;
+	i.GetStreamInfo = GetStreamInfo;
+	i.ResolveReparsePoints = ResolveReparsePoints;
+	i.GetReparsePoint = GetReparsePoint;
+	i.SetReparsePoint = SetReparsePoint;
+	i.DeleteReparsePoint = DeleteReparsePoint;
 	return i;
 }();
+
+static bool IsElevated()
+{
+	HANDLE token = nullptr;
+	TOKEN_ELEVATION e = {};
+	DWORD n = 0;
+	if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+		return false;
+	bool elevated = GetTokenInformation(token, TokenElevation, &e, sizeof(e), &n) && e.TokenIsElevated;
+	CloseHandle(token);
+	return elevated;
+}
+
+// Highest free letter from Z: down to D: (what WinFsp picks for NULL).
+static wchar_t FreeDriveLetter()
+{
+	DWORD used = GetLogicalDrives();
+	for (wchar_t c = L'Z'; c >= L'D'; c--)
+	{
+		wchar_t root[] = { c, L':', 0 };
+		wchar_t target[MAX_PATH];
+		if (!(used & (1u << (c - L'A'))) && !QueryDosDeviceW(root, target, MAX_PATH))
+			return c;
+	}
+	return 0;
+}
 
 NTSTATUS ApfsFs::Start(const wchar_t *mount_point)
 {
@@ -695,7 +1345,10 @@ NTSTATUS ApfsFs::Start(const wchar_t *mount_point)
 	vp.Version = sizeof(FSP_FSCTL_VOLUME_PARAMS);
 	vp.SectorSize = 4096;
 	vp.SectorsPerAllocationUnit = static_cast<UINT16>(std::max<uint32_t>(1, m_block_size / 4096));
-	vp.MaxComponentLength = 255;
+	// WinFsp checks "name:stream:$DATA" as one component (NTFS checks the parts
+	// separately): room for a 255-character name plus a 127-byte xattr name.
+	// Longer file names are refused in ResolveParent.
+	vp.MaxComponentLength = 255 + 1 + 127 + 6;
 	vp.VolumeCreationTime = NsToFileTime(info.last_mod_ns);
 	vp.VolumeSerialNumber = static_cast<UINT32>(std::hash<std::string>()(info.uuid));
 	// read-only: metadata never changes, cache it forever
@@ -706,6 +1359,9 @@ NTSTATUS ApfsFs::Start(const wchar_t *mount_point)
 	vp.PersistentAcls = 1;
 	vp.ReadOnlyVolume = m_vol->Writable() ? 0 : 1;
 	vp.PostCleanupWhenModifiedOnly = 1;
+	vp.NamedStreams = 1;                // xattrs
+	vp.ReparsePoints = 1;               // symlinks, FIFOs, devices
+	vp.ReparsePointsAccessCheck = 0;
 	vp.UmFileContextIsUserContext2 = 1;
 	wcscpy_s(vp.FileSystemName, L"APFS");
 
@@ -719,7 +1375,25 @@ NTSTATUS ApfsFs::Start(const wchar_t *mount_point)
 		FspFileSystemSetDebugLog(m_fs, static_cast<UINT32>(-1));
 	}
 
-	r = FspFileSystemSetMountPoint(m_fs, const_cast<PWSTR>(mount_point));
+	// Elevated: a plain drive letter would live in the admin token's own DOS
+	// device namespace, invisible to the user's (non-elevated) Explorer. The
+	// WinFsp form \\.\X: creates it through the Mount Manager instead: a
+	// global drive letter every session sees (needs administrator rights).
+	r = STATUS_UNSUCCESSFUL;
+	bool letter = !mount_point || (iswalpha(mount_point[0]) && mount_point[1] == L':' && mount_point[2] == 0);
+	if (letter && IsElevated())
+	{
+		wchar_t c = mount_point ? static_cast<wchar_t>(towupper(mount_point[0])) : FreeDriveLetter();
+		if (c)
+		{
+			std::wstring mm = std::wstring(L"\\\\.\\") + c + L":";
+			r = FspFileSystemSetMountPoint(m_fs, const_cast<PWSTR>(mm.c_str()));
+			if (!NT_SUCCESS(r) && m_opts.debug)
+				fprintf(stderr, "Mount Manager mount at %lc: failed (0x%08lx); using a session drive letter\n", c, r);
+		}
+	}
+	if (!NT_SUCCESS(r))
+		r = FspFileSystemSetMountPoint(m_fs, const_cast<PWSTR>(mount_point));
 	if (NT_SUCCESS(r))
 		r = FspFileSystemStartDispatcher(m_fs, 0);
 	if (!NT_SUCCESS(r))
@@ -744,7 +1418,10 @@ std::wstring ApfsFs::MountPoint() const
 	if (!m_fs)
 		return std::wstring();
 	PWSTR mp = FspFileSystemMountPoint(m_fs);
-	return mp ? std::wstring(mp) : std::wstring();
+	std::wstring s = mp ? std::wstring(mp) : std::wstring();
+	if (s.compare(0, 4, L"\\\\.\\") == 0)
+		s = s.substr(4);   // Mount Manager form \\.\X: -> X:
+	return s;
 }
 
 bool LoadWinFsp()

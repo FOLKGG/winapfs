@@ -89,6 +89,10 @@ constexpr uint32_t kUF_COMPRESSED = 0x00000020;
 constexpr uint32_t kUF_HIDDEN = 0x00008000;
 constexpr uint32_t kSF_IMMUTABLE = 0x00020000;
 
+// Volume::SetXattr flags
+constexpr int kXattrCreate = 1;
+constexpr int kXattrReplace = 2;
+
 class Volume;
 
 // Random-access reader over a file's logical (decompressed) contents.
@@ -184,8 +188,23 @@ public:
 
 	// ---- writing (linux-apfs-rw volumes mounted read-write). Every call
 	// returns 0 or a negative errno; read-only volumes return -EROFS.
+	//
+	// Write and SetSize on a compressed file first replace it by an
+	// uncompressed copy (a new inode); the old inode number keeps working
+	// for the rest of the mount, and GetStat on it reports the new number.
 	virtual bool Writable() const { return false; }
 	virtual int Create(uint64_t parent, const std::string &name, bool dir, uint32_t mode, DirEntry &out) { return -30; }
+	virtual int Symlink(uint64_t parent, const std::string &name, const std::string &target, DirEntry &out) { return -30; }
+	virtual int Link(uint64_t inode, uint64_t parent, const std::string &name) { return -30; }
+	// value replaces the whole attribute; flags: kXattrCreate, kXattrReplace.
+	// File-system-owned names (com.apple.fs.*, com.apple.decmpfs, a compressed
+	// file's resource fork) give -EPERM.
+	virtual int SetXattr(uint64_t inode, const std::string &name, const void *data, size_t len, int flags) { return -30; }
+	virtual int RemoveXattr(uint64_t inode, const std::string &name) { return -30; }
+	virtual int SetCreateTime(uint64_t inode, int64_t ns) { return -30; }
+	// BSD flags: the bits in mask take their values from flags. Only
+	// UF_NODUMP and UF_HIDDEN can be changed.
+	virtual int SetFlags(uint64_t inode, uint32_t flags, uint32_t mask) { return -30; }
 	// Removes one name; the inode is freed when its last name and use go.
 	virtual int Remove(uint64_t parent, const std::string &name, bool dir) { return -30; }
 	virtual int Rename(uint64_t old_parent, const std::string &old_name, uint64_t new_parent, const std::string &new_name, bool replace) { return -30; }

@@ -82,6 +82,15 @@ tests/verify.cpp         winapfs-verify: manifest checker (image or mounted dir)
   and the write callbacks return STATUS_MEDIA_WRITE_PROTECTED. With `--rw`
   (see W3): `FileInfoTimeout = 1000`, Everyone gets FA, the cache is
   invalidated on rename/delete. winfsp-x64.dll is delay-loaded via `FspLoad`.
+  `NamedStreams` (xattrs) and `ReparsePoints` (symlinks etc.) are on (W4).
+  `MaxComponentLength` is 255+1+127+6, because WinFsp checks `name:stream:$DATA`
+  as one component; ResolveParent refuses names over 255.
+- **Drive letters when elevated**: a plain `X:` created by an elevated process
+  lives in the admin token's DOS-device namespace, invisible to the user's
+  Explorer. Elevated, `ApfsFs::Start` mounts at `\\.\X:` (WinFsp's Mount
+  Manager form: a global letter) and falls back to the session letter;
+  `MountPoint()` strips the prefix. Found by the user's first physical-disk
+  `mount-all` (2026-11-08).
 - **Timestamps**: APFS ns since 1970 (pre-1970 stored as negative int64) →
   FILETIME with floor division.
 
@@ -188,7 +197,8 @@ Tests: `rwengine.*` runs `winapfs-verify --engine rw --fields all` on every
 volume; all pass. Secret is refused (the engine has no encryption, WILL_FAIL).
 `apfsrw-smoke` mounts and lists a volume.
 
-Patches to vendored linux-apfs-rw (all marked `winapfs:`), needed only for MSVC:
+Patches to vendored linux-apfs-rw (all marked `winapfs:`), mostly for MSVC (the
+xattr inode-flag fix in xattr.c is a real bug fix, see W4):
 - apfs.h: `#pragma pack(1)` around `#include "apfs_raw.h"` (no `__packed` suffix).
 - apfs_raw.h: `kl_entries` is `u8[]` on MSVC (array of structs ending in a
   flexible array; unused by the driver).
@@ -341,9 +351,69 @@ and freed blocks count once the free queue is flushed at the next transaction
 start), as on Linux. apfsck can crash (access violation) on images corrupted
 by `nobarrier` (robustness bug, upstream too presumably).
 
-Next: W4 (fidelity writes), then the user's macOS `fsck_apfs` check of images
-written here (`build/tests/w32-*.img`, `crash-*.img`, `full-*.img` after a
-test run) before W5.
+### W4 done: fidelity (read and write) on the mount
+
+**Engine** (apfsrw.h): `apfsrw_setxattr`/`apfsrw_removexattr` (refuse
+com.apple.fs.*, com.apple.decmpfs, a compressed file's resource fork: EPERM;
+names ≤ 127 bytes), setattr `APFSRW_SET_CRTIME` and `APFSRW_SET_FLAGS` (only
+UF_NODUMP|UF_HIDDEN; via a transaction that joins the inode, the driver writes
+`i_crtime`/`i_bsd_flags`), `apfsrw_decompress(dir, name)`: the driver never
+writes decmpfs files, so a compressed file is replaced by an uncompressed copy
+(temp `.winapfs-decompress-<ino>` in the same dir: data, xattrs except the
+compression ones, owner/mode/times/flags; then an atomic rename over it;
+-EMLINK for hard-linked files). kshim `XATTR_SIZE_MAX` is 256 MiB (Linux's
+64 KiB is a VFS limit; resource forks are bigger).
+
+Driver patch (marked `winapfs (upstream candidate)`, xattr.c): `apfs_xattr_set`
+keeps the inode flags that mirror xattrs in sync: HAS_FINDER_INFO
+(com.apple.FinderInfo), HAS_RSRC_FORK/NO_RSRC_FORK (com.apple.ResourceFork),
+HAS_SECURITY_EA (com.apple.system.Security). Without it every FinderInfo set
+failed fsck ("wrong setting for finder info flag").
+
+**Volume**: SetXattr/RemoveXattr/Symlink/Link/SetCreateTime/SetFlags.
+RwVolume's Write/SetSize decompress first; the old inode number becomes an
+alias of the new one (m_alias), so open mount handles keep working.
+
+**Mount** (ApfsFs):
+- Named streams = xattrs: open/create (creating `new:s` creates the file, like
+  NTFS), read, write (read-modify-write of the whole xattr, ≤ 256 MiB),
+  set size, delete, GetStreamInfo. Only what ListXattrs shows is visible.
+  Stream rename: not supported.
+- Reparse points: symlinks = IO_REPARSE_TAG_SYMLINK, FIFO/char/block/socket =
+  WSL tags (LX_FIFO 0x80000024, LX_CHR, LX_BLK, AF_UNIX). Targets: POSIX
+  components name-mapped, '/'→'\'; relative and "/x" (rooted at the volume)
+  get SYMLINK_FLAG_RELATIVE; "C:/x" targets are absolute. The substitute name
+  maps `/Volumes/<this volume>/...` to the volume root so Mac absolute links
+  resolve; the print name keeps the stored target (the verifier reads it).
+  A symlink whose target (followed inside the volume, ≤ 8 hops) is a
+  directory also gets FILE_ATTRIBUTE_DIRECTORY (`<SYMLINKD>`). Paths through
+  links: GetSecurityByName → FspFileSystemFindReparsePoint → STATUS_REPARSE.
+- Creating symlinks from Windows (CreateSymbolicLink: empty file/dir, then
+  SetReparsePoint): replaced by an APFS symlink; absolute targets inside the
+  mount become relative to the link; other reparse tags: NOT_SUPPORTED.
+  WinFsp does not demand SeCreateSymbolicLinkPrivilege (works unelevated).
+  DeleteReparsePoint leaves an empty file/dir.
+- SetBasicInfo: creation time, FILE_ATTRIBUTE_HIDDEN ↔ UF_HIDDEN; "leave
+  unchanged" FILETIMEs (0, -1, -2) are ignored. Writable mounts report
+  READONLY for files without write bits.
+
+**Tests**: `MOUNT_FIELDS` = type,size,sha256,target,xattrs; `mount.links.img`
+now runs (26 entries incl. targets and the FIFO). `winapfs-verify --dir`
+reads streams (FindFirstStreamW). writetest models xattrs (from the manifest
+for every macOS entry, so CoW/decompression must keep them), creation time,
+hidden flag, nlink; W4 ops: inline/stream/empty/shrunk/removed xattrs,
+FinderInfo, xattr on a dir and on a macOS file, crtime, hidden on/off
+(keeping read-only), names with `:?*|<>"`, trailing dot/space, file/dir/
+dangling/up-level/absolute symlinks, 3 compressed files (patch, shrink,
+rewrite). `write.*` and `mountwrite.*` also run on compressed.img and
+links.img. 121 tests, ~145 s.
+
+Not done (WinFsp has no hard-link creation; FIFOs can't be made from
+Windows; ACLs are still the fixed SD, W7).
+
+Next: the user's macOS `fsck_apfs` check of images written here
+(`build/tests/w3-*.img`, `w32-*.img`, `crash-*.img`, `full-*.img` after a test
+run), then W5 (physical-disk writes).
 
 ## Milestones (read path)
 
@@ -360,14 +430,14 @@ test run) before W5.
    ~11 min for Basic. The cached version passes the non-admin `rawdev.*` /
    `mount_rawdev.*` tests (\\.\C:\...\file.img routes through DeviceWinPhys)
    but has not been re-timed on a real disk.
-4. Fidelity: compression (done at library level), xattrs as ADS, symlinks
-   as reparse points, hard links, timestamps, case, normalization.
+4. ✅ (W4) Fidelity: compression, xattrs as ADS, symlinks/FIFOs as reparse
+   points, timestamps incl. creation time, hidden flag, case, normalization.
+   Hard links show as separate files (WinFsp has no link count).
 5. FileVault: password prompt (CLI done), recovery key.
 6. Snapshots, installer, auto-mount service.
 
 ## Known gaps
 
-- Symlinks show up as 0-byte files and FIFOs as files on the mount (milestone 4).
 - Reserved DOS names (`nul`, `CON.txt`) are passed through unchanged; Win32
   path parsing may turn them into devices unless accessed via `\\?\`.
 - Hard links appear as independent files (same IndexNumber); WinFsp has no
@@ -385,9 +455,13 @@ test run) before W5.
 - Vendored upstream files have CRLF line endings (Git for Windows autocrlf):
   use the Edit tool, not perl/sed with `\n`, on files under third_party/.
 - No sealed-volume (signed system volume) testing; ApfsLib reads the fext tree.
-- `--rw` mounts: the creation time can't be set, FILE_ATTRIBUTE_HIDDEN is not
-  stored, compressed files can't be written, symlinks/hard links can't be made
-  from Windows, the SD is a fixed "Everyone: full access" (W4/W7). No refusal
-  yet for unclean/hibernated containers or sealed volumes (W5 list).
+- `--rw` mounts: hard links can't be made from Windows (WinFsp), the SD is a
+  fixed "Everyone: full access" (W7). No refusal yet for unclean/hibernated
+  containers or sealed volumes (W5 list). Writing a compressed file rewrites
+  it whole (decompressed copy); a hard-linked compressed file can't be
+  written (EMLINK → unexpected I/O error on Windows).
+- Mount Manager drive letters (elevated) are picked from Z: down by
+  GetLogicalDrives in the admin session; a network drive the user mapped
+  unelevated isn't visible there and could shadow the chosen letter.
 - No Python in this environment (the Microsoft Store alias only); script with
   PowerShell (.ps1 files) or the Edit tool.

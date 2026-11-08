@@ -358,6 +358,29 @@ int apfsrw_fsync(apfsrw_file *af)
 }
 
 /* notify_change(): fill in the times the VFS would, then ->setattr */
+/*
+ * Creation time and BSD flags (bits in mask take those of flags). The driver
+ * writes both from apfs_inode_info when the inode joins a transaction.
+ * Caller holds the inode lock.
+ */
+static int set_crtime_flags(struct inode *inode, bool set_crtime, s64 crtime_ns, u32 flags, u32 mask)
+{
+	struct super_block *sb = inode->i_sb;
+	struct apfs_inode_info *ai = APFS_I(inode);
+	int err = apfs_transaction_start(sb, APFS_TRANS_REG);
+
+	if (err)
+		return err;
+	apfs_inode_join_transaction(sb, inode);
+	if (set_crtime)
+		ai->i_crtime = ns_to_timespec64(crtime_ns);
+	ai->i_bsd_flags = (ai->i_bsd_flags & ~mask) | (flags & mask);
+	err = apfs_transaction_commit(sb);
+	if (err)
+		apfs_transaction_abort(sb);
+	return err;
+}
+
 int apfsrw_setattr(apfsrw_node *n, const apfsrw_setattr_t *a)
 {
 	struct dentry *d = D(n);
@@ -407,6 +430,188 @@ int apfsrw_setattr(apfsrw_node *n, const apfsrw_setattr_t *a)
 		mark_inode_dirty(inode);
 		err = 0;
 	}
+	if (!err && (a->mask & (APFSRW_SET_CRTIME | APFSRW_SET_FLAGS)))
+		err = set_crtime_flags(inode, (a->mask & APFSRW_SET_CRTIME) != 0, a->crtime_ns,
+				       a->flags, (a->mask & APFSRW_SET_FLAGS) ? a->flags_mask & APFSRW_USER_FLAGS : 0);
 	inode_unlock(inode);
+	return err;
+}
+
+/* ------------------------------------------------------------ xattrs */
+
+static const struct xattr_handler *osx_xattr_handler(struct super_block *sb)
+{
+	const struct xattr_handler * const *h;
+	for (h = sb->s_xattr; h && *h; h++)
+		if ((*h)->prefix && !strcmp((*h)->prefix, XATTR_MAC_OSX_PREFIX))
+			return *h;
+	return NULL;
+}
+
+int apfsrw_setxattr(apfsrw_node *n, const char *name, const void *value, size_t size, int flags)
+{
+	struct dentry *d = D(n);
+	struct inode *inode = d->d_inode;
+	const struct xattr_handler *h = osx_xattr_handler(d->d_sb);
+	size_t len = name ? strlen(name) : 0;
+	int lflags = 0, err;
+
+	if (sb_rdonly(inode->i_sb))
+		return -EROFS;
+	if (len == 0)
+		return -EINVAL;
+	if (len > 127)
+		return -ENAMETOOLONG;
+	/* xattrs that carry file system state (symlink targets, compression) */
+	if (!strncmp(name, "com.apple.fs.", 13) || !strcmp(name, APFS_XATTR_NAME_COMPRESSED) ||
+	    (!strcmp(name, APFS_XATTR_NAME_RSRC_FORK) && (APFS_I(inode)->i_bsd_flags & APFS_INOBSD_COMPRESSED)))
+		return -EPERM;
+	if (!h || !h->set)
+		return -EOPNOTSUPP;
+	if (flags & APFSRW_XATTR_CREATE)
+		lflags |= XATTR_CREATE;
+	if (flags & APFSRW_XATTR_REPLACE)
+		lflags |= XATTR_REPLACE;
+	inode_lock(inode);
+	err = h->set(h, &nop_mnt_idmap, d, inode, name, value, size, lflags);
+	inode_unlock(inode);
+	return err;
+}
+
+int apfsrw_removexattr(apfsrw_node *n, const char *name)
+{
+	return apfsrw_setxattr(n, name, NULL, 0, APFSRW_XATTR_REPLACE);
+}
+
+/* ------------------------------------------------------------ decompression */
+
+/*
+ * The driver never writes compressed (decmpfs) files. To write one, it is
+ * replaced by an uncompressed copy: a temporary file in the same directory
+ * gets the data, the xattrs other than the compression ones, the owner,
+ * mode, times and flags, and is then renamed over the original. The rename
+ * is atomic, so a crash leaves either file intact (plus, at worst, the
+ * temporary, which the next attempt removes).
+ */
+int apfsrw_decompress(apfsrw_node *dir, const char *name, size_t len, apfsrw_node **out)
+{
+	enum { CHUNK = 1 << 20 };
+	apfsrw_node *src = NULL, *tmp = NULL;
+	apfsrw_file *in = NULL, *outf = NULL;
+	apfsrw_stat st;
+	char tname[64];
+	char *buf = NULL, *names = NULL, *p;
+	long nlen = 0;
+	u64 off = 0;
+	int err;
+
+	if (out)
+		*out = NULL;
+	err = apfsrw_lookup(dir, name, len, &src);
+	if (err)
+		return err;
+	err = apfsrw_getattr(src, &st);
+	if (err)
+		goto done;
+	if ((st.mode & 0170000) != 0100000 || !(st.bsd_flags & APFS_INOBSD_COMPRESSED)) {
+		err = -EINVAL;
+		goto done;
+	}
+	if (st.nlink > 1) {
+		err = -EMLINK;	/* the copy would split the hard links */
+		goto done;
+	}
+	snprintf(tname, sizeof(tname), ".winapfs-decompress-%llx", (unsigned long long)st.ino);
+	apfsrw_unlink(dir, tname, strlen(tname));
+	err = apfsrw_create(dir, tname, strlen(tname), st.mode & 07777, &tmp);
+	if (err)
+		goto done;
+
+	buf = malloc(CHUNK);
+	err = buf ? apfsrw_open(src, false, &in) : -ENOMEM;
+	if (!err)
+		err = apfsrw_open(tmp, true, &outf);
+	while (!err) {
+		size_t got = 0, w = 0;
+		err = apfsrw_read(in, off, buf, CHUNK, &got);
+		if (err || !got)
+			break;
+		err = apfsrw_write(outf, off, buf, got, &w);
+		if (!err && w != got)
+			err = -EIO;
+		off += got;
+	}
+	if (!err && off != st.size)
+		err = -EIO;
+	if (in)
+		apfsrw_release(in);
+	if (outf)
+		apfsrw_release(outf);
+
+	if (!err)
+		nlen = apfsrw_listxattr(src, NULL, 0);
+	if (nlen < 0)
+		err = (int)nlen;
+	if (!err && nlen > 0) {
+		names = malloc((size_t)nlen);
+		nlen = names ? apfsrw_listxattr(src, names, (size_t)nlen) : -ENOMEM;
+		if (nlen < 0)
+			err = (int)nlen;
+		for (p = names; !err && p < names + nlen; p += strlen(p) + 1) {
+			long vs;
+			void *v;
+			if (!strcmp(p, APFS_XATTR_NAME_COMPRESSED) || !strcmp(p, APFS_XATTR_NAME_RSRC_FORK) ||
+			    !strncmp(p, "com.apple.fs.", 13))
+				continue;
+			vs = apfsrw_getxattr(src, p, NULL, 0);
+			if (vs < 0) {
+				err = (int)vs;
+				break;
+			}
+			v = malloc(vs ? (size_t)vs : 1);
+			if (!v) {
+				err = -ENOMEM;
+				break;
+			}
+			if (vs > 0)
+				vs = apfsrw_getxattr(src, p, v, (size_t)vs);
+			err = vs < 0 ? (int)vs : apfsrw_setxattr(tmp, p, v, (size_t)vs, APFSRW_XATTR_CREATE);
+			free(v);
+		}
+	}
+
+	if (!err) {
+		struct inode *ti = D(tmp)->d_inode;
+		apfsrw_setattr_t a;
+		memset(&a, 0, sizeof(a));
+		a.mask = APFSRW_SET_MODE | APFSRW_SET_UID | APFSRW_SET_GID | APFSRW_SET_ATIME | APFSRW_SET_MTIME;
+		a.mode = st.mode & 07777;
+		a.uid = st.uid;
+		a.gid = st.gid;
+		a.atime_ns = st.atime_ns;
+		a.mtime_ns = st.mtime_ns;
+		err = apfsrw_setattr(tmp, &a);
+		if (!err) {
+			inode_lock(ti);
+			err = set_crtime_flags(ti, true, st.btime_ns, st.bsd_flags & ~APFS_INOBSD_COMPRESSED, ~0u);
+			inode_unlock(ti);
+		}
+	}
+	if (!err)
+		err = apfsrw_rename(dir, tname, strlen(tname), dir, name, len, 0);
+	if (err && tmp)
+		apfsrw_unlink(dir, tname, strlen(tname));
+	if (!err && out) {
+		*out = tmp;
+		tmp = NULL;
+	}
+
+done:
+	free(names);
+	free(buf);
+	if (tmp)
+		apfsrw_put(tmp);
+	if (src)
+		apfsrw_put(src);
 	return err;
 }

@@ -350,14 +350,81 @@ public:
 		return 0;
 	}
 
-	int Write(uint64_t inode, uint64_t off, const void *buf, size_t len, size_t &written) override
+	int Symlink(uint64_t parent, const std::string &name, const std::string &target, DirEntry &out) override
+	{
+		apfsrw_node *p = Get(parent), *n = nullptr;
+		if (!p)
+			return -2;
+		int err = apfsrw_symlink(p, name.data(), name.size(), target.c_str(), &n);
+		if (err)
+			return err;
+		apfsrw_stat s;
+		err = apfsrw_getattr(n, &s);
+		if (err)
+		{
+			apfsrw_put(n);
+			return err;
+		}
+		Remember(s.ino, n, parent);
+		out.name = name;
+		out.inode = s.ino;
+		out.type = FileType::Symlink;
+		return 0;
+	}
+
+	int Link(uint64_t inode, uint64_t parent, const std::string &name) override
+	{
+		apfsrw_node *src = Get(inode), *p = Get(parent);
+		if (!src || !p)
+			return -2;
+		return apfsrw_link(src, p, name.data(), name.size(), nullptr);
+	}
+
+	int SetXattr(uint64_t inode, const std::string &name, const void *data, size_t len, int flags) override
 	{
 		apfsrw_node *n = Get(inode);
-		apfsrw_file *f = nullptr;
-		written = 0;
 		if (!n)
 			return -2;
-		int err = apfsrw_open(n, true, &f);
+		int f = ((flags & kXattrCreate) ? APFSRW_XATTR_CREATE : 0) | ((flags & kXattrReplace) ? APFSRW_XATTR_REPLACE : 0);
+		return apfsrw_setxattr(n, name.c_str(), data ? data : "", len, f);
+	}
+
+	int RemoveXattr(uint64_t inode, const std::string &name) override
+	{
+		apfsrw_node *n = Get(inode);
+		return n ? apfsrw_removexattr(n, name.c_str()) : -2;
+	}
+
+	int SetCreateTime(uint64_t inode, int64_t ns) override
+	{
+		apfsrw_setattr_t a = {};
+		a.mask = APFSRW_SET_CRTIME;
+		a.crtime_ns = ns;
+		return Setattr(inode, a);
+	}
+
+	int SetFlags(uint64_t inode, uint32_t flags, uint32_t mask) override
+	{
+		if (mask & ~APFSRW_USER_FLAGS)
+			return -1;   // EPERM
+		apfsrw_setattr_t a = {};
+		a.mask = APFSRW_SET_FLAGS;
+		a.flags = flags;
+		a.flags_mask = mask;
+		return Setattr(inode, a);
+	}
+
+	int Write(uint64_t inode, uint64_t off, const void *buf, size_t len, size_t &written) override
+	{
+		written = 0;
+		int err = Decompressed(inode);
+		if (err)
+			return err;
+		apfsrw_node *n = Get(inode);
+		apfsrw_file *f = nullptr;
+		if (!n)
+			return -2;
+		err = apfsrw_open(n, true, &f);
 		if (err)
 			return err;
 		err = apfsrw_write(f, off, buf, len, &written);
@@ -367,6 +434,9 @@ public:
 
 	int SetSize(uint64_t inode, uint64_t size) override
 	{
+		int err = Decompressed(inode);
+		if (err)
+			return err;
 		apfsrw_setattr_t a = {};
 		a.mask = APFSRW_SET_SIZE;
 		a.size = size;
@@ -409,6 +479,62 @@ private:
 		return n ? apfsrw_setattr(n, &a) : -2;
 	}
 
+	// The engine can't write compressed files: replace one by an uncompressed
+	// copy (apfsrw_decompress) and make the old inode number an alias of the
+	// new one. inode becomes the new number.
+	int Decompressed(uint64_t &inode)
+	{
+		Stat st;
+		if (!GetStat(inode, st) || !st.compressed)
+			return 0;
+		apfsrw_node *p = Get(st.parent);
+		std::vector<DirEntry> ents;
+		if (!p || !ListDir(st.parent, ents))
+			return -2;
+		const DirEntry *me = nullptr;
+		for (const auto &e : ents)
+			if (e.inode == st.inode)
+				me = &e;
+		if (!me)
+			return -2;
+		apfsrw_node *n = nullptr;
+		int err = apfsrw_decompress(p, me->name.data(), me->name.size(), &n);
+		if (err)
+			return err;
+		apfsrw_stat s;
+		err = apfsrw_getattr(n, &s);
+		if (err)
+		{
+			apfsrw_put(n);
+			return err;
+		}
+		Remember(s.ino, n, st.parent);
+		std::lock_guard<std::mutex> lock(m_mutex);
+		auto it = m_nodes.find(st.inode);
+		if (it != m_nodes.end())
+		{
+			apfsrw_put(it->second);   // the replaced inode can go
+			m_nodes.erase(it);
+		}
+		m_parent.erase(st.inode);
+		m_alias[st.inode] = s.ino;
+		inode = s.ino;
+		return 0;
+	}
+
+	// Lock held. Follows decompression aliases.
+	uint64_t Current(uint64_t inode) const
+	{
+		for (int i = 0; i < 16; i++)
+		{
+			auto it = m_alias.find(inode);
+			if (it == m_alias.end())
+				break;
+			inode = it->second;
+		}
+		return inode;
+	}
+
 	// Inode number behind a name, or 0.
 	uint64_t InodeOf(apfsrw_node *dir, const std::string &name)
 	{
@@ -446,14 +572,14 @@ private:
 	apfsrw_node *Get(uint64_t inode)
 	{
 		std::lock_guard<std::mutex> lock(m_mutex);
-		auto it = m_nodes.find(inode);
+		auto it = m_nodes.find(Current(inode));
 		return it == m_nodes.end() ? nullptr : it->second;
 	}
 
 	uint64_t Parent(uint64_t inode)
 	{
 		std::lock_guard<std::mutex> lock(m_mutex);
-		auto it = m_parent.find(inode);
+		auto it = m_parent.find(Current(inode));
 		return it == m_parent.end() ? 0 : it->second;
 	}
 
@@ -473,6 +599,7 @@ private:
 	std::mutex m_mutex;
 	std::unordered_map<uint64_t, apfsrw_node *> m_nodes;
 	std::unordered_map<uint64_t, uint64_t> m_parent;
+	std::unordered_map<uint64_t, uint64_t> m_alias;   // decompressed: old inode -> new
 };
 
 } // namespace

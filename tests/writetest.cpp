@@ -48,6 +48,13 @@ struct Expect
 	int mode = -1;            // permission bits to check, -1 = don't
 	int orig_mode = -1;       // mode before the test touched it (manifest or 0644 for new files)
 	int64_t mtime_ns = INT64_MIN;
+	// xattrs as macOS shows them: name -> sha256 of the value
+	std::map<std::string, std::string> xattrs;
+	bool check_xattrs = false;
+	int64_t crtime_ns = INT64_MIN;
+	int hidden = -1;          // UF_HIDDEN: 0/1, -1 = don't check
+	uint32_t flags = 0;       // BSD flags from the manifest
+	uint64_t nlink = 1;
 };
 
 std::map<std::string, Expect> g_model;
@@ -128,9 +135,22 @@ struct Backend
 	// Permission bits; the Win32 backend can only toggle "read-only"
 	virtual bool SetMode(const std::string &path, int mode) = 0;
 	virtual bool CanChmod() const = 0;
-	virtual bool Symlink(const std::string &path, const std::string &target) = 0;
+	// dir: the target is a directory (Windows makes directory links differently)
+	virtual bool Symlink(const std::string &path, const std::string &target, bool dir) = 0;
+	virtual bool CanSymlink() const = 0;
+	// A link to an absolute path inside the volume; the engine stores it relative
+	// to the link (expected_target), which is what the engine backend writes.
+	virtual bool SymlinkAbsolute(const std::string &path, const std::string &vol_path, const std::string &expected_target)
+	{
+		return Symlink(path, expected_target, false);
+	}
 	virtual bool Link(const std::string &existing, const std::string &path) = 0;
 	virtual bool CanLink() const = 0;
+	// xattrs (named streams through the drive)
+	virtual bool SetXattr(const std::string &path, const std::string &name, const std::vector<uint8_t> &value) = 0;
+	virtual bool RemoveXattr(const std::string &path, const std::string &name) = 0;
+	virtual bool SetCrtime(const std::string &path, int64_t ns) = 0;
+	virtual bool SetHidden(const std::string &path, bool hidden) = 0;
 };
 
 struct RwBackend : Backend
@@ -181,9 +201,28 @@ struct RwBackend : Backend
 		return out;
 	}
 
-	bool Write(const std::string &path, uint64_t off, const std::vector<uint8_t> &data, size_t chunk) override
+	// The node to write to: a compressed file is first replaced by an
+	// uncompressed copy, as the mount does (RwVolume).
+	apfsrw_node *WritableNode(const std::string &path)
 	{
 		apfsrw_node *n = Walk(path);
+		apfsrw_stat st;
+		if (!n || apfsrw_getattr(n, &st) || !(st.bsd_flags & 0x20))
+			return n;
+		apfsrw_put(n);
+		n = nullptr;
+		apfsrw_node *dir = Walk(Parent(path));
+		std::string b = Base(path);
+		int err = dir ? apfsrw_decompress(dir, b.data(), b.size(), &n) : -2;
+		CHECK(err == 0, "decompress %s: %d", path.c_str(), err);
+		if (dir)
+			apfsrw_put(dir);
+		return n;
+	}
+
+	bool Write(const std::string &path, uint64_t off, const std::vector<uint8_t> &data, size_t chunk) override
+	{
+		apfsrw_node *n = WritableNode(path);
 		apfsrw_file *f = nullptr;
 		CHECK(n && apfsrw_open(n, true, &f) == 0, "open for write %s", path.c_str());
 		if (!f)
@@ -239,9 +278,48 @@ struct RwBackend : Backend
 		});
 	}
 
-	bool Symlink(const std::string &path, const std::string &target) override
+	bool Symlink(const std::string &path, const std::string &target, bool) override
 	{
 		return InParent(path, "symlink", [&](apfsrw_node *d, const std::string &n) { return apfsrw_symlink(d, n.data(), n.size(), target.c_str(), nullptr); });
+	}
+
+	bool CanSymlink() const override { return true; }
+
+	bool SetXattr(const std::string &path, const std::string &name, const std::vector<uint8_t> &value) override
+	{
+		apfsrw_node *n = Walk(path);
+		int err = n ? apfsrw_setxattr(n, name.c_str(), value.empty() ? "" : (const void *)value.data(), value.size(), 0) : -2;
+		CHECK(err == 0, "setxattr %s %s: %d", path.c_str(), name.c_str(), err);
+		if (n)
+			apfsrw_put(n);
+		return err == 0;
+	}
+
+	bool RemoveXattr(const std::string &path, const std::string &name) override
+	{
+		apfsrw_node *n = Walk(path);
+		int err = n ? apfsrw_removexattr(n, name.c_str()) : -2;
+		CHECK(err == 0, "removexattr %s %s: %d", path.c_str(), name.c_str(), err);
+		if (n)
+			apfsrw_put(n);
+		return err == 0;
+	}
+
+	bool SetCrtime(const std::string &path, int64_t ns) override
+	{
+		apfsrw_setattr_t a = {};
+		a.mask = APFSRW_SET_CRTIME;
+		a.crtime_ns = ns;
+		return Setattr(path, a, "set crtime");
+	}
+
+	bool SetHidden(const std::string &path, bool hidden) override
+	{
+		apfsrw_setattr_t a = {};
+		a.mask = APFSRW_SET_FLAGS;
+		a.flags = hidden ? 0x8000 : 0;
+		a.flags_mask = 0x8000;
+		return Setattr(path, a, "set hidden");
 	}
 
 	bool Rename(const std::string &from, const std::string &to) override
@@ -278,6 +356,9 @@ struct RwBackend : Backend
 
 	bool SetSize(const std::string &path, uint64_t size) override
 	{
+		apfsrw_node *n = WritableNode(path);   // decompresses a compressed file
+		if (n)
+			apfsrw_put(n);
 		apfsrw_setattr_t a = {};
 		a.mask = APFSRW_SET_SIZE;
 		a.size = size;
@@ -450,10 +531,116 @@ struct Win32Backend : Backend
 	}
 
 	bool CanChmod() const override { return false; }
-	// symlinks and hard links through the drive come with milestone W4
-	bool Symlink(const std::string &, const std::string &) override { return false; }
-	bool Link(const std::string &, const std::string &) override { return false; }
+
+	// Symlinks need SeCreateSymbolicLinkPrivilege or Developer Mode; probed once.
+	bool can_symlink = false;
+	void ProbeSymlink()
+	{
+		std::wstring probe = root + L"\\.winapfs-symlink-probe";
+		can_symlink = CreateSymbolicLinkW(probe.c_str(), L"x", SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE) != 0;
+		if (can_symlink)
+			DeleteFileW(probe.c_str());
+		else
+			printf("note: no symlink privilege (error %lu); symlink creation through the drive is not tested\n", GetLastError());
+	}
+	bool CanSymlink() const override { return can_symlink; }
+
+	static std::wstring WinTarget(const std::string &target)
+	{
+		std::wstring w;
+		size_t pos = 0;
+		while (pos <= target.size())
+		{
+			size_t next = target.find('/', pos);
+			if (next == std::string::npos)
+				next = target.size();
+			std::string c = target.substr(pos, next - pos);
+			if (pos > 0)
+				w.push_back(L'\\');
+			w += (c == "." || c == "..") ? Utf8ToWide(c) : ApfsNameToWindows(c);
+			pos = next + 1;
+		}
+		return w;
+	}
+
+	bool MakeLink(const std::string &path, const std::wstring &target, bool dir)
+	{
+		DWORD flags = SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE | (dir ? SYMBOLIC_LINK_FLAG_DIRECTORY : 0);
+		bool ok = CreateSymbolicLinkW(Win(path).c_str(), target.c_str(), flags) != 0;
+		CHECK(ok, "CreateSymbolicLink %s: error %lu", path.c_str(), GetLastError());
+		return ok;
+	}
+
+	bool Symlink(const std::string &path, const std::string &target, bool dir) override
+	{
+		return MakeLink(path, WinTarget(target), dir);
+	}
+
+	bool SymlinkAbsolute(const std::string &path, const std::string &vol_path, const std::string &) override
+	{
+		// "\\?\Z:" + "\w3\x": a full Windows path into the mounted volume
+		std::wstring t = root.substr(4) + WinTarget(vol_path);
+		return MakeLink(path, t, false);
+	}
+
+	bool Link(const std::string &, const std::string &) override { return false; }   // WinFsp has no hard links
 	bool CanLink() const override { return false; }
+
+	bool SetXattr(const std::string &path, const std::string &name, const std::vector<uint8_t> &value) override
+	{
+		std::wstring s = Win(path) + L":" + ApfsNameToWindows(name);
+		HANDLE h = CreateFileW(s.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, CREATE_ALWAYS,
+			FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+		CHECK(h != INVALID_HANDLE_VALUE, "create stream %s:%s: error %lu", path.c_str(), name.c_str(), GetLastError());
+		if (h == INVALID_HANDLE_VALUE)
+			return false;
+		size_t done = 0;
+		bool ok = true;
+		while (ok && done < value.size())
+		{
+			DWORD w = 0, len = static_cast<DWORD>(std::min<size_t>(value.size() - done, 7000));   // several writes
+			ok = WriteFile(h, value.data() + done, len, &w, nullptr) && w == len;
+			done += w;
+		}
+		CHECK(ok, "write stream %s:%s: error %lu", path.c_str(), name.c_str(), GetLastError());
+		CloseHandle(h);
+		return ok;
+	}
+
+	bool RemoveXattr(const std::string &path, const std::string &name) override
+	{
+		bool ok = DeleteFileW((Win(path) + L":" + ApfsNameToWindows(name)).c_str()) != 0;
+		CHECK(ok, "delete stream %s:%s: error %lu", path.c_str(), name.c_str(), GetLastError());
+		return ok;
+	}
+
+	bool SetCrtime(const std::string &path, int64_t ns) override
+	{
+		HANDLE h = Open(path, FILE_WRITE_ATTRIBUTES, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS);
+		if (h == INVALID_HANDLE_VALUE)
+			return false;
+		ULARGE_INTEGER u;
+		u.QuadPart = static_cast<ULONGLONG>(ns / 100 + 116444736000000000LL);
+		FILETIME ft = { u.LowPart, u.HighPart };
+		bool ok = SetFileTime(h, &ft, nullptr, nullptr) != 0;
+		CHECK(ok, "SetFileTime(creation) %s: error %lu", path.c_str(), GetLastError());
+		CloseHandle(h);
+		return ok;
+	}
+
+	bool SetHidden(const std::string &path, bool hidden) override
+	{
+		DWORD attrs = GetFileAttributesW(Win(path).c_str());
+		if (attrs == INVALID_FILE_ATTRIBUTES)
+			return false;
+		attrs = hidden ? (attrs | FILE_ATTRIBUTE_HIDDEN) : (attrs & ~FILE_ATTRIBUTE_HIDDEN);
+		attrs &= ~(FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT);
+		if (!attrs)
+			attrs = FILE_ATTRIBUTE_NORMAL;
+		bool ok = SetFileAttributesW(Win(path).c_str(), attrs) != 0;
+		CHECK(ok, "SetFileAttributes(hidden) %s: error %lu", path.c_str(), GetLastError());
+		return ok;
+	}
 };
 
 Backend *g_be = nullptr;
@@ -492,17 +679,15 @@ struct TraceOp
 // ---------------------------------------------------------------- operations
 // Each runs on the backend and mirrors its effect into the model.
 
+// New contents; the metadata (mode, times, xattrs, flags) stays.
 void ModelFile(const std::string &path, const std::vector<uint8_t> &data)
 {
 	Expect &e = g_model[path];
-	int mode = e.mode;
-	int64_t mtime = e.mtime_ns;
-	e = Expect();
 	e.type = "file";
 	e.data = data;
 	e.have_data = true;
-	e.mode = mode;
-	e.mtime_ns = mtime;
+	e.size = data.size();
+	e.sha256.clear();
 }
 
 void OpCreate(const std::string &path, const std::vector<uint8_t> &data, size_t chunk)
@@ -510,9 +695,40 @@ void OpCreate(const std::string &path, const std::vector<uint8_t> &data, size_t 
 	TraceOp t("create", path);
 	if (g_be->Create(path) && !data.empty())
 		g_be->Write(path, 0, data, chunk);
+	g_model[path] = Expect();
 	ModelFile(path, data);
-	if (g_model[path].orig_mode < 0)
-		g_model[path].orig_mode = 0644;   // both backends create files 0644
+	Expect &e = g_model[path];
+	e.orig_mode = 0644;   // both backends create files 0644
+	e.check_xattrs = true;   // a new file has none
+	e.hidden = 0;
+}
+
+void OpXattr(const std::string &path, const std::string &name, const std::vector<uint8_t> &value)
+{
+	TraceOp t("setxattr", path + " " + name);
+	g_be->SetXattr(path, name, value);
+	g_model[path].xattrs[name] = Sha256Hex(value.data(), value.size());
+}
+
+void OpRmXattr(const std::string &path, const std::string &name)
+{
+	TraceOp t("removexattr", path + " " + name);
+	g_be->RemoveXattr(path, name);
+	g_model[path].xattrs.erase(name);
+}
+
+void OpCrtime(const std::string &path, int64_t ns)
+{
+	TraceOp t("crtime", path);
+	g_be->SetCrtime(path, ns);
+	g_model[path].crtime_ns = ns;
+}
+
+void OpHidden(const std::string &path, bool hidden)
+{
+	TraceOp t("hidden", path);
+	g_be->SetHidden(path, hidden);
+	g_model[path].hidden = hidden ? 1 : 0;
 }
 
 void OpPatch(const std::string &path, uint64_t off, const std::vector<uint8_t> &patch, size_t chunk)
@@ -541,6 +757,8 @@ void OpMkdir(const std::string &path)
 	g_be->Mkdir(path);
 	g_model[path] = Expect();
 	g_model[path].type = "dir";
+	g_model[path].check_xattrs = true;
+	g_model[path].hidden = 0;
 }
 
 void OpRename(const std::string &from, const std::string &to)
@@ -571,15 +789,26 @@ void OpUnlink(const std::string &path, bool dir = false)
 	g_model.erase(path);
 }
 
-void OpSymlink(const std::string &path, const std::string &target)
+void OpSymlink(const std::string &path, const std::string &target, bool dir = false)
 {
 	TraceOp t("symlink", path);
-	if (!g_be->CanLink())
+	if (!g_be->CanSymlink())
 		return;
-	g_be->Symlink(path, target);
+	g_be->Symlink(path, target, dir);
 	g_model[path] = Expect();
 	g_model[path].type = "symlink";
 	g_model[path].target = target;
+}
+
+void OpSymlinkAbsolute(const std::string &path, const std::string &vol_path, const std::string &expected_target)
+{
+	TraceOp t("symlink-abs", path);
+	if (!g_be->CanSymlink())
+		return;
+	g_be->SymlinkAbsolute(path, vol_path, expected_target);
+	g_model[path] = Expect();
+	g_model[path].type = "symlink";
+	g_model[path].target = expected_target;
 }
 
 void OpLink(const std::string &existing, const std::string &path)
@@ -750,6 +979,9 @@ struct Seen
 	std::string target;
 	int mode = 0;
 	int64_t mtime_ns = 0;
+	std::map<std::string, std::string> xattrs;
+	int64_t crtime_ns = 0;
+	int hidden = 0;
 };
 
 void WalkVolume(Volume &v, uint64_t ino, const std::string &path, std::map<std::string, Seen> &out, int depth = 0)
@@ -775,6 +1007,16 @@ void WalkVolume(Volume &v, uint64_t ino, const std::string &path, std::map<std::
 		s.type = st.type == FileType::Dir ? "dir" : st.type == FileType::Symlink ? "symlink" : st.type == FileType::Fifo ? "fifo" : "file";
 		s.mode = st.mode & 07777;
 		s.mtime_ns = st.mod_ns;
+		s.crtime_ns = st.create_ns;
+		s.hidden = (st.bsd_flags & kUF_HIDDEN) ? 1 : 0;
+		std::vector<std::string> xnames;
+		CHECK(v.ListXattrs(e.inode, st, xnames), "[%s] cannot list xattrs of %s", v.EngineName(), p.c_str());
+		for (const auto &xn : xnames)
+		{
+			std::vector<uint8_t> xv;
+			CHECK(v.GetXattr(e.inode, xn, xv), "[%s] cannot read xattr %s of %s", v.EngineName(), xn.c_str(), p.c_str());
+			s.xattrs[xn] = Sha256Hex(xv.data(), xv.size());
+		}
 		if (s.type == "file")
 		{
 			s.size = st.size;
@@ -824,6 +1066,21 @@ void Compare(Volume &v)
 			CHECK(s.mode == e.mode, "[%s] %s: mode %o, expected %o", v.EngineName(), kv.first.c_str(), s.mode, e.mode);
 		if (e.mtime_ns != INT64_MIN)
 			CHECK(s.mtime_ns == e.mtime_ns, "[%s] %s: mtime %lld, expected %lld", v.EngineName(), kv.first.c_str(), (long long)s.mtime_ns, (long long)e.mtime_ns);
+		if (e.crtime_ns != INT64_MIN)
+			CHECK(s.crtime_ns == e.crtime_ns, "[%s] %s: creation time %lld, expected %lld", v.EngineName(), kv.first.c_str(), (long long)s.crtime_ns, (long long)e.crtime_ns);
+		if (e.hidden >= 0)
+			CHECK(s.hidden == e.hidden, "[%s] %s: hidden %d, expected %d", v.EngineName(), kv.first.c_str(), s.hidden, e.hidden);
+		if (e.check_xattrs)
+		{
+			for (const auto &x : e.xattrs)
+			{
+				auto it2 = s.xattrs.find(x.first);
+				CHECK(it2 != s.xattrs.end(), "[%s] %s: missing xattr %s", v.EngineName(), kv.first.c_str(), x.first.c_str());
+				CHECK(it2 == s.xattrs.end() || it2->second == x.second, "[%s] %s: xattr %s differs", v.EngineName(), kv.first.c_str(), x.first.c_str());
+			}
+			for (const auto &x : s.xattrs)
+				CHECK(e.xattrs.count(x.first), "[%s] %s: unexpected xattr %s", v.EngineName(), kv.first.c_str(), x.first.c_str());
+		}
 	}
 	for (const auto &kv : seen)
 		CHECK(g_model.count(kv.first) || (g_ignore_crash && kv.first.compare(0, 6, "/crash") == 0),
@@ -866,6 +1123,17 @@ void SaveModel(const std::wstring &file)
 			j["mode"] = e.mode;
 		if (e.mtime_ns != INT64_MIN)
 			j["mtime_ns"] = e.mtime_ns;
+		if (e.crtime_ns != INT64_MIN)
+			j["crtime_ns"] = e.crtime_ns;
+		if (e.hidden >= 0)
+			j["hidden"] = e.hidden;
+		if (e.check_xattrs)
+		{
+			json x = json::object();
+			for (const auto &kv2 : e.xattrs)
+				x[HexEncode(kv2.first)] = kv2.second;
+			j["xattrs_hex"] = x;
+		}
 		doc.push_back(j);
 	}
 	std::ofstream(file) << doc.dump(1);
@@ -892,6 +1160,16 @@ bool LoadModel(const std::wstring &file)
 			e.mode = j["mode"].get<int>();
 		if (j.contains("mtime_ns"))
 			e.mtime_ns = j["mtime_ns"].get<int64_t>();
+		if (j.contains("crtime_ns"))
+			e.crtime_ns = j["crtime_ns"].get<int64_t>();
+		if (j.contains("hidden"))
+			e.hidden = j["hidden"].get<int>();
+		if (j.contains("xattrs_hex"))
+		{
+			e.check_xattrs = true;
+			for (auto it = j["xattrs_hex"].begin(); it != j["xattrs_hex"].end(); ++it)
+				e.xattrs[HexDecode(it.key())] = it.value().get<std::string>();
+		}
 		g_model[HexDecode(j["path_hex"].get<std::string>())] = e;
 	}
 	return true;
@@ -1123,6 +1401,20 @@ int wmain(int argc, wchar_t **argv)
 			e.target = j["target"].get<std::string>();
 		if (j.contains("mode"))
 			e.orig_mode = static_cast<int>(strtol(j["mode"].get<std::string>().c_str() + 2, nullptr, 8));   // "0o755"
+		// the manifest lists every xattr macOS shows, and the BSD flags
+		e.check_xattrs = true;
+		if (j.contains("xattrs"))
+			for (auto it = j["xattrs"].begin(); it != j["xattrs"].end(); ++it)
+				e.xattrs[it.key()] = it.value()["sha256"].get<std::string>();
+		if (j.contains("flags"))
+		{
+			e.flags = j["flags"].get<uint32_t>();
+			e.hidden = (e.flags & kUF_HIDDEN) ? 1 : 0;
+		}
+		if (j.contains("nlink") && e.type == "file")
+		{
+			e.nlink = j["nlink"].get<uint64_t>();
+		}
 		g_model[path] = e;
 	}
 
@@ -1137,6 +1429,7 @@ int wmain(int argc, wchar_t **argv)
 			win.root.pop_back();
 		if (win.root.compare(0, 4, L"\\\\?\\") != 0)
 			win.root = L"\\\\?\\" + win.root;
+		win.ProbeSymlink();
 		g_be = &win;
 	}
 	else
@@ -1253,6 +1546,71 @@ int wmain(int argc, wchar_t **argv)
 	if (!skip("nfd"))
 		OpCreate("/w3/caf\x65\xcc\x81_nfd.txt", Pattern(7, 10), 4096);
 	OpCreate("/w3/\xf0\x9f\x99\x82.txt", Pattern(8, 20), 4096);
+
+	// ---- W4: fidelity
+	if (!skip("fidelity"))
+	{
+		// xattrs (named streams through the drive): inline, stream-backed
+		// (> 3804 bytes), empty, replaced by a smaller value, removed, on a
+		// directory, next to the xattrs macOS wrote
+		OpXattr("/w3/page.bin", "user.small", Pattern(20, 30));
+		OpXattr("/w3/page.bin", "user.big", Pattern(21, 100000));
+		OpXattr("/w3/page.bin", "user.empty", {});
+		OpXattr("/w3/page.bin", "user.big", Pattern(22, 5000));
+		OpXattr("/w3/page.bin", "user.gone", Pattern(23, 10));
+		OpRmXattr("/w3/page.bin", "user.gone");
+		OpXattr("/w3/empty.bin", "com.apple.FinderInfo", std::vector<uint8_t>(32, 0));
+		if (has("/w3/moved_sub"))
+			OpXattr("/w3/moved_sub", "user.on_dir", Pattern(24, 40));
+		if (!mac_file.empty())
+			OpXattr(mac_file, "user.added", Pattern(25, 50));
+		// creation time (100 ns units: FILETIME) and the hidden flag
+		OpCrtime("/w3/page.bin", 1000000000LL * 1000000000LL + 1234500);
+		OpHidden("/w3/empty.bin", true);
+		if (has("/w3/moved_sub"))
+		{
+			OpCrtime("/w3/moved_sub", 946684800LL * 1000000000LL);
+			OpHidden("/w3/moved_sub/deeper", true);
+		}
+		if (has("/w3/b.txt"))
+		{
+			OpHidden("/w3/b.txt", true);   // read-only too: the bit must survive
+			OpHidden("/w3/b.txt", false);
+		}
+		// names Windows can't spell directly (U+F0xx on the Windows side)
+		OpCreate("/w3/a:b?c*d|e<f>g\"h.txt", Pattern(26, 10), 4096);
+		OpCreate("/w3/trailing.", Pattern(27, 10), 4096);
+		OpCreate("/w3/trailing ", Pattern(28, 10), 4096);
+		// symlinks (through the drive only with the symlink privilege)
+		if (has("/w3/moved_sub"))
+		{
+			OpSymlink("/w3/dirlink", "moved_sub", true);
+			OpSymlink("/w3/moved_sub/up", "../page.bin");
+		}
+		OpSymlink("/w3/dangling", "does/not/exist");
+		OpSymlinkAbsolute("/w3/abs", "/w3/page.bin", "page.bin");
+		// compressed (decmpfs) files: written by replacing them with plain copies
+		std::vector<std::pair<std::string, uint64_t>> compressed;
+		for (const auto &kv : g_model)
+			if (kv.second.type == "file" && (kv.second.flags & kUF_COMPRESSED) && kv.second.size > 2 && kv.second.nlink == 1 &&
+				!kv.second.have_data && compressed.size() < 3)
+				compressed.emplace_back(kv.first, kv.second.size);
+		for (size_t i = 0; i < compressed.size(); i++)
+		{
+			const std::string &p = compressed[i].first;
+			uint64_t size = compressed[i].second;
+			if (i == 0)
+				OpPatch(p, size / 2, Pattern(30, 3000), 1000);
+			else if (i == 1)
+				OpTruncate(p, size / 3);
+			else
+			{
+				OpTruncate(p, 0);
+				OpPatch(p, 0, Pattern(31, 777), 4096);
+			}
+		}
+		printf("fidelity: %zu compressed files written, symlinks %s\n", compressed.size(), g_be->CanSymlink() ? "made" : "skipped");
+	}
 	}
 
 	if (mode == WIN32_DRIVE)

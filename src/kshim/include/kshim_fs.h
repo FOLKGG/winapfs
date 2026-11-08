@@ -869,7 +869,9 @@ int fiemap_fill_next_extent(struct fiemap_extent_info *fi, u64 logical, u64 phys
 /* ------------------------------------------------------------ xattr */
 #define XATTR_CREATE	0x1
 #define XATTR_REPLACE	0x2
-#define XATTR_SIZE_MAX	65536
+/* winapfs: Linux caps xattr values at 64 KiB (a VFS limit, not an APFS one);
+ * resource forks are often larger and are exposed as streams on Windows */
+#define XATTR_SIZE_MAX	(256 << 20)
 #define XATTR_NAME_MAX	255
 #define XATTR_LIST_MAX	65536
 #define XATTR_USER_PREFIX	"user."

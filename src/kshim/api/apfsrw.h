@@ -130,13 +130,39 @@ int apfsrw_fsync(apfsrw_file *f);
 #define APFSRW_SET_SIZE		0x08
 #define APFSRW_SET_ATIME	0x10
 #define APFSRW_SET_MTIME	0x20
+#define APFSRW_SET_CRTIME	0x40	/* creation time (no Linux equivalent) */
+#define APFSRW_SET_FLAGS	0x80	/* BSD flags: bits in flags_mask become those of flags */
 typedef struct apfsrw_setattr_t {
 	uint32_t mask;
 	uint32_t mode;          /* permission bits only */
 	uint32_t uid, gid;
 	uint64_t size;
 	int64_t atime_ns, mtime_ns;
+	int64_t crtime_ns;
+	uint32_t flags, flags_mask;	/* only APFSRW_USER_FLAGS may change */
 } apfsrw_setattr_t;
+/* BSD flags a user may change: UF_NODUMP, UF_HIDDEN */
+#define APFSRW_USER_FLAGS	0x00008001u
+
+/*
+ * Extended attributes (on-disk names, no "osx." prefix; at most 127 bytes).
+ * value NULL removes the attribute. Names the file system owns
+ * (com.apple.fs.*, com.apple.decmpfs, and com.apple.ResourceFork of a
+ * compressed file) are refused with -EPERM.
+ */
+#define APFSRW_XATTR_CREATE	1	/* fail with -EEXIST if it exists */
+#define APFSRW_XATTR_REPLACE	2	/* fail with -ENODATA if it doesn't */
+int apfsrw_setxattr(apfsrw_node *n, const char *name, const void *value, size_t size, int flags);
+int apfsrw_removexattr(apfsrw_node *n, const char *name);
+
+/*
+ * The driver can't write compressed (decmpfs) files: this replaces the
+ * compressed file `name` in dir by an uncompressed copy with the same data,
+ * xattrs, owner, mode, times and flags (atomically, by a rename). *out (may
+ * be NULL) is the new file. -EINVAL if the file isn't compressed, -EMLINK if
+ * it has more than one name.
+ */
+int apfsrw_decompress(apfsrw_node *dir, const char *name, size_t len, apfsrw_node **out);
 /* ctime is always set to now, as the Linux VFS does. */
 int apfsrw_setattr(apfsrw_node *n, const apfsrw_setattr_t *a);
 

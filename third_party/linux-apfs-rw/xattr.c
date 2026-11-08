@@ -702,6 +702,34 @@ static int apfs_xattr_dstream_from_query(struct apfs_query *query, struct apfs_d
  *
  * Returns 0 on success, or a negative error code in case of failure.
  */
+/*
+ * winapfs (upstream candidate): some xattrs are mirrored by inode flags, and
+ * fsck (apfsck, presumably fsck_apfs too) requires them to agree. Called in
+ * the transaction that added or removed the xattr.
+ */
+static void apfs_xattr_sync_inode_flags(struct inode *inode, const char *name, bool present)
+{
+	struct apfs_inode_info *ai = APFS_I(inode);
+	u64 set, clear;
+
+	if (strcmp(name, APFS_XATTR_NAME_FINDER_INFO) == 0) {
+		set = present ? APFS_INODE_HAS_FINDER_INFO : 0;
+		clear = present ? 0 : APFS_INODE_HAS_FINDER_INFO;
+	} else if (strcmp(name, APFS_XATTR_NAME_RSRC_FORK) == 0) {
+		set = present ? APFS_INODE_HAS_RSRC_FORK : APFS_INODE_NO_RSRC_FORK;
+		clear = present ? APFS_INODE_NO_RSRC_FORK : APFS_INODE_HAS_RSRC_FORK;
+	} else if (strcmp(name, APFS_XATTR_NAME_SECURITY) == 0) {
+		set = present ? APFS_INODE_HAS_SECURITY_EA : 0;
+		clear = present ? 0 : APFS_INODE_HAS_SECURITY_EA;
+	} else {
+		return;
+	}
+	if ((ai->i_int_flags & (set | clear)) == set)
+		return;
+	ai->i_int_flags = (ai->i_int_flags & ~clear) | set;
+	apfs_inode_join_transaction(inode->i_sb, inode);
+}
+
 int apfs_xattr_set(struct inode *inode, const char *name, const void *value,
 		   size_t size, int flags)
 {
@@ -790,6 +818,8 @@ int apfs_xattr_set(struct inode *inode, const char *name, const void *value,
 	}
 
 done:
+	if (!ret)
+		apfs_xattr_sync_inode_flags(inode, name, value != NULL);	/* winapfs */
 	kfree(valid_dstream);
 	if (bad_dstream) {
 		cleanup_err = apfs_truncate(bad_dstream, 0);

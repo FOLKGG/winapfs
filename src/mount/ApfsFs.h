@@ -48,10 +48,26 @@ public:
 	NTSTATUS CopySecurity(PSECURITY_DESCRIPTOR sd, SIZE_T *size);
 	uint32_t Attributes(const Stat &st, const std::string &name);
 
+	// Reparse points: symlinks (IO_REPARSE_TAG_SYMLINK), FIFOs, devices and
+	// sockets (the WSL tags).
+	static uint32_t ReparseTag(const Stat &st);
+	// Whether a symlink resolves, inside the volume, to a directory.
+	bool SymlinkIsDir(const Stat &st);
+	NTSTATUS MakeReparseData(const Stat &st, PVOID buf, PSIZE_T size);
+	// POSIX symlink target -> Windows substitute name (+ relative flag) and back.
+	// link_dir: Windows path of the link's directory inside the volume ("" = root).
+	static void PosixTargetToWindows(const std::string &target, std::wstring &sub, std::wstring &print, bool &relative);
+	std::string WindowsTargetToPosix(const std::wstring &sub, bool relative, const std::wstring &link_dir);
+
+	// Named streams are xattrs; only those ListXattrs shows are visible.
+	bool StreamVisible(const Stat &st, const std::string &xattr);
+
 	const MountOptions &Options() const { return m_opts; }
 	FSP_FILE_SYSTEM *FileSystem() { return m_fs; }
 
 private:
+	bool FollowLink(uint64_t dir, const std::string &target, int depth, Stat &out);
+	std::string LocalTarget(const std::string &target);
 	bool CacheGet(const std::wstring &dir, uint64_t &inode, std::wstring &normalized);
 	void CachePut(const std::wstring &dir, uint64_t inode, const std::wstring &normalized);
 
