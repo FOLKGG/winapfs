@@ -73,13 +73,16 @@ catch {
 }
 finally {
 	if ($attached) { Dismount-DiskImage -ImagePath $vhd | Out-Null }
+	# the events first: uninstall removes the event source and its message table
+	Write-Host "recent service events:"
+	try {
+		Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'winapfs' } -MaxEvents 12 -ErrorAction Stop |
+			Sort-Object TimeCreated | ForEach-Object { Write-Host "  $($_.TimeCreated.ToString('HH:mm:ss'))  $($_.Message)" }
+	} catch { Write-Host "  (none readable: $($_.Exception.Message))" }
 	& $winapfs service uninstall
 	# forget the test volume's settings
 	Get-ChildItem 'HKLM:\SOFTWARE\winapfs\Volumes' -ErrorAction SilentlyContinue |
 		Where-Object { (Get-ItemProperty $_.PSPath).Name -eq 'Basic' } | Remove-Item -Recurse -Force
-	Write-Host "recent service events:"
-	Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'winapfs' } -MaxEvents 12 -ErrorAction SilentlyContinue |
-		Sort-Object TimeCreated | ForEach-Object { Write-Host "  $($_.TimeCreated.ToString('HH:mm:ss'))  $($_.Message)" }
 	if ($Log) { Stop-Transcript | Out-Null }
 }
 if ($rc -eq 0) { Write-Host "service test: OK" }

@@ -505,7 +505,8 @@ owner/mode, settings UI.
   remembers letters, honours Disabled/DriveLetter/ReadWrite, shares the
   container, fsck clean). `tests\service_admin_test.ps1` (elevated): installs
   the real service, attaches a VHD copy, waits for the drive, detaches, checks
-  the drive goes, uninstalls (not yet run). VHD helpers moved to
+  the drive goes, uninstalls: passed 2026-11-08 (mounted at X: within the
+  wait, drive gone after detach, i.e. the query-remove path works). VHD helpers moved to
   tests\vhd_helpers.ps1.
 
 ### Performance (2026-11-08, after the user's physical-disk copy test)
