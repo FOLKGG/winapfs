@@ -36,6 +36,9 @@ struct kshim_bdev {
 };
 
 static struct kshim_bdev g_bdevs[MAX_BDEVS];
+
+/* KSHIM_IOSTATS=1: device I/O counts, printed when a device is released */
+static volatile LONG64 g_reads, g_read_bytes, g_writes, g_write_bytes;
 static SRWLOCK g_bdev_lock = SRWLOCK_INIT;
 
 int kshim_bdev_register(const wchar_t *path, u64 offset, u64 size, bool writable, char *name, size_t name_size)
@@ -109,6 +112,9 @@ void kshim_bdev_unregister(const char *name)
 	AcquireSRWLockExclusive(&g_bdev_lock);
 	b = lookup(name);
 	if (b && b->opens == 0) {
+		if (getenv("KSHIM_IOSTATS"))
+			fprintf(stderr, "kshim %s: %lld reads (%lld KiB), %lld writes (%lld KiB)\n", name, (long long)g_reads,
+				(long long)g_read_bytes / 1024, (long long)g_writes, (long long)g_write_bytes / 1024);
 		/* nothing dirty should be left after the last close; never drop it silently */
 		if (b->writable)
 			sync_blockdev(&b->bdev);
@@ -134,6 +140,8 @@ static int io(struct block_device *bdev, bool write, u64 off, void *buf, size_t 
 	if (off > b->size || len > b->size - off)
 		return -EIO;
 	off += b->offset;
+	InterlockedIncrement64(write ? &g_writes : &g_reads);
+	InterlockedAdd64(write ? &g_write_bytes : &g_read_bytes, (LONG64)len);
 
 	while (len > 0) {
 		OVERLAPPED ov = { 0 };

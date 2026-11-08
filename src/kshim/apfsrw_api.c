@@ -263,6 +263,29 @@ int apfsrw_read(apfsrw_file *af, uint64_t off, void *buf, size_t len, size_t *go
 	if (len > size - off)
 		len = (size_t)(size - off);
 
+	/*
+	 * Bring the range into the page cache with large device reads (the
+	 * driver's readahead op, batched by mpage_readahead), plus 1 MiB ahead for
+	 * a sequential reader; read_mapping_folio below then finds every page.
+	 */
+	{
+		const u64 window = 1u << 20;
+		u64 from = off, to = off + len;
+		if (off == af->ra_next)
+			to = max(to, off + window);
+		if (to > size)
+			to = size;
+		if (off < af->ra_end && af->ra_end <= to && off + window >= af->ra_end)
+			from = af->ra_end;   /* the start was read ahead last time */
+		if (from < to) {
+			pgoff_t first = (pgoff_t)(from >> PAGE_SHIFT);
+			pgoff_t last = (pgoff_t)((to - 1) >> PAGE_SHIFT);
+			kshim_file_readahead(af->f.f_mapping, &af->f, first, (unsigned long)(last - first + 1));
+			af->ra_end = to;
+		}
+		af->ra_next = off + len;
+	}
+
 	while (len > 0) {
 		pgoff_t idx = (pgoff_t)(off >> PAGE_SHIFT);
 		size_t in = (size_t)(off & (PAGE_SIZE - 1));

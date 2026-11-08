@@ -180,7 +180,13 @@ kshim_bdev.c      device registry "kshim:N" -> Win32 handle + partition range,
                   positional overlapped I/O, FlushFileBuffers as the barrier
 kshim_pagecache.c folios (one 4 KiB page, page-aligned), per-mapping hash, buffer
                   heads on folios, synchronous submit_bh, mpage read, block_write_*
-                  writeback, truncation, reclaim of clean folios above 64K folios
+                  writeback, truncation, reclaim of clean folios above 64K folios;
+                  mpage_readahead batches runs of pages into one device read per
+                  extent piece (≤ 1 MiB); apfsrw_read reads ahead the request plus
+                  1 MiB for sequential readers. Before that, every 4 KiB was its own
+                  device read: fine on image files (OS cache), very slow on raw
+                  USB disks (user report 2026-11-08). 20 MiB file: 5429 → 58 reads.
+                  `KSHIM_IOSTATS=1` prints device read/write counts at unmount.
 kshim_vfs.c       inode cache (iget5_locked & co), transient dentries, sget/super
                   lifecycle, sync_filesystem (write_inode, sync_fs 0, flush, sync_fs 1)
 apfsrw_api.c      C API (src/kshim/api/apfsrw.h): mount/unmount/sync/statfs, lookup,

@@ -22,6 +22,7 @@ void kshim_reclaim(void);
 /* block devices */
 struct kshim_bdev;
 int kshim_bdev_read(struct block_device *bdev, u64 off, void *buf, size_t len);
+void kshim_file_readahead(struct address_space *m, struct file *file, pgoff_t index, unsigned long nr);
 int kshim_bdev_write(struct block_device *bdev, u64 off, const void *buf, size_t len);
 int kshim_bdev_flush(struct block_device *bdev);
 

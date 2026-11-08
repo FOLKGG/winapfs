@@ -967,13 +967,109 @@ int mpage_read_folio(struct folio *f, get_block_t get_block)
 	return err;
 }
 
+/*
+ * Fills a run of consecutive locked folios with as few device reads as the
+ * extents allow: get_block maps up to the end of an extent (b_size in, mapped
+ * length out), and each mapped piece is one read into a bounce buffer. This is
+ * what Linux's mpage code does with bios; reading page by page made every
+ * 4 KiB a separate (uncached, on raw disks) device round trip. On error the
+ * folios stay !uptodate and read_folio retries them one by one.
+ */
+static void read_folio_run(struct folio **fs, unsigned n, get_block_t get_block)
+{
+	struct inode *inode;
+	unsigned bits;
+	loff_t isize;
+	u64 start;
+	size_t total, pos = 0;
+	u8 *buf;
+	int err = 0;
+	unsigned i;
+
+	if (!n)
+		return;
+	inode = fs[0]->page.mapping->host;
+	bits = inode->i_blkbits;
+	isize = i_size_read(inode);
+	start = (u64)fs[0]->page.index << PAGE_SHIFT;
+	total = (size_t)n << PAGE_SHIFT;
+	buf = malloc(total);
+	if (!buf)
+		err = -ENOMEM;
+	while (!err && pos < total) {
+		u64 fpos = start + pos;
+		struct buffer_head tmp;
+		size_t len;
+
+		if ((loff_t)fpos >= isize) {
+			memset(buf + pos, 0, total - pos);
+			break;
+		}
+		memset(&tmp, 0, sizeof(tmp));
+		tmp.b_size = total - pos;
+		err = get_block(inode, (sector_t)(fpos >> bits), &tmp, 0);
+		if (err)
+			break;
+		len = tmp.b_size;
+		if (len < ((size_t)1 << bits) || len > total - pos)
+			len = min(total - pos, (size_t)1 << bits);
+		if (buffer_mapped(&tmp))
+			err = kshim_bdev_read(tmp.b_bdev ? tmp.b_bdev : inode->i_sb->s_bdev, (u64)tmp.b_blocknr << bits, buf + pos, len);
+		else
+			memset(buf + pos, 0, len);   /* hole */
+		pos += len;
+	}
+	for (i = 0; i < n; i++) {
+		if (!err) {
+			memcpy(fs[i]->page.data, buf + ((size_t)i << PAGE_SHIFT), PAGE_SIZE);
+			folio_mark_uptodate(fs[i]);
+		}
+		folio_unlock(fs[i]);
+		folio_put(fs[i]);
+	}
+	free(buf);
+}
+
+#define KSHIM_RA_BATCH	256	/* pages per device read at most (1 MiB) */
+
 void mpage_readahead(struct readahead_control *rac, get_block_t get_block)
 {
-	struct folio *f;
+	struct folio *batch[KSHIM_RA_BATCH], *f;
+	unsigned n = 0;
+
 	while ((f = readahead_folio(rac)) != NULL) {
-		if (!folio_test_uptodate(f) && !read_folio_blocks(f, get_block))
-			folio_mark_uptodate(f);
-		folio_unlock(f);
+		if (folio_test_uptodate(f)) {
+			folio_unlock(f);
+			read_folio_run(batch, n, get_block);
+			n = 0;
+			continue;
+		}
+		if (n && (batch[n - 1]->page.index + 1 != f->page.index || n == KSHIM_RA_BATCH)) {
+			read_folio_run(batch, n, get_block);
+			n = 0;
+		}
+		folio_get(f);   /* held until filled: readahead_folio returns it without a reference */
+		batch[n++] = f;
+	}
+	read_folio_run(batch, n, get_block);
+}
+
+/* Reads pages [index, index + nr) of a file through its readahead op, if any. */
+void kshim_file_readahead(struct address_space *m, struct file *file, pgoff_t index, unsigned long nr)
+{
+	if (!m->a_ops || !m->a_ops->readahead)
+		return;
+	while (nr) {
+		struct readahead_control rac;
+		unsigned chunk = nr > KSHIM_RA_BATCH ? KSHIM_RA_BATCH : (unsigned)nr;
+		memset(&rac, 0, sizeof(rac));
+		rac.file = file;
+		rac.mapping = m;
+		rac._index = index;
+		rac._nr_pages = chunk;
+		m->a_ops->readahead(&rac);
+		index += chunk;
+		nr -= chunk;
 	}
 }
 

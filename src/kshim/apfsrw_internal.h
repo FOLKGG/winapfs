@@ -15,6 +15,9 @@
 
 struct apfsrw_file {
 	struct file f;
+	/* readahead hints (apfsrw_read); racy updates only cost an extra or a missed readahead */
+	u64 ra_next;	/* where a sequential reader continues */
+	u64 ra_end;	/* bytes before this were read ahead already */
 };
 
 /* A node is a referenced dentry. */
