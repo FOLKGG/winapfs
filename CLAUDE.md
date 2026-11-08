@@ -187,6 +187,12 @@ kshim_pagecache.c folios (one 4 KiB page, page-aligned), per-mapping hash, buffe
                   device read: fine on image files (OS cache), very slow on raw
                   USB disks (user report 2026-11-08). 20 MiB file: 5429 → 58 reads.
                   `KSHIM_IOSTATS=1` prints device read/write counts at unmount.
+                  The bounce buffer is page-aligned (raw disks need sector-aligned
+                  buffers; a plain malloc made batched reads fail and fall back to
+                  4 KiB pages: ~40 MB/s on the user's USB SSD), and physically
+                  adjacent extent pieces are merged into one read.
+                  Known: files written by the engine get one extent record per
+                  4 KiB block (600 MiB file: 153,600 records, writes ~15 MB/s).
 kshim_vfs.c       inode cache (iget5_locked & co), transient dentries, sget/super
                   lifecycle, sync_filesystem (write_inode, sync_fs 0, flush, sync_fs 1)
 apfsrw_api.c      C API (src/kshim/api/apfsrw.h): mount/unmount/sync/statfs, lookup,

@@ -975,6 +975,8 @@ int mpage_read_folio(struct folio *f, get_block_t get_block)
  * 4 KiB a separate (uncached, on raw disks) device round trip. On error the
  * folios stay !uptodate and read_folio retries them one by one.
  */
+volatile LONG64 g_ra_pieces;	/* extent pieces seen by readahead (KSHIM_IOSTATS) */
+
 static void read_folio_run(struct folio **fs, unsigned n, get_block_t get_block)
 {
 	struct inode *inode;
@@ -993,31 +995,55 @@ static void read_folio_run(struct folio **fs, unsigned n, get_block_t get_block)
 	isize = i_size_read(inode);
 	start = (u64)fs[0]->page.index << PAGE_SHIFT;
 	total = (size_t)n << PAGE_SHIFT;
-	buf = malloc(total);
+	/* page-aligned: raw disk handles want sector-aligned buffers */
+	buf = _aligned_malloc(total, PAGE_SIZE);
 	if (!buf)
 		err = -ENOMEM;
-	while (!err && pos < total) {
-		u64 fpos = start + pos;
-		struct buffer_head tmp;
-		size_t len;
+	{
+		/* pieces that are physically adjacent (separate extent records,
+		 * contiguous blocks) are merged into one device read */
+		struct block_device *pend_bdev = NULL;
+		u64 pend_disk = 0;
+		size_t pend_pos = 0, pend_len = 0;
 
-		if ((loff_t)fpos >= isize) {
-			memset(buf + pos, 0, total - pos);
-			break;
+		while (!err && pos < total) {
+			u64 fpos = start + pos;
+			struct buffer_head tmp;
+			size_t len;
+
+			if ((loff_t)fpos >= isize) {
+				memset(buf + pos, 0, total - pos);
+				break;
+			}
+			memset(&tmp, 0, sizeof(tmp));
+			tmp.b_size = total - pos;
+			err = get_block(inode, (sector_t)(fpos >> bits), &tmp, 0);
+			if (err)
+				break;
+			InterlockedIncrement64(&g_ra_pieces);
+			len = tmp.b_size;
+			if (len < ((size_t)1 << bits) || len > total - pos)
+				len = min(total - pos, (size_t)1 << bits);
+			if (buffer_mapped(&tmp)) {
+				struct block_device *bd = tmp.b_bdev ? tmp.b_bdev : inode->i_sb->s_bdev;
+				u64 disk = (u64)tmp.b_blocknr << bits;
+				if (pend_len && (bd != pend_bdev || disk != pend_disk + pend_len)) {
+					err = kshim_bdev_read(pend_bdev, pend_disk, buf + pend_pos, pend_len);
+					pend_len = 0;
+				}
+				if (!pend_len) {
+					pend_bdev = bd;
+					pend_disk = disk;
+					pend_pos = pos;
+				}
+				pend_len += len;
+			} else {
+				memset(buf + pos, 0, len);   /* hole */
+			}
+			pos += len;
 		}
-		memset(&tmp, 0, sizeof(tmp));
-		tmp.b_size = total - pos;
-		err = get_block(inode, (sector_t)(fpos >> bits), &tmp, 0);
-		if (err)
-			break;
-		len = tmp.b_size;
-		if (len < ((size_t)1 << bits) || len > total - pos)
-			len = min(total - pos, (size_t)1 << bits);
-		if (buffer_mapped(&tmp))
-			err = kshim_bdev_read(tmp.b_bdev ? tmp.b_bdev : inode->i_sb->s_bdev, (u64)tmp.b_blocknr << bits, buf + pos, len);
-		else
-			memset(buf + pos, 0, len);   /* hole */
-		pos += len;
+		if (!err && pend_len)
+			err = kshim_bdev_read(pend_bdev, pend_disk, buf + pend_pos, pend_len);
 	}
 	for (i = 0; i < n; i++) {
 		if (!err) {
@@ -1027,7 +1053,7 @@ static void read_folio_run(struct folio **fs, unsigned n, get_block_t get_block)
 		folio_unlock(fs[i]);
 		folio_put(fs[i]);
 	}
-	free(buf);
+	_aligned_free(buf);
 }
 
 #define KSHIM_RA_BATCH	256	/* pages per device read at most (1 MiB) */
