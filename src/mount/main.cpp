@@ -345,6 +345,16 @@ static int CmdMountAll(const Args &a)
 			for (const auto &vi : c->Volumes())
 			{
 				std::unique_ptr<Volume> vol = OpenVolume(*c, vi, Opts(a, s));
+				if (!vol && a.rw)
+				{
+					// a volume refused for writing (macOS system volume, not ejected
+					// cleanly, ...) is still mounted, read-only, as the service does
+					Args ro = a;
+					ro.rw = false;
+					vol = OpenVolume(*c, vi, Opts(ro, s));
+					if (vol)
+						fprintf(stderr, "%s: mounting read-only instead\n", vi.name.c_str());
+				}
 				if (!vol)
 				{
 					failures++;
