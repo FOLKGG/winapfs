@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  winapfs MSI (WiX 5). Built by installer\build.ps1, which passes:
+    Version   x.y.z (from CMakeLists.txt)
+    BuildDir  the CMake build directory (Release binaries)
+    ObjDir    generated files: license.rtf, THIRD-PARTY-NOTICES.txt
+  Installs winapfs.exe, winapfs-cli.exe and winapfs-fsck.exe to
+  Program Files\winapfs, adds that folder to PATH, registers the event log
+  source and installs + starts the auto-mount service (LocalSystem).
+  Needs WinFsp (the setup bundle installs it first). Major upgrades in place;
+  uninstall stops and removes the service and keeps HKLM\SOFTWARE\winapfs
+  (per-volume settings).
+  SPDX-License-Identifier: GPL-2.0-or-later
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+
+  <!-- the UpgradeCode never changes: it is how upgrades find older versions -->
+  <Package Name="winapfs (APFS for Windows)"
+           Manufacturer="winapfs contributors"
+           Version="$(var.Version)"
+           UpgradeCode="7C3F1A52-8E4B-4D2A-9B6E-5A0F3C2D1E47"
+           Scope="perMachine"
+           Language="1033">
+
+    <SummaryInformation Description="APFS (Mac) disks on Windows" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of winapfs is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- WinFsp must be there (it registers under the 32-bit view) -->
+    <Property Id="WINFSPDIR">
+      <RegistrySearch Root="HKLM" Key="SOFTWARE\WinFsp" Name="InstallDir" Type="raw" Bitness="always32" />
+    </Property>
+    <Launch Condition="Installed OR WINFSPDIR"
+            Message="winapfs needs WinFsp (Windows File System Proxy). Install it from https://winfsp.dev, or use winapfs-setup.exe, which installs both." />
+
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/winfsp/winfsp" />
+    <Property Id="ARPCOMMENTS" Value="APFS (Mac) disks on Windows. Uses WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos." />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="winapfs" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="Main" Directory="INSTALLFOLDER">
+      <Component Id="WinapfsExe" Bitness="always64">
+        <File Id="WinapfsExe" Source="$(var.BuildDir)\src\mount\Release\winapfs.exe" KeyPath="yes" />
+        <ServiceInstall Name="winapfs"
+                        DisplayName="winapfs (APFS for Windows)"
+                        Description="Mounts APFS (Mac) disks at drive letters when they are connected."
+                        Type="ownProcess" Start="auto" ErrorControl="normal"
+                        Account="LocalSystem" Arguments="service run" Vital="yes">
+          <util:ServiceConfig FirstFailureActionType="restart" SecondFailureActionType="restart"
+                              ThirdFailureActionType="none" RestartServiceDelayInSeconds="5"
+                              ResetPeriodInDays="1" />
+        </ServiceInstall>
+        <ServiceControl Id="WinapfsService" Name="winapfs" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
+        <!-- event log source; the message table is in winapfs.exe -->
+        <RegistryKey Root="HKLM" Key="SYSTEM\CurrentControlSet\Services\EventLog\Application\winapfs">
+          <RegistryValue Name="EventMessageFile" Type="string" Value="[#WinapfsExe]" />
+          <RegistryValue Name="TypesSupported" Type="integer" Value="7" />
+        </RegistryKey>
+        <Environment Id="PathEntry" Name="PATH" Value="[INSTALLFOLDER]" Part="last" Action="set" System="yes" Permanent="no" />
+      </Component>
+      <Component Id="CliExe" Bitness="always64">
+        <File Source="$(var.BuildDir)\src\cli\Release\winapfs-cli.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="FsckExe" Bitness="always64">
+        <File Source="$(var.BuildDir)\src\fsck\Release\winapfs-fsck.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="Readme" Bitness="always64">
+        <File Id="Readme" Source="$(sys.SOURCEFILEDIR)..\README.md" Name="README.md" KeyPath="yes" />
+      </Component>
+      <Component Id="License" Bitness="always64">
+        <File Id="License" Source="$(sys.SOURCEFILEDIR)..\LICENSE" Name="LICENSE.txt" KeyPath="yes" />
+      </Component>
+      <Component Id="Notices" Bitness="always64">
+        <File Id="Notices" Source="$(var.ObjDir)\THIRD-PARTY-NOTICES.txt" Name="THIRD-PARTY-NOTICES.txt" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="Main" Title="winapfs" Level="1">
+      <ComponentGroupRef Id="Main" />
+    </Feature>
+
+    <!-- one page: the licence (GPL-2.0, with the WinFsp notice on top), then install -->
+    <ui:WixUI Id="WixUI_Minimal" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.ObjDir)\license.rtf" />
+  </Package>
+</Wix>
