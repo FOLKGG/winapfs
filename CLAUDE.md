@@ -90,7 +90,7 @@ tests/verify.cpp         winapfs-verify: manifest checker (image or mounted dir)
   Explorer. Elevated, `ApfsFs::Start` mounts at `\\.\X:` (WinFsp's Mount
   Manager form: a global letter) and falls back to the session letter;
   `MountPoint()` strips the prefix. Found by the user's first physical-disk
-  `mount-all` (2026-11-08).
+  `mount-all` (2026-11-08); with `\\.\X:` the drives showed in Explorer (confirmed).
 - **Timestamps**: APFS ns since 1970 (pre-1970 stored as negative int64) →
   FILETIME with floor division.
 
