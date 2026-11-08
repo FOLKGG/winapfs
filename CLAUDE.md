@@ -487,7 +487,7 @@ owner/mode, settings UI.
   Volumes\<UUID>\DriveLetter`, else highest free); unmounts volumes whose disk
   or UUID is gone. Read-write if `ReadWrite` (per volume or global) — on
   physical disks also `AllowDiskWrites` — else read-only; a refused rw open
-  falls back to read-only; `Disabled`, `HideDotfiles`. Encrypted volumes are
+  falls back to read-only; `Disabled`, `HideDotfiles` (default 1). Encrypted volumes are
   skipped (stage 3). Skipped volumes are logged once per disk.
 - Events: disk-interface arrival/removal → rescan (after 1.5 s and 4.5 s,
   plus every 60 s); a handle notification per mounted disk: query-remove /

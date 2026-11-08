@@ -33,6 +33,10 @@ winapfs mount-all --ask              # ask for passwords of encrypted volumes
 Disk images (`.img`, `.dmg` raw images) work without administrator rights:
 `winapfs mount disk.img *`.
 
+As on the Mac, names starting with `.` (`.DS_Store`, `.gitignore`, ...) are
+hidden; files the Mac marks hidden are too. Explorer shows them with "Hidden
+items" ticked; `--show-dotfiles` (service: `HideDotfiles=0`) turns this off.
+
 ### Automatic mounting
 
 ```

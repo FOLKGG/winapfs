@@ -54,7 +54,8 @@ static void Usage()
 		"                             cleanly (only if no Mac is hibernated on it)\n"
 		"  --engine auto|rw|lib       auto (default): linux-apfs-rw, or apfs-fuse for\n"
 		"                             encrypted volumes; rw or lib forces one\n"
-		"  --hide-dotfiles            mark names starting with '.' hidden\n"
+		"  --show-dotfiles            don't mark names starting with '.' hidden (they are by\n"
+		"                             default, as on macOS)\n"
 		"  --run <command>            mount, run command, unmount, and exit with its exit\n"
 		"                             code. %%MOUNT%% is the mount point (mount); the\n"
 		"                             environment gets WINAPFS_MOUNT_<volume>=<mount point>\n"
@@ -110,7 +111,8 @@ static bool ParseArgs(const std::vector<std::wstring> &argv, Args &a)
 		else if (s == L"--allow-disk-writes") a.allow_disk_writes = true;
 		else if (s == L"--force") a.force = true;
 		else if (s == L"--ask") a.ask = true;
-		else if (s == L"--hide-dotfiles") a.opts.hide_dotfiles = true;
+		else if (s == L"--hide-dotfiles") a.opts.hide_dotfiles = true;   // the default; kept for old scripts
+		else if (s == L"--show-dotfiles") a.opts.hide_dotfiles = false;
 		else if (s == L"-d" || s == L"--debug") a.opts.debug = true;
 		else if (!s.empty() && s[0] == L'-' && s != L"*") return false;
 		else a.positional.push_back(s);

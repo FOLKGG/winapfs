@@ -20,7 +20,7 @@ namespace winapfs {
 struct MountOptions
 {
 	bool debug = false;
-	bool hide_dotfiles = false;   // mark names starting with '.' FILE_ATTRIBUTE_HIDDEN
+	bool hide_dotfiles = true;    // names starting with '.' are FILE_ATTRIBUTE_HIDDEN (as on macOS)
 };
 
 class ApfsFs

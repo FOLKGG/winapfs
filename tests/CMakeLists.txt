@@ -322,3 +322,12 @@ if(TARGET winapfs)
 			-Winapfs $<TARGET_FILE:winapfs> -Fsck $<TARGET_FILE:winapfs-fsck> -Testdata ${TD} -WorkDir ${CMAKE_CURRENT_BINARY_DIR})
 	set_tests_properties(service.automount PROPERTIES RESOURCE_LOCK winfsp_mount PASS_REGULAR_EXPRESSION "OK: auto-mount")
 endif()
+
+# dotfiles are hidden by default (as on macOS); --show-dotfiles turns it off
+if(TARGET winapfs)
+	add_test(NAME mount_dotfiles.hidden
+		COMMAND winapfs mount ${TD}/basic.img * --run "powershell -NoProfile -Command \"if (((Get-Item -Force '%MOUNT%${BS}.hidden_dotfile').Attributes -band 'Hidden') -and -not ((Get-Item '%MOUNT%${BS}hello.txt').Attributes -band 'Hidden')) { exit 0 } else { exit 1 }\"")
+	add_test(NAME mount_dotfiles.shown
+		COMMAND winapfs mount ${TD}/basic.img * --show-dotfiles --run "powershell -NoProfile -Command \"if ((Get-Item -Force '%MOUNT%${BS}.hidden_dotfile').Attributes -band 'Hidden') { exit 1 } else { exit 0 }\"")
+	set_tests_properties(mount_dotfiles.hidden mount_dotfiles.shown PROPERTIES RESOURCE_LOCK winfsp_mount)
+endif()

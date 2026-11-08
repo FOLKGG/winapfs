@@ -17,7 +17,7 @@
 // HKCU\Software\winapfs-test)
 //   AllowDiskWrites  DWORD  1: read-write volumes on physical disks (W5 opt-in)
 //   ReadWrite        DWORD  default for volumes without their own setting
-//   HideDotfiles     DWORD
+//   HideDotfiles     DWORD  default 1: names starting with . are hidden (as on macOS)
 //   Volumes\<UUID>   DriveLetter (REG_SZ "X:"), ReadWrite, HideDotfiles,
 //                    Disabled (DWORD), Name (REG_SZ, informational)
 // Encrypted volumes are skipped (a per-user helper will ask for passwords).
@@ -364,7 +364,7 @@ private:
 			return false;
 		}
 		MountOptions mo;
-		mo.hide_dotfiles = m_cfg.Dword(sub, L"HideDotfiles", m_cfg.Dword(L"", L"HideDotfiles", 0)) != 0;
+		mo.hide_dotfiles = m_cfg.Dword(sub, L"HideDotfiles", m_cfg.Dword(L"", L"HideDotfiles", 1)) != 0;
 		std::unique_ptr<ApfsFs> fs(new ApfsFs(std::move(vol), mo));
 		wchar_t mp[] = { letter, L':', 0 };
 		NTSTATUS r = fs->Start(mp);
@@ -743,7 +743,7 @@ void ServiceUsage()
 		"\n"
 		"The service mounts every APFS volume read-only at a drive letter it remembers\n"
 		"per volume. Settings (HKLM\\SOFTWARE\\winapfs): AllowDiskWrites and ReadWrite\n"
-		"(DWORD, both 1 for read-write disks), HideDotfiles; per volume under\n"
+		"(DWORD, both 1 for read-write disks), HideDotfiles (default 1); per volume under\n"
 		"Volumes\\<UUID>: DriveLetter (\"X:\"), ReadWrite, HideDotfiles, Disabled.\n");
 }
 
