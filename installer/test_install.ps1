@@ -56,12 +56,14 @@ try {
 	Step "install $v1"
 	$p = Start-Process msiexec -ArgumentList "/i `"$msi1`" /qn /l*v `"$dir\install.log`"" -Wait -PassThru
 	Check ($p.ExitCode -eq 0) "msiexec exit code $($p.ExitCode)"
-	foreach ($f in 'winapfs.exe', 'winapfs-cli.exe', 'winapfs-fsck.exe', 'README.md', 'LICENSE.txt', 'THIRD-PARTY-NOTICES.txt') { Check (Test-Path "$inst\$f") "installed $f" }
+	foreach ($f in 'winapfs.exe', 'winapfs-tray.exe', 'winapfs-cli.exe', 'winapfs-fsck.exe', 'README.md', 'LICENSE.txt', 'THIRD-PARTY-NOTICES.txt') { Check (Test-Path "$inst\$f") "installed $f" }
 	$svc = Get-Service winapfs -ErrorAction SilentlyContinue
 	Check ($svc -and $svc.Status -eq 'Running') "service running"
 	Check ((Get-CimInstance Win32_Service -Filter "Name='winapfs'").PathName -like "*$inst\winapfs.exe*") "service runs the installed exe"
 	Check ((MachinePath) -like "*$inst*") "install folder on the system PATH"
 	Check (Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Application\winapfs') "event log source"
+	Check ((Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -ErrorAction SilentlyContinue).'winapfs-tray' -like '*winapfs-tray.exe*') "tray starts at logon (Run key)"
+	Check (Test-Path "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\winapfs.lnk") "Start menu shortcut"
 	Check (@(Products).Count -eq 1 -and (Products).DisplayVersion -eq $v1) "one product entry, version $v1"
 
 	Step "the installed service mounts a disk"
@@ -94,6 +96,8 @@ try {
 	Check (-not (Test-Path "$inst\winapfs.exe")) "files removed"
 	Check (-not ((MachinePath) -like "*$inst*")) "PATH entry removed"
 	Check (-not (Products)) "no product entry left"
+	Check (-not (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -ErrorAction SilentlyContinue).'winapfs-tray') "Run key removed"
+	Check (-not (Test-Path "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\winapfs.lnk")) "Start menu shortcut removed"
 	Check (Test-Path 'HKLM:\SOFTWARE\winapfs') "settings kept (HKLM\SOFTWARE\winapfs)"
 	$rc = 0
 }

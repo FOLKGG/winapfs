@@ -20,7 +20,7 @@ if (-not (Test-Path $wix)) { throw "WiX 5 not found (winget install WiXToolset.W
 
 $m = Select-String -Path "$root\CMakeLists.txt" -Pattern 'project\(winapfs VERSION ([0-9.]+)'
 $version = if ($Version) { $Version } else { $m.Matches[0].Groups[1].Value }
-foreach ($exe in 'src\mount\Release\winapfs.exe', 'src\cli\Release\winapfs-cli.exe', 'src\fsck\Release\winapfs-fsck.exe') {
+foreach ($exe in 'src\mount\Release\winapfs.exe', 'src\mount\Release\winapfs-tray.exe', 'src\cli\Release\winapfs-cli.exe', 'src\fsck\Release\winapfs-fsck.exe') {
 	if (-not (Test-Path "$Build\$exe")) { throw "missing $(Join-Path $Build $exe) (build Release first)" }
 }
 

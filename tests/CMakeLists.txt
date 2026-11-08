@@ -331,3 +331,11 @@ if(TARGET winapfs)
 		COMMAND winapfs mount ${TD}/basic.img * --show-dotfiles --run "powershell -NoProfile -Command \"if ((Get-Item -Force '%MOUNT%${BS}.hidden_dotfile').Attributes -band 'Hidden') { exit 1 } else { exit 0 }\"")
 	set_tests_properties(mount_dotfiles.hidden mount_dotfiles.shown PROPERTIES RESOURCE_LOCK winfsp_mount)
 endif()
+
+# the service's control pipe through `winapfs ctl` (service debug on image copies)
+if(TARGET winapfs)
+	add_test(NAME service.control
+		COMMAND powershell -NoProfile -ExecutionPolicy Bypass -File ${CMAKE_CURRENT_SOURCE_DIR}/ctl_test.ps1
+			-Winapfs $<TARGET_FILE:winapfs> -Fsck $<TARGET_FILE:winapfs-fsck> -Testdata ${TD} -WorkDir ${CMAKE_CURRENT_BINARY_DIR})
+	set_tests_properties(service.control PROPERTIES RESOURCE_LOCK winfsp_mount PASS_REGULAR_EXPRESSION "OK: control pipe")
+endif()

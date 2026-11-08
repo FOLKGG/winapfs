@@ -468,7 +468,45 @@ Gate still open: the user's macOS `fsck_apfs` check of images written here
 `crash-*.img`, `full-*.img` after a test run); once it passes, physical-disk
 writes may drop the `--allow-disk-writes` requirement.
 
-### W7 status: stage 1 (auto-mount service) done
+### W7 status: service, control pipe, tray app, MSI done; bundle next
+
+**Control pipe** (src/mount/Control.h documents the protocol): the service
+(`\\.\pipe\winapfs`, SDDL: SYSTEM/Administrators full, interactive users
+read/write) and `service debug` (`\\.\pipe\winapfs-debug`) answer one
+tab-separated request per connection: list (every volume seen: state
+mounted/locked/disabled/failed/unmounted, letter, mode, disk, reason),
+mount [password], unmount (stays off until the disk returns), eject
+(unmount the disk's volumes, then CM_Request_Device_EjectW on the disk or
+its parent), set ReadWrite/Disabled/HideDotfiles (stored, applied by
+remounting; ReadWrite remounts the whole container so its device can become
+writable), rescan. One listening instance always exists (the next is
+created before a client is served); clients retry briefly anyway.
+`winapfs ctl list|mount|unmount|eject|set|rescan` is the CLI client;
+`winapfs service config <name> <0|1>` sets the global switches (admin).
+Failure reasons come from Mount.cpp's per-thread LastLoggedProblem().
+Test: `service.control` (tests/ctl_test.ps1, 24 checks incl. unlocking
+encrypted.img's Secret).
+
+**winapfs-tray.exe** (src/tray, Win32, per user, single instance, built next
+to winapfs.exe): notification-area icon; menu per volume (Open, Mount /
+Unmount, Unlock... dialog for encrypted volumes, Eject disk, Read-write,
+Mount automatically, reason), Allow writing to disks (warning, then
+`winapfs service config AllowDiskWrites 1` elevated via runas), Rescan,
+Start/Install service, About (WinFsp notice). Polls `list` every 2.5 s and
+shows notifications on changes; clicking the "encrypted" one opens Unlock.
+`--pipe` / WINAPFS_PIPE for the debug service. Not yet looked at by the user.
+
+**MSI**: also installs winapfs-tray.exe (HKLM Run key, Start-menu shortcut,
+"Start winapfs" checkbox on the last page via WixShellExec, closed with
+util:CloseApplication for uninstall/upgrade). installer/test_install.ps1
+(elevated, not yet run) checks files, service, PATH, Run key, shortcut,
+mount of a VHD, a major upgrade and a clean uninstall.
+
+Bundle (setup.exe with WinFsp): the WinFsp 2.1.25156 MSI that winget
+installed is cached as C:\Windows\Installer\c059a.msi (check its signature
+before using it).
+
+### W7 stage 1 (auto-mount service)
 
 Stages: (1) service; (2) installer: WiX MSI (winapfs.exe, service, event
 source) + Burn bundle chaining the WinFsp MSI, WinFsp notice in the UI, clean

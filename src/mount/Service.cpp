@@ -11,33 +11,42 @@
 //     remove", eject: handle notifications on each disk), when it is gone,
 //     and at shutdown (pre-shutdown, so read-write volumes unmount cleanly);
 //   - read-only unless configured (and allowed) read-write; refused writes
-//     fall back to read-only.
+//     fall back to read-only;
+//   - serves the control pipe (Control.h) for `winapfs ctl` and the tray app:
+//     status of every volume seen, mount (with a password for encrypted
+//     volumes), unmount, eject, settings.
 //
 // Settings: HKLM\SOFTWARE\winapfs (tests: WINAPFS_CONFIG_HKCU=1 uses
 // HKCU\Software\winapfs-test)
-//   AllowDiskWrites  DWORD  1: read-write volumes on physical disks (W5 opt-in)
+//   AllowDiskWrites  DWORD  1: read-write volumes on physical disks (W5 opt-in;
+//                           only `winapfs service config`, i.e. administrators)
 //   ReadWrite        DWORD  default for volumes without their own setting
 //   HideDotfiles     DWORD  default 1: names starting with . are hidden (as on macOS)
 //   Volumes\<UUID>   DriveLetter (REG_SZ "X:"), ReadWrite, HideDotfiles,
 //                    Disabled (DWORD), Name (REG_SZ, informational)
-// Encrypted volumes are skipped (a per-user helper will ask for passwords).
 
 #include "Service.h"
 
 #include "ApfsFs.h"
+#include "Control.h"
 #include "Mount.h"
 #include "messages.h"
 
 #include <Windows.h>
+#include <cfgmgr32.h>
 #include <dbt.h>
 #include <initguid.h>
+#include <sddl.h>
+#include <setupapi.h>
 #include <winioctl.h>
 
 #include <cstdio>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace winapfs;
@@ -84,15 +93,31 @@ struct Config
 		return L"";
 	}
 
-	void SetString(const std::wstring &sub, const wchar_t *name, const std::wstring &value) const
+	bool Set(const std::wstring &sub, const wchar_t *name, DWORD type, const void *data, DWORD size) const
 	{
 		HKEY k;
 		if (RegCreateKeyExW(root, Key(sub).c_str(), 0, nullptr, 0, KEY_SET_VALUE, nullptr, &k, nullptr) != ERROR_SUCCESS)
-			return;
-		RegSetValueExW(k, name, 0, REG_SZ, reinterpret_cast<const BYTE *>(value.c_str()), static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t)));
+			return false;
+		bool ok = RegSetValueExW(k, name, 0, type, static_cast<const BYTE *>(data), size) == ERROR_SUCCESS;
 		RegCloseKey(k);
+		return ok;
+	}
+
+	bool SetString(const std::wstring &sub, const wchar_t *name, const std::wstring &value) const
+	{
+		return Set(sub, name, REG_SZ, value.c_str(), static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t)));
+	}
+
+	bool SetDword(const std::wstring &sub, const wchar_t *name, DWORD value) const
+	{
+		return Set(sub, name, REG_DWORD, &value, sizeof(value));
 	}
 };
+
+std::wstring VolKey(const std::string &uuid)
+{
+	return L"Volumes\\" + Utf8ToWide(uuid);
+}
 
 // ---------------------------------------------------------------- logging
 
@@ -132,6 +157,70 @@ wchar_t PickLetter(const std::wstring &remembered)
 	return 0;
 }
 
+// ---------------------------------------------------------------- device eject
+
+// Asks Windows to eject the device behind \\.\PhysicalDriveN (what "Safely
+// Remove Hardware" does). Our handles must be closed first.
+bool EjectDisk(const std::string &drive, std::string &err)
+{
+	const char *prefix = "\\\\.\\PhysicalDrive";
+	if (_strnicmp(drive.c_str(), prefix, strlen(prefix)) != 0)
+	{
+		err = "only physical disks can be ejected";
+		return false;
+	}
+	DWORD number = strtoul(drive.c_str() + strlen(prefix), nullptr, 10);
+	HDEVINFO set = SetupDiGetClassDevsW(&GUID_DEVINTERFACE_DISK, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+	if (set == INVALID_HANDLE_VALUE)
+	{
+		err = "cannot list disks";
+		return false;
+	}
+	DEVINST inst = 0;
+	SP_DEVICE_INTERFACE_DATA ifd = { sizeof(ifd) };
+	for (DWORD i = 0; !inst && SetupDiEnumDeviceInterfaces(set, nullptr, &GUID_DEVINTERFACE_DISK, i, &ifd); i++)
+	{
+		alignas(8) BYTE buf[1024];
+		auto *detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W *>(buf);
+		detail->cbSize = sizeof(*detail);
+		SP_DEVINFO_DATA dev = { sizeof(dev) };
+		if (!SetupDiGetDeviceInterfaceDetailW(set, &ifd, detail, sizeof(buf), nullptr, &dev))
+			continue;
+		HANDLE h = CreateFileW(detail->DevicePath, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+		if (h == INVALID_HANDLE_VALUE)
+			continue;
+		STORAGE_DEVICE_NUMBER sdn = {};
+		DWORD got = 0;
+		if (DeviceIoControl(h, IOCTL_STORAGE_GET_DEVICE_NUMBER, nullptr, 0, &sdn, sizeof(sdn), &got, nullptr) && sdn.DeviceNumber == number)
+			inst = dev.DevInst;
+		CloseHandle(h);
+	}
+	SetupDiDestroyDeviceInfoList(set);
+	if (!inst)
+	{
+		err = "the disk is gone";
+		return false;
+	}
+	// the disk itself, else its parent (a USB storage device, a card reader slot)
+	for (int level = 0; level < 2 && inst; level++)
+	{
+		PNP_VETO_TYPE veto = PNP_VetoTypeUnknown;
+		wchar_t name[MAX_PATH] = {};
+		CONFIGRET cr = CM_Request_Device_EjectW(inst, &veto, name, MAX_PATH, 0);
+		if (cr == CR_SUCCESS && veto == PNP_VetoTypeUnknown)
+			return true;
+		if (veto != PNP_VetoTypeUnknown)
+			err = "Windows refused to eject it (veto " + std::to_string(static_cast<int>(veto)) + (name[0] ? ", " + WideToUtf8(name) : std::string()) + ")";
+		else
+			err = "eject failed (CONFIGRET " + std::to_string(cr) + ")";
+		DEVINST parent = 0;
+		if (CM_Get_Parent(&parent, inst, 0) != CR_SUCCESS)
+			break;
+		inst = parent;
+	}
+	return false;
+}
+
 // ---------------------------------------------------------------- auto-mounter
 
 class AutoMounter
@@ -152,7 +241,7 @@ public:
 				if (!d.access_denied && !d.apfs.empty())
 					sources.push_back(d.path);
 
-		// disks that disappeared
+		// disks that disappeared (an ejected disk may come back, and is new then)
 		for (size_t i = 0; i < m_disks.size();)
 		{
 			bool present = false;
@@ -166,8 +255,16 @@ public:
 				Drop(i);
 			}
 		}
+		for (auto it = m_ejected.begin(); it != m_ejected.end();)
+		{
+			bool present = false;
+			for (const auto &s : sources)
+				present = present || s == *it;
+			it = present ? std::next(it) : m_ejected.erase(it);
+		}
 		for (const auto &src : sources)
-			ScanDisk(src);
+			if (!m_ejected.count(src))
+				ScanDisk(src);
 	}
 
 	// A disk Windows wants to remove: release everything on it (query-remove).
@@ -202,11 +299,169 @@ public:
 		return out;
 	}
 
+	// ---- control requests (Control.h); each returns "" or an error
+
+	std::vector<std::string> List()
+	{
+		std::lock_guard<std::mutex> lock(m_mutex);
+		std::vector<std::string> out;
+		for (const auto &d : m_disks)
+			for (const auto &kv : d->vols)
+			{
+				const VolStatus &s = kv.second;
+				std::string letter = "-", mode = "-";
+				for (const auto &m : d->mounts)
+					if (m.uuid == kv.first)
+					{
+						letter = WideToUtf8(m.fs->MountPoint());
+						mode = m.fs->Vol().Writable() ? "rw" : "ro";
+					}
+				out.push_back("vol\t" + kv.first + "\t" + Clean(s.name) + "\t" + s.state + "\t" + letter + "\t" + mode + "\t" + d->path + "\t" + Clean(s.note));
+			}
+		out.push_back("cfg\tAllowDiskWrites\t" + std::to_string(m_cfg.Dword(L"", L"AllowDiskWrites", 0)));
+		return out;
+	}
+
+	std::string Mount(const std::string &uuid, const std::string &password)
+	{
+		bool siblings = false;
+		std::string r = MountLocked(uuid, password, siblings);
+		if (siblings)
+			Scan();   // remount the volumes stopped to make the device writable
+		return r;
+	}
+
+	std::string MountLocked(const std::string &uuid, const std::string &password, bool &siblings)
+	{
+		std::lock_guard<std::mutex> lock(m_mutex);
+		Disk *d = nullptr;
+		VolStatus *s = Find(uuid, &d);
+		if (!s)
+			return "no such volume";
+		if (IsMounted(*d, uuid))
+			return "";
+		// a read-write volume can't share a device its read-only siblings opened read-only
+		if (WantsReadWrite(uuid))
+			for (const auto &kv : d->vols)
+				if (kv.first != uuid && kv.second.part == s->part && IsMounted(*d, kv.first))
+					siblings = true;
+		if (siblings)
+			StopPartition(*d, s->part);
+		std::string err;
+		std::unique_ptr<Container> c = Container::Open(d->path, err, s->part);
+		if (!c)
+			return err;
+		for (const auto &vi : c->Volumes())
+			if (vi.uuid == uuid)
+			{
+				if (vi.encrypted && password.empty())
+					return "the volume is encrypted: a password (or recovery key) is needed";
+				if (!TryMount(*d, *c, vi, password, true))
+					return s->note.empty() ? "cannot mount it" : s->note;
+				d->containers.push_back(std::move(c));
+				if (d->notify == nullptr && m_status && d->path.compare(0, 4, "\\\\.\\") == 0)
+					WatchRemoval(*d);
+				return "";
+			}
+		return "the volume is gone";
+	}
+
+	std::string Unmount(const std::string &uuid)
+	{
+		std::lock_guard<std::mutex> lock(m_mutex);
+		Disk *d = nullptr;
+		VolStatus *s = Find(uuid, &d);
+		if (!s)
+			return "no such volume";
+		Stop(*d, uuid);
+		s->state = "unmounted";
+		s->note = "unmounted; mount it again from the menu, or reconnect the disk";
+		return "";
+	}
+
+	std::string Eject(const std::string &uuid)
+	{
+		std::lock_guard<std::mutex> lock(m_mutex);
+		Disk *d = nullptr;
+		if (!Find(uuid, &d))
+			return "no such volume";
+		std::string path = d->path;
+		for (size_t i = 0; i < m_disks.size(); i++)
+			if (m_disks[i].get() == d)
+			{
+				Drop(i);   // unmounts everything on the disk and closes our handles
+				break;
+			}
+		m_ejected.insert(path);   // no remounting while it is still there
+		if (path.compare(0, 4, "\\\\.\\") != 0)
+			return "";             // an image (debug mode): unmounting is all
+		std::string err;
+		if (!EjectDisk(path, err))
+			return "unmounted, but " + err;
+		Log(2, "%s ejected", path.c_str());
+		return "";
+	}
+
+	std::string Set(const std::string &uuid, const std::string &key, const std::string &value)
+	{
+		std::wstring wkey = Utf8ToWide(key);
+		if (key != "ReadWrite" && key != "Disabled" && key != "HideDotfiles")
+			return "unknown setting " + key;
+		if (value != "0" && value != "1")
+			return "the value must be 0 or 1";
+		bool remount = false;
+		{
+			std::lock_guard<std::mutex> lock(m_mutex);
+			Disk *d = nullptr;
+			VolStatus *s = Find(uuid, &d);
+			if (!s)
+				return "no such volume";
+			if (!m_cfg.SetDword(VolKey(uuid), wkey.c_str(), value == "1"))
+				return "cannot store the setting";
+			bool mounted = IsMounted(*d, uuid);
+			if (key == "Disabled" && value == "1")
+			{
+				Stop(*d, uuid);
+				s->state = "disabled";
+				s->note = "not mounted automatically";
+			}
+			else if (key == "Disabled")
+			{
+				s->tried = false;   // mount it at the next scan
+				remount = !mounted;
+			}
+			else if (key == "ReadWrite")
+			{
+				// the container's device may have to become writable: remount
+				// every volume of the partition (rw ones first, see ScanDisk)
+				StopPartition(*d, s->part);
+				remount = true;
+			}
+			else if (mounted)
+			{
+				Stop(*d, uuid);     // applies HideDotfiles
+				s->tried = false;
+				remount = true;
+			}
+		}
+		if (remount)
+			Scan();
+		return "";
+	}
+
 private:
 	struct Mounted
 	{
 		std::string uuid, name;
 		std::unique_ptr<ApfsFs> fs;
+	};
+	struct VolStatus
+	{
+		std::string name;
+		int part = -1;
+		std::string state = "failed";
+		std::string note;
+		bool tried = false;   // automatic mounting was attempted (not retried)
 	};
 	struct Disk
 	{
@@ -214,10 +469,66 @@ private:
 		DiskLocks locks;   // released after the mounts and containers below
 		std::vector<std::unique_ptr<Container>> containers;
 		std::vector<Mounted> mounts;
-		std::set<std::string> skipped;   // volumes not mounted (said once, not retried)
+		std::map<std::string, VolStatus> vols;   // every volume seen, by UUID
 		HANDLE notify_handle = INVALID_HANDLE_VALUE;
 		HDEVNOTIFY notify = nullptr;
 	};
+
+	static std::string Clean(std::string s)
+	{
+		for (auto &c : s)
+			if (c == '\t' || c == '\n' || c == '\r')
+				c = ' ';
+		return s;
+	}
+
+	VolStatus *Find(const std::string &uuid, Disk **disk)
+	{
+		for (auto &d : m_disks)
+		{
+			auto it = d->vols.find(uuid);
+			if (it != d->vols.end())
+			{
+				*disk = d.get();
+				return &it->second;
+			}
+		}
+		return nullptr;
+	}
+
+	static bool IsMounted(const Disk &d, const std::string &uuid)
+	{
+		for (const auto &m : d.mounts)
+			if (m.uuid == uuid)
+				return true;
+		return false;
+	}
+
+	void Stop(Disk &d, const std::string &uuid)
+	{
+		for (size_t i = 0; i < d.mounts.size(); i++)
+			if (d.mounts[i].uuid == uuid)
+			{
+				std::wstring mp = d.mounts[i].fs->MountPoint();
+				d.mounts[i].fs->Stop();
+				Log(2, "unmounted %s (%ls)", d.mounts[i].name.c_str(), mp.c_str());
+				d.mounts.erase(d.mounts.begin() + static_cast<ptrdiff_t>(i));
+				return;
+			}
+	}
+
+	// Unmounts every volume of one container (they share its device), to be
+	// mounted again by the next scan.
+	void StopPartition(Disk &d, int part)
+	{
+		for (auto &kv : d.vols)
+			if (kv.second.part == part)
+			{
+				Stop(d, kv.first);
+				if (kv.second.state == "mounted")
+					kv.second.tried = false;
+			}
+	}
 
 	void Drop(size_t i)
 	{
@@ -244,8 +555,7 @@ private:
 		for (auto &d : m_disks)
 			if (d->path == src)
 				disk = d.get();
-		bool is_new = !disk;
-		if (is_new)
+		if (!disk)
 		{
 			m_disks.emplace_back(new Disk());
 			disk = m_disks.back().get();
@@ -275,19 +585,22 @@ private:
 			// (not the other way round)
 			std::vector<const VolumeInfo *> order;
 			for (const auto &vi : c->Volumes())
-				if (WantsReadWrite(vi))
+				if (WantsReadWrite(vi.uuid))
 					order.push_back(&vi);
 			for (const auto &vi : c->Volumes())
-				if (!WantsReadWrite(vi))
+				if (!WantsReadWrite(vi.uuid))
 					order.push_back(&vi);
 			bool used = false;
 			for (const VolumeInfo *vi : order)
 			{
 				seen.insert(vi->uuid);
-				bool mounted = false;
-				for (const auto &m : disk->mounts)
-					mounted = mounted || m.uuid == vi->uuid;
-				if (!mounted && MountVolume(*disk, *c, *vi))
+				VolStatus &s = disk->vols[vi->uuid];
+				s.name = vi->name;
+				s.part = part;
+				if (IsMounted(*disk, vi->uuid) || s.tried)
+					continue;
+				s.tried = true;
+				if (TryMount(*disk, *c, *vi, "", false))
 					used = true;
 			}
 			if (used)
@@ -295,59 +608,64 @@ private:
 		}
 
 		// volumes that left the disk (another disk took its number)
-		for (size_t i = 0; i < disk->mounts.size();)
+		for (auto it = disk->vols.begin(); it != disk->vols.end();)
 		{
-			if (seen.count(disk->mounts[i].uuid))
+			if (seen.count(it->first))
 			{
-				i++;
+				++it;
 				continue;
 			}
-			disk->mounts[i].fs->Stop();
-			Log(2, "unmounted %s (gone from %s)", disk->mounts[i].name.c_str(), src.c_str());
-			disk->mounts.erase(disk->mounts.begin() + static_cast<ptrdiff_t>(i));
+			Stop(*disk, it->first);
+			Log(2, "%s left %s", it->second.name.c_str(), src.c_str());
+			it = disk->vols.erase(it);
 		}
 
 		if (!disk->mounts.empty() && disk->notify == nullptr && m_status && src.compare(0, 4, "\\\\.\\") == 0)
 			WatchRemoval(*disk);
 	}
 
-	bool WantsReadWrite(const VolumeInfo &vi) const
+	bool WantsReadWrite(const std::string &uuid) const
 	{
-		std::wstring sub = L"Volumes\\" + Utf8ToWide(vi.uuid);
-		return m_cfg.Dword(sub, L"ReadWrite", m_cfg.Dword(L"", L"ReadWrite", 0)) != 0;
+		return m_cfg.Dword(VolKey(uuid), L"ReadWrite", m_cfg.Dword(L"", L"ReadWrite", 0)) != 0;
 	}
 
-	bool MountVolume(Disk &disk, Container &c, const VolumeInfo &vi)
+	// Mounts one volume; records the outcome in its VolStatus. explicit_request:
+	// asked for through the control pipe (mounts disabled volumes too).
+	bool TryMount(Disk &disk, Container &c, const VolumeInfo &vi, const std::string &password, bool explicit_request)
 	{
-		if (disk.skipped.count(vi.uuid))
-			return false;
-		bool ok = TryMount(disk, c, vi);
-		if (!ok)
-			disk.skipped.insert(vi.uuid);
-		return ok;
-	}
-
-	bool TryMount(Disk &disk, Container &c, const VolumeInfo &vi)
-	{
-		std::wstring sub = L"Volumes\\" + Utf8ToWide(vi.uuid);
-		if (m_cfg.Dword(sub, L"Disabled", 0))
-			return false;
-		if (vi.encrypted)
+		VolStatus &s = disk.vols[vi.uuid];
+		s.name = vi.name;
+		std::wstring sub = VolKey(vi.uuid);
+		if (!explicit_request && m_cfg.Dword(sub, L"Disabled", 0))
 		{
-			Log(2, "%s: encrypted, not mounted automatically (mount it with winapfs mount --ask)", vi.name.c_str());
+			s.state = "disabled";
+			s.note = "not mounted automatically";
 			return false;
 		}
-		bool rw = WantsReadWrite(vi);
+		if (vi.encrypted && password.empty())
+		{
+			s.state = "locked";
+			s.note = "encrypted: unlock it with its password";
+			Log(2, "%s: encrypted, waiting for a password", vi.name.c_str());
+			return false;
+		}
+		ClearLoggedProblem();
+		bool rw = WantsReadWrite(vi.uuid);
 		OpenOptions o;
 		o.allow_disk_writes = m_cfg.Dword(L"", L"AllowDiskWrites", 0) != 0;
 		o.locks = &disk.locks;
+		o.password = password;
 		std::unique_ptr<Volume> vol;
-		if (rw)
+		std::string rw_problem;
+		if (rw && !vi.encrypted)
 		{
 			o.rw = true;
 			vol = OpenVolume(c, vi, o);
 			if (!vol)
+			{
+				rw_problem = LastLoggedProblem();
 				Log(1, "%s: mounting read-only instead", vi.name.c_str());
+			}
 		}
 		if (!vol)
 		{
@@ -355,11 +673,17 @@ private:
 			vol = OpenVolume(c, vi, o);
 		}
 		if (!vol)
+		{
+			s.state = vi.encrypted ? "locked" : "failed";
+			s.note = LastLoggedProblem();
 			return false;
+		}
 
 		wchar_t letter = PickLetter(m_cfg.String(sub, L"DriveLetter"));
 		if (!letter)
 		{
+			s.state = "failed";
+			s.note = "no free drive letter";
 			Log(0, "%s: no free drive letter", vi.name.c_str());
 			return false;
 		}
@@ -370,13 +694,19 @@ private:
 		NTSTATUS r = fs->Start(mp);
 		if (!NT_SUCCESS(r))
 		{
-			Log(0, "%s: cannot mount at %lc: (NTSTATUS 0x%08lx)", vi.name.c_str(), letter, static_cast<unsigned long>(r));
+			char buf[64];
+			snprintf(buf, sizeof(buf), "cannot mount at %lc: (NTSTATUS 0x%08lx)", letter, static_cast<unsigned long>(r));
+			s.state = "failed";
+			s.note = buf;
+			Log(0, "%s: %s", vi.name.c_str(), buf);
 			return false;
 		}
 		m_cfg.SetString(sub, L"DriveLetter", mp);
 		m_cfg.SetString(sub, L"Name", Utf8ToWide(vi.name));
-		Log(2, "mounted %s at %ls (%s) from %s", vi.name.c_str(), fs->MountPoint().c_str(),
-			fs->Vol().Writable() ? "read-write" : "read-only", disk.path.c_str());
+		bool writable = fs->Vol().Writable();
+		Log(2, "mounted %s at %ls (%s) from %s", vi.name.c_str(), fs->MountPoint().c_str(), writable ? "read-write" : "read-only", disk.path.c_str());
+		s.state = "mounted";
+		s.note = rw && !writable ? "read-only: " + rw_problem : "";
 		disk.mounts.push_back(Mounted{ vi.uuid, vi.name, std::move(fs) });
 		return true;
 	}
@@ -406,7 +736,147 @@ private:
 	SERVICE_STATUS_HANDLE m_status;
 	std::mutex m_mutex;
 	std::vector<std::unique_ptr<Disk>> m_disks;
+	std::set<std::string> m_ejected;   // disks ejected through the control pipe, until they go
 };
+
+// ---------------------------------------------------------------- control pipe
+
+class ControlServer
+{
+public:
+	// sddl: who may connect (null: the default, i.e. the owner)
+	ControlServer(AutoMounter &m, const wchar_t *pipe, const wchar_t *sddl) : m_mounter(m), m_pipe(pipe)
+	{
+		m_stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+		if (sddl)
+			ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &m_sd, nullptr);
+		m_thread = std::thread([this] { Run(); });
+	}
+
+	~ControlServer()
+	{
+		SetEvent(m_stop);
+		if (m_thread.joinable())
+			m_thread.join();
+		CloseHandle(m_stop);
+		if (m_sd)
+			LocalFree(m_sd);
+	}
+
+private:
+	HANDLE NewInstance()
+	{
+		SECURITY_ATTRIBUTES sa = { sizeof(sa), m_sd, FALSE };
+		HANDLE h = CreateNamedPipeW(m_pipe.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+			PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, PIPE_UNLIMITED_INSTANCES,
+			65536, 4096, 0, m_sd ? &sa : nullptr);
+		if (h == INVALID_HANDLE_VALUE)
+			Log(0, "cannot create the control pipe (error %lu)", GetLastError());
+		return h;
+	}
+
+	// One instance always listens: the next is created before a client is
+	// served, so the pipe name never disappears between requests.
+	void Run()
+	{
+		HANDLE h = NewInstance();
+		while (h != INVALID_HANDLE_VALUE && WaitForSingleObject(m_stop, 0) == WAIT_TIMEOUT)
+		{
+			OVERLAPPED ov = {};
+			ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+			bool connected = ConnectNamedPipe(h, &ov) != 0 || GetLastError() == ERROR_PIPE_CONNECTED;
+			if (!connected && GetLastError() == ERROR_IO_PENDING)
+			{
+				HANDLE waits[] = { m_stop, ov.hEvent };
+				if (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0 + 1)
+				{
+					DWORD got;
+					connected = GetOverlappedResult(h, &ov, &got, FALSE) != 0;
+				}
+				else
+					CancelIo(h);
+			}
+			CloseHandle(ov.hEvent);
+			HANDLE next = connected ? NewInstance() : INVALID_HANDLE_VALUE;
+			if (connected)
+				Serve(h);
+			DisconnectNamedPipe(h);
+			CloseHandle(h);
+			h = next;
+		}
+		if (h != INVALID_HANDLE_VALUE)
+			CloseHandle(h);
+	}
+
+	void Serve(HANDLE h)
+	{
+		std::string req;
+		char buf[4096];
+		OVERLAPPED ov = {};
+		ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+		for (;;)
+		{
+			DWORD got = 0;
+			BOOL ok = ReadFile(h, buf, sizeof(buf), nullptr, &ov);
+			DWORD e = ok ? 0 : GetLastError();
+			if (ok || e == ERROR_IO_PENDING || e == ERROR_MORE_DATA)
+			{
+				ok = GetOverlappedResult(h, &ov, &got, TRUE);
+				e = ok ? 0 : GetLastError();
+			}
+			req.append(buf, got);
+			if (ok)
+				break;
+			if (e != ERROR_MORE_DATA)   // the rest of a longer message follows
+			{
+				CloseHandle(ov.hEvent);
+				return;
+			}
+		}
+		while (!req.empty() && (req.back() == '\n' || req.back() == '\r'))
+			req.pop_back();
+		std::string resp = Handle(req);
+		DWORD done = 0;
+		if (!WriteFile(h, resp.data(), static_cast<DWORD>(resp.size()), nullptr, &ov) && GetLastError() == ERROR_IO_PENDING)
+			GetOverlappedResult(h, &ov, &done, TRUE);
+		FlushFileBuffers(h);
+		CloseHandle(ov.hEvent);
+	}
+
+	std::string Handle(const std::string &req)
+	{
+		std::vector<std::string> f = SplitTabs(req);
+		const std::string &cmd = f[0];
+		std::string err, out;
+		if (cmd == "list")
+		{
+			for (const auto &l : m_mounter.List())
+				out += l + "\n";
+		}
+		else if (cmd == "mount" && f.size() >= 2)
+			err = m_mounter.Mount(f[1], f.size() >= 3 ? f[2] : "");
+		else if (cmd == "unmount" && f.size() >= 2)
+			err = m_mounter.Unmount(f[1]);
+		else if (cmd == "eject" && f.size() >= 2)
+			err = m_mounter.Eject(f[1]);
+		else if (cmd == "set" && f.size() >= 4)
+			err = m_mounter.Set(f[1], f[2], f[3]);
+		else if (cmd == "rescan")
+			m_mounter.Scan();
+		else
+			err = "unknown request";
+		return out + (err.empty() ? "OK" : "ERR " + err);
+	}
+
+	AutoMounter &m_mounter;
+	std::wstring m_pipe;
+	PSECURITY_DESCRIPTOR m_sd = nullptr;
+	HANDLE m_stop = nullptr;
+	std::thread m_thread;
+};
+
+// interactive users may use the pipe; SYSTEM and administrators fully
+const wchar_t *kPipeSddl = L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";
 
 // ---------------------------------------------------------------- the service
 
@@ -491,23 +961,26 @@ void WINAPI ServiceMain(DWORD, LPWSTR *)
 	{
 		AutoMounter m(cfg, {}, g_status);
 		g_mounter = &m;
-		ReportStatus(SERVICE_RUNNING);
-		Log(2, "started");
-		m.Scan();
-		HANDLE waits[] = { g_stop, g_rescan };
-		for (;;)
 		{
-			DWORD w = WaitForMultipleObjects(2, waits, FALSE, 60000);   // and a rescan every minute
-			if (w == WAIT_OBJECT_0)
-				break;
-			if (w == WAIT_OBJECT_0 + 1)
-			{
-				// a new disk takes a moment to show its partitions
-				Sleep(1500);
-				m.Scan();
-				Sleep(3000);
-			}
+			ControlServer control(m, kServicePipe, kPipeSddl);
+			ReportStatus(SERVICE_RUNNING);
+			Log(2, "started");
 			m.Scan();
+			HANDLE waits[] = { g_stop, g_rescan };
+			for (;;)
+			{
+				DWORD w = WaitForMultipleObjects(2, waits, FALSE, 60000);   // and a rescan every minute
+				if (w == WAIT_OBJECT_0)
+					break;
+				if (w == WAIT_OBJECT_0 + 1)
+				{
+					// a new disk takes a moment to show its partitions
+					Sleep(1500);
+					m.Scan();
+					Sleep(3000);
+				}
+				m.Scan();
+			}
 		}
 		g_mounter = nullptr;
 		m.UnmountAll();
@@ -556,11 +1029,13 @@ int Debug(const std::vector<std::wstring> &args)
 	}
 	Config cfg;
 	AutoMounter m(cfg, images, nullptr);
+	ControlServer control(m, kDebugPipe, nullptr);
 	m.Scan();
 	if (!run.empty())
 	{
 		for (const auto &mp : m.Mounts())
 			SetEnvironmentVariableW(Utf8ToWide(MountEnvName(mp.first)).c_str(), mp.second.c_str());
+		SetEnvironmentVariableW(L"WINAPFS_PIPE", kDebugPipe);
 		STARTUPINFOW si = { sizeof(si) };
 		PROCESS_INFORMATION pi = {};
 		if (!CreateProcessW(nullptr, &run[0], nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi))
@@ -577,7 +1052,7 @@ int Debug(const std::vector<std::wstring> &args)
 	}
 	g_debug_stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 	SetConsoleCtrlHandler(DebugCtrl, TRUE);
-	fprintf(stderr, "auto-mounting (rescan every 3 s); press Ctrl+C to stop\n");
+	fprintf(stderr, "auto-mounting (rescan every 3 s, control pipe %ls); press Ctrl+C to stop\n", kDebugPipe);
 	ULONGLONG end = seconds ? GetTickCount64() + seconds * 1000ull : 0;
 	while (WaitForSingleObject(g_debug_stop, 3000) == WAIT_TIMEOUT && (!end || GetTickCount64() < end))
 		m.Scan();
@@ -732,19 +1207,55 @@ int Status()
 	return svc ? 0 : 1;
 }
 
+// `service config [<name> <0|1>]`: the global switches (administrators)
+int ConfigCmd(const std::vector<std::wstring> &args)
+{
+	Config cfg;
+	const wchar_t *names[] = { L"AllowDiskWrites", L"ReadWrite", L"HideDotfiles" };
+	if (args.empty())
+	{
+		for (const wchar_t *n : names)
+			printf("%ls = %lu\n", n, cfg.Dword(L"", n, wcscmp(n, L"HideDotfiles") == 0 ? 1 : 0));
+		return 0;
+	}
+	if (args.size() != 2 || (args[1] != L"0" && args[1] != L"1"))
+	{
+		fprintf(stderr, "usage: winapfs service config [AllowDiskWrites|ReadWrite|HideDotfiles 0|1]\n");
+		return 2;
+	}
+	bool known = false;
+	for (const wchar_t *n : names)
+		known = known || args[0] == n;
+	if (!known)
+	{
+		fprintf(stderr, "unknown setting %ls\n", args[0].c_str());
+		return 2;
+	}
+	if (!cfg.SetDword(L"", args[0].c_str(), args[1] == L"1"))
+		return Fail("storing the setting");
+	printf("%ls = %ls\n", args[0].c_str(), args[1].c_str());
+	// let a running service apply it
+	std::vector<std::string> lines;
+	std::string err;
+	ControlRequest(DefaultControlPipe(), "rescan", lines, err);
+	return 0;
+}
+
 void ServiceUsage()
 {
 	fprintf(stderr,
 		"usage: winapfs service install     install and start the auto-mount service (administrator)\n"
 		"       winapfs service uninstall   stop and remove it\n"
 		"       winapfs service start|stop|status\n"
+		"       winapfs service config [<name> <0|1>]   global settings (administrator)\n"
 		"       winapfs service debug [--image <img>]... [--run <cmd>] [--seconds <n>]\n"
 		"                                   the same in this console (images instead of disks)\n"
 		"\n"
 		"The service mounts every APFS volume read-only at a drive letter it remembers\n"
 		"per volume. Settings (HKLM\\SOFTWARE\\winapfs): AllowDiskWrites and ReadWrite\n"
 		"(DWORD, both 1 for read-write disks), HideDotfiles (default 1); per volume under\n"
-		"Volumes\\<UUID>: DriveLetter (\"X:\"), ReadWrite, HideDotfiles, Disabled.\n");
+		"Volumes\\<UUID>: DriveLetter (\"X:\"), ReadWrite, HideDotfiles, Disabled.\n"
+		"winapfs ctl and the tray app (winapfs-tray) control it.\n");
 }
 
 } // namespace
@@ -752,6 +1263,7 @@ void ServiceUsage()
 int CmdService(const std::vector<std::wstring> &args)
 {
 	std::wstring sub = args.empty() ? L"" : args[0];
+	std::vector<std::wstring> rest(args.begin() + (args.empty() ? 0 : 1), args.end());
 	if (sub == L"run")
 	{
 		SERVICE_TABLE_ENTRYW table[] = { { const_cast<LPWSTR>(kServiceName), ServiceMain }, { nullptr, nullptr } };
@@ -763,7 +1275,7 @@ int CmdService(const std::vector<std::wstring> &args)
 		return 0;
 	}
 	if (sub == L"debug")
-		return Debug(std::vector<std::wstring>(args.begin() + 1, args.end()));
+		return Debug(rest);
 	if (sub == L"install")
 		return Install();
 	if (sub == L"uninstall")
@@ -772,6 +1284,95 @@ int CmdService(const std::vector<std::wstring> &args)
 		return Control(sub == L"start");
 	if (sub == L"status")
 		return Status();
+	if (sub == L"config")
+		return ConfigCmd(rest);
 	ServiceUsage();
 	return 2;
+}
+
+// ---------------------------------------------------------------- winapfs ctl
+
+int CmdCtl(const std::vector<std::wstring> &args)
+{
+	std::wstring pipe = DefaultControlPipe();
+	auto usage = [] {
+		fprintf(stderr,
+			"usage: winapfs ctl list\n"
+			"       winapfs ctl mount <volume> [--password <pw>]\n"
+			"       winapfs ctl unmount <volume>\n"
+			"       winapfs ctl eject <volume>        unmount the disk's volumes and eject it\n"
+			"       winapfs ctl set <volume> <ReadWrite|Disabled|HideDotfiles> <0|1>\n"
+			"       winapfs ctl rescan\n"
+			"<volume>: a name or UUID from `winapfs ctl list`. Talks to the service\n"
+			"(WINAPFS_PIPE selects another pipe, e.g. service debug's).\n");
+		return 2;
+	};
+	if (args.empty())
+		return usage();
+	std::string cmd = WideToUtf8(args[0]);
+	std::string err;
+	if (cmd == "list")
+	{
+		std::vector<VolumeStatus> vols;
+		bool adw = false;
+		if (!ControlList(pipe, vols, adw, err))
+		{
+			fprintf(stderr, "%s\n", err.c_str());
+			return 1;
+		}
+		for (const auto &v : vols)
+			printf("%-24s %-3s %-9s %-2s  %s  %s%s%s\n", v.name.c_str(), v.letter.c_str(), v.state.c_str(), v.mode.c_str(), v.uuid.c_str(),
+				v.disk.c_str(), v.note.empty() ? "" : "  # ", v.note.c_str());
+		printf("disk writes %s\n", adw ? "allowed (AllowDiskWrites=1)" : "not allowed (winapfs service config AllowDiskWrites 1)");
+		return 0;
+	}
+	if (cmd == "rescan")
+	{
+		std::vector<std::string> lines;
+		int rc = ControlRequest(pipe, "rescan", lines, err);
+		if (rc)
+			fprintf(stderr, "%s\n", err.c_str());
+		return rc ? 1 : 0;
+	}
+	if (args.size() < 2)
+		return usage();
+	// a name or UUID
+	std::vector<VolumeStatus> vols;
+	bool adw = false;
+	if (!ControlList(pipe, vols, adw, err))
+	{
+		fprintf(stderr, "%s\n", err.c_str());
+		return 1;
+	}
+	std::string want = WideToUtf8(args[1]), uuid;
+	for (const auto &v : vols)
+		if (v.uuid == want || v.name == want)
+			uuid = v.uuid;
+	if (uuid.empty())
+	{
+		fprintf(stderr, "no volume '%s' (see winapfs ctl list)\n", want.c_str());
+		return 1;
+	}
+	std::string req;
+	if (cmd == "mount")
+	{
+		req = "mount\t" + uuid;
+		if (args.size() >= 4 && args[2] == L"--password")
+			req += "\t" + WideToUtf8(args[3]);
+	}
+	else if (cmd == "unmount" || cmd == "eject")
+		req = cmd + "\t" + uuid;
+	else if (cmd == "set" && args.size() >= 4)
+		req = "set\t" + uuid + "\t" + WideToUtf8(args[2]) + "\t" + WideToUtf8(args[3]);
+	else
+		return usage();
+	std::vector<std::string> lines;
+	int rc = ControlRequest(pipe, req, lines, err);
+	if (rc)
+	{
+		fprintf(stderr, "%s\n", err.c_str());
+		return 1;
+	}
+	printf("ok\n");
+	return 0;
 }

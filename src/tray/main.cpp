@@ -1,0 +1,575 @@
+// winapfs - APFS for Windows
+// Copyright (C) 2026 winapfs contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+//
+// winapfs-tray: a notification-area app for each signed-in user. It shows the
+// APFS volumes the service sees and acts on them through the service's control
+// pipe (Control.h), so it never needs administrator rights itself:
+//   - per volume: Open, Mount / Unmount, Unlock... (encrypted, asks for the
+//     password), Eject disk (safely remove), Read-write, Mount automatically
+//   - Allow writing to disks (experimental; runs `winapfs service config`
+//     elevated), Rescan, Start/install the service, About (WinFsp notice)
+//   - notifications when volumes are mounted or unmounted, and when an
+//     encrypted volume waits for its password (click to unlock)
+//
+//   winapfs-tray [--pipe <name>]   (default: the service; WINAPFS_PIPE too)
+
+#include "Control.h"
+#include "resource.h"
+
+#include <Windows.h>
+#include <commctrl.h>
+#include <shellapi.h>
+#include <shlobj.h>
+
+#include <map>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+using namespace winapfs;
+
+namespace {
+
+constexpr UINT WM_TRAY = WM_APP + 1;
+constexpr UINT WM_ACTION_DONE = WM_APP + 2;   // lParam: new std::wstring (message) or null
+constexpr UINT_PTR TIMER_POLL = 1;
+constexpr UINT kPollMs = 2500;
+
+enum MenuId : UINT
+{
+	ID_ALLOW_WRITES = 100,
+	ID_RESCAN,
+	ID_SERVICE_START,
+	ID_SERVICE_INSTALL,
+	ID_ABOUT,
+	ID_EXIT,
+	ID_VOLUME_BASE = 1000,   // + 10 * volume index + action
+};
+
+enum VolumeAction : UINT
+{
+	VA_OPEN,
+	VA_MOUNT,
+	VA_UNMOUNT,
+	VA_UNLOCK,
+	VA_EJECT,
+	VA_READWRITE,
+	VA_AUTOMOUNT,
+};
+
+HINSTANCE g_inst;
+HWND g_wnd;
+NOTIFYICONDATAW g_nid;
+UINT g_taskbar_created;
+std::wstring g_pipe;
+
+std::mutex g_mutex;                    // the state below (the poller thread writes it)
+std::vector<VolumeStatus> g_vols;
+bool g_allow_writes = false;
+bool g_service_up = false;
+std::map<std::string, std::string> g_seen;   // uuid -> "state|letter|mode" at the last poll
+bool g_first_poll = true;
+std::string g_balloon_uuid;            // a locked volume the last notification was about
+
+std::wstring W(const std::string &s)
+{
+	if (s.empty())
+		return L"";
+	int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+	std::wstring w(n, L'\0');
+	MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), &w[0], n);
+	return w;
+}
+
+std::string U(const std::wstring &w)
+{
+	if (w.empty())
+		return "";
+	int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
+	std::string s(n, '\0');
+	WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), &s[0], n, nullptr, nullptr);
+	return s;
+}
+
+std::wstring WinapfsExe()
+{
+	wchar_t buf[MAX_PATH];
+	GetModuleFileNameW(nullptr, buf, MAX_PATH);
+	std::wstring p = buf;
+	return p.substr(0, p.rfind(L'\\') + 1) + L"winapfs.exe";
+}
+
+void Notify(const std::wstring &title, const std::wstring &text, DWORD flags = NIIF_INFO)
+{
+	NOTIFYICONDATAW n = g_nid;
+	n.uFlags = NIF_INFO;
+	wcsncpy_s(n.szInfoTitle, title.c_str(), _TRUNCATE);
+	wcsncpy_s(n.szInfo, text.c_str(), _TRUNCATE);
+	n.dwInfoFlags = flags | NIIF_RESPECT_QUIET_TIME;
+	Shell_NotifyIconW(NIM_MODIFY, &n);
+}
+
+void SetTip(const std::wstring &tip)
+{
+	g_nid.uFlags = NIF_TIP | NIF_SHOWTIP;
+	wcsncpy_s(g_nid.szTip, tip.c_str(), _TRUNCATE);
+	Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+}
+
+bool IsPhysical(const VolumeStatus &v)
+{
+	return v.disk.compare(0, 4, "\\\\.\\") == 0;
+}
+
+std::wstring StateText(const VolumeStatus &v)
+{
+	if (v.state == "mounted")
+		return v.mode == "rw" ? L"read-write" : L"read-only";
+	if (v.state == "locked")
+		return L"locked";
+	if (v.state == "unmounted")
+		return L"unmounted";
+	if (v.state == "disabled")
+		return L"not mounted automatically";
+	return L"not mounted";
+}
+
+// ---------------------------------------------------------------- polling
+
+void Poll()
+{
+	std::vector<VolumeStatus> vols;
+	bool allow = false;
+	std::string err;
+	bool up = ControlList(g_pipe, vols, allow, err);
+
+	std::vector<std::pair<std::wstring, std::wstring>> notes;   // title, text
+	std::string locked_uuid;
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		if (!g_first_poll && up)
+			for (const auto &v : vols)
+			{
+				std::string now = v.state + "|" + v.letter + "|" + v.mode;
+				auto it = g_seen.find(v.uuid);
+				std::string before = it == g_seen.end() ? "" : it->second;
+				if (before == now)
+					continue;
+				if (v.state == "mounted")
+					notes.emplace_back(W(v.name) + L" is ready", L"Mounted at " + W(v.letter) + L" (" + StateText(v) + L")");
+				else if (v.state == "locked" && before.compare(0, 6, "locked") != 0)
+				{
+					notes.emplace_back(W(v.name) + L" is encrypted", L"Click here to unlock it with its password.");
+					locked_uuid = v.uuid;
+				}
+				else if (before.compare(0, 7, "mounted") == 0)
+					notes.emplace_back(W(v.name) + L" unmounted", v.note.empty() ? L"It is no longer mounted." : W(v.note));
+			}
+		if (up && !g_first_poll)
+			for (const auto &kv : g_seen)
+			{
+				bool still = false;
+				for (const auto &v : vols)
+					still = still || v.uuid == kv.first;
+				if (!still && kv.second.compare(0, 7, "mounted") == 0)
+					notes.emplace_back(L"APFS disk removed", L"Its volumes were unmounted.");
+			}
+		g_seen.clear();
+		for (const auto &v : vols)
+			g_seen[v.uuid] = v.state + "|" + v.letter + "|" + v.mode;
+		if (!locked_uuid.empty())
+			g_balloon_uuid = locked_uuid;
+		g_first_poll = !up;
+		g_vols = vols;
+		g_allow_writes = allow;
+		g_service_up = up;
+	}
+
+	size_t mounted = 0;
+	for (const auto &v : vols)
+		mounted += v.state == "mounted";
+	if (!up)
+		SetTip(L"winapfs: the service is not running");
+	else if (vols.empty())
+		SetTip(L"winapfs: no APFS disks");
+	else
+		SetTip(L"winapfs: " + std::to_wstring(mounted) + L" of " + std::to_wstring(vols.size()) + L" APFS volumes mounted");
+	if (!notes.empty())
+		Notify(notes.back().first, notes.size() == 1 ? notes.back().second : notes.back().second + L" (and more)");
+}
+
+// Runs a request off the UI thread; failures come back as a notification.
+void Request(const std::string &req, const std::wstring &what)
+{
+	std::thread([req, what] {
+		std::vector<std::string> lines;
+		std::string err;
+		int rc = ControlRequest(g_pipe, req, lines, err);
+		std::wstring *msg = rc ? new std::wstring(what + L": " + W(err)) : nullptr;
+		PostMessageW(g_wnd, WM_ACTION_DONE, 0, reinterpret_cast<LPARAM>(msg));
+	}).detach();
+}
+
+// winapfs.exe with administrator rights (one UAC prompt); true if it ran and succeeded
+bool RunElevated(const std::wstring &args)
+{
+	std::wstring exe = WinapfsExe();
+	SHELLEXECUTEINFOW sei = { sizeof(sei) };
+	sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+	sei.hwnd = g_wnd;
+	sei.lpVerb = L"runas";
+	sei.lpFile = exe.c_str();
+	sei.lpParameters = args.c_str();
+	sei.nShow = SW_HIDE;
+	if (!ShellExecuteExW(&sei) || !sei.hProcess)
+		return false;
+	WaitForSingleObject(sei.hProcess, 120000);
+	DWORD code = 1;
+	GetExitCodeProcess(sei.hProcess, &code);
+	CloseHandle(sei.hProcess);
+	return code == 0;
+}
+
+bool ServiceInstalled()
+{
+	SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+	SC_HANDLE svc = scm ? OpenServiceW(scm, L"winapfs", SERVICE_QUERY_STATUS) : nullptr;
+	bool ok = svc != nullptr;
+	if (svc)
+		CloseServiceHandle(svc);
+	if (scm)
+		CloseServiceHandle(scm);
+	return ok;
+}
+
+// ---------------------------------------------------------------- unlock dialog
+
+struct UnlockData
+{
+	std::wstring name;
+	std::wstring password;
+};
+
+INT_PTR CALLBACK UnlockProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
+{
+	switch (msg)
+	{
+	case WM_INITDIALOG:
+	{
+		auto *d = reinterpret_cast<UnlockData *>(lp);
+		SetWindowLongPtrW(dlg, DWLP_USER, lp);
+		SetDlgItemTextW(dlg, IDC_UNLOCK_TEXT, (L"\"" + d->name + L"\" is encrypted. Enter its password or recovery key:").c_str());
+		SetDlgItemTextW(dlg, IDC_HINT, L"The password is sent to the winapfs service on this PC only.");
+		SetForegroundWindow(dlg);
+		SetFocus(GetDlgItem(dlg, IDC_PASSWORD));
+		return FALSE;
+	}
+	case WM_COMMAND:
+		if (LOWORD(wp) == IDOK || LOWORD(wp) == IDCANCEL)
+		{
+			if (LOWORD(wp) == IDOK)
+			{
+				auto *d = reinterpret_cast<UnlockData *>(GetWindowLongPtrW(dlg, DWLP_USER));
+				wchar_t buf[512];
+				GetDlgItemTextW(dlg, IDC_PASSWORD, buf, 512);
+				d->password = buf;
+				SecureZeroMemory(buf, sizeof(buf));
+			}
+			EndDialog(dlg, LOWORD(wp));
+			return TRUE;
+		}
+		break;
+	}
+	return FALSE;
+}
+
+void Unlock(const VolumeStatus &v)
+{
+	UnlockData d;
+	d.name = W(v.name);
+	if (DialogBoxParamW(g_inst, MAKEINTRESOURCEW(IDD_UNLOCK), g_wnd, UnlockProc, reinterpret_cast<LPARAM>(&d)) != IDOK || d.password.empty())
+		return;
+	std::string pw = U(d.password);
+	SecureZeroMemory(&d.password[0], d.password.size() * sizeof(wchar_t));
+	Request("mount\t" + v.uuid + "\t" + pw, L"Cannot unlock " + d.name);
+	SecureZeroMemory(&pw[0], pw.size());
+}
+
+// ---------------------------------------------------------------- menu
+
+void About()
+{
+	std::wstring text =
+		L"winapfs " WINAPFS_VERSION_W L"\nAPFS (Mac) disks on Windows\n\n"
+		L"Free software under the GNU General Public License, version 2.\n"
+		L"Includes linux-apfs-rw, apfs-fuse and apfsprogs (GPL), LZFSE, zlib, bzip2.\n\n"
+		L"Uses WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos\n"
+		L"https://github.com/winfsp/winfsp\n\n"
+		L"Writing to APFS disks is experimental: keep a backup.";
+	MessageBoxW(g_wnd, text.c_str(), L"About winapfs", MB_OK | MB_ICONINFORMATION);
+}
+
+void ShowMenu()
+{
+	Poll();
+	std::vector<VolumeStatus> vols;
+	bool allow, up;
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		vols = g_vols;
+		allow = g_allow_writes;
+		up = g_service_up;
+	}
+
+	HMENU m = CreatePopupMenu();
+	AppendMenuW(m, MF_STRING | MF_GRAYED, 0, up ? L"winapfs \x2014 APFS disks" : L"winapfs: the service is not running");
+	AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+	if (up && vols.empty())
+		AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"No APFS disks connected");
+	for (size_t i = 0; i < vols.size() && i < 90; i++)
+	{
+		const VolumeStatus &v = vols[i];
+		UINT base = ID_VOLUME_BASE + static_cast<UINT>(i) * 10;
+		HMENU sub = CreatePopupMenu();
+		bool mounted = v.state == "mounted";
+		if (mounted)
+		{
+			AppendMenuW(sub, MF_STRING, base + VA_OPEN, (L"Open " + W(v.letter)).c_str());
+			SetMenuDefaultItem(sub, base + VA_OPEN, FALSE);
+			AppendMenuW(sub, MF_STRING, base + VA_UNMOUNT, L"Unmount");
+		}
+		else if (v.state == "locked")
+			AppendMenuW(sub, MF_STRING, base + VA_UNLOCK, L"Unlock\x2026");
+		else
+			AppendMenuW(sub, MF_STRING, base + VA_MOUNT, L"Mount");
+		if (IsPhysical(v))
+			AppendMenuW(sub, MF_STRING, base + VA_EJECT, L"Eject disk (safely remove)");
+		AppendMenuW(sub, MF_SEPARATOR, 0, nullptr);
+		bool rw_possible = !IsPhysical(v) || allow;
+		AppendMenuW(sub, MF_STRING | (v.mode == "rw" ? MF_CHECKED : 0) | (rw_possible && v.state != "locked" ? 0 : MF_GRAYED), base + VA_READWRITE,
+			rw_possible ? L"Read-write" : L"Read-write (allow writing to disks first)");
+		AppendMenuW(sub, MF_STRING | (v.state != "disabled" ? MF_CHECKED : 0), base + VA_AUTOMOUNT, L"Mount automatically");
+		if (!v.note.empty())
+		{
+			AppendMenuW(sub, MF_SEPARATOR, 0, nullptr);
+			std::wstring note = W(v.note);
+			if (note.size() > 90)
+				note = note.substr(0, 87) + L"...";
+			AppendMenuW(sub, MF_STRING | MF_GRAYED, 0, note.c_str());
+		}
+		std::wstring label = W(v.name) + (v.letter != "-" ? L" (" + W(v.letter) + L")" : L"") + L"\t" + StateText(v);
+		AppendMenuW(m, MF_POPUP, reinterpret_cast<UINT_PTR>(sub), label.c_str());
+	}
+	AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+	if (up)
+	{
+		AppendMenuW(m, MF_STRING | (allow ? MF_CHECKED : 0), ID_ALLOW_WRITES, L"Allow writing to disks (experimental)\x2026");
+		AppendMenuW(m, MF_STRING, ID_RESCAN, L"Rescan disks");
+	}
+	else if (ServiceInstalled())
+		AppendMenuW(m, MF_STRING, ID_SERVICE_START, L"Start the winapfs service");
+	else
+		AppendMenuW(m, MF_STRING, ID_SERVICE_INSTALL, L"Install the winapfs service\x2026");
+	AppendMenuW(m, MF_STRING, ID_ABOUT, L"About winapfs");
+	AppendMenuW(m, MF_STRING, ID_EXIT, L"Exit");
+
+	POINT pt;
+	GetCursorPos(&pt);
+	SetForegroundWindow(g_wnd);
+	UINT cmd = TrackPopupMenu(m, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, g_wnd, nullptr);
+	PostMessageW(g_wnd, WM_NULL, 0, 0);
+	DestroyMenu(m);
+
+	if (cmd >= ID_VOLUME_BASE)
+	{
+		size_t i = (cmd - ID_VOLUME_BASE) / 10;
+		UINT action = (cmd - ID_VOLUME_BASE) % 10;
+		if (i >= vols.size())
+			return;
+		const VolumeStatus &v = vols[i];
+		std::wstring name = W(v.name);
+		switch (action)
+		{
+		case VA_OPEN:
+			ShellExecuteW(nullptr, L"open", (W(v.letter) + L"\\").c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+			break;
+		case VA_MOUNT:
+			Request("mount\t" + v.uuid, L"Cannot mount " + name);
+			break;
+		case VA_UNMOUNT:
+			Request("unmount\t" + v.uuid, L"Cannot unmount " + name);
+			break;
+		case VA_UNLOCK:
+			Unlock(v);
+			break;
+		case VA_EJECT:
+			Request("eject\t" + v.uuid, L"Cannot eject " + name);
+			Notify(L"Ejecting the disk", L"Wait for the next message before unplugging it.");
+			break;
+		case VA_READWRITE:
+			if (v.mode != "rw" &&
+				MessageBoxW(g_wnd, (L"Mount \"" + name + L"\" read-write?\n\nWriting to APFS is experimental: keep a backup. "
+					L"Always unmount or eject before unplugging the disk.").c_str(), L"winapfs", MB_OKCANCEL | MB_ICONWARNING) != IDOK)
+				break;
+			Request("set\t" + v.uuid + "\tReadWrite\t" + (v.mode == "rw" ? "0" : "1"), L"Cannot change " + name);
+			break;
+		case VA_AUTOMOUNT:
+			Request("set\t" + v.uuid + "\tDisabled\t" + (v.state == "disabled" ? "0" : "1"), L"Cannot change " + name);
+			break;
+		}
+		return;
+	}
+	switch (cmd)
+	{
+	case ID_ALLOW_WRITES:
+		if (!allow &&
+			MessageBoxW(g_wnd, L"Allow winapfs to write to APFS disks?\n\nWrite support is experimental and still being validated "
+				L"against macOS. Keep a backup of anything on the disk.\n\nYou will then choose \"Read-write\" per volume. "
+				L"Windows asks for administrator rights once.", L"winapfs", MB_OKCANCEL | MB_ICONWARNING) != IDOK)
+			break;
+		std::thread([allow] {
+			bool ok = RunElevated(allow ? L"service config AllowDiskWrites 0" : L"service config AllowDiskWrites 1");
+			PostMessageW(g_wnd, WM_ACTION_DONE, 0, reinterpret_cast<LPARAM>(ok ? nullptr : new std::wstring(L"The setting was not changed")));
+		}).detach();
+		break;
+	case ID_RESCAN:
+		Request("rescan", L"Rescan failed");
+		break;
+	case ID_SERVICE_START:
+	case ID_SERVICE_INSTALL:
+		std::thread([cmd] {
+			bool ok = RunElevated(cmd == ID_SERVICE_START ? L"service start" : L"service install");
+			PostMessageW(g_wnd, WM_ACTION_DONE, 0, reinterpret_cast<LPARAM>(ok ? nullptr : new std::wstring(L"The winapfs service could not be started")));
+		}).detach();
+		break;
+	case ID_ABOUT:
+		About();
+		break;
+	case ID_EXIT:
+		DestroyWindow(g_wnd);
+		break;
+	}
+}
+
+// ---------------------------------------------------------------- window
+
+void AddIcon()
+{
+	Shell_NotifyIconW(NIM_ADD, &g_nid);
+	g_nid.uVersion = NOTIFYICON_VERSION_4;
+	Shell_NotifyIconW(NIM_SETVERSION, &g_nid);
+}
+
+LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+	if (msg == g_taskbar_created && g_taskbar_created)
+	{
+		AddIcon();   // Explorer restarted
+		return 0;
+	}
+	switch (msg)
+	{
+	case WM_TRAY:
+		switch (LOWORD(lp))
+		{
+		case WM_CONTEXTMENU:
+		case NIN_SELECT:
+		case NIN_KEYSELECT:
+			ShowMenu();
+			break;
+		case NIN_BALLOONUSERCLICK:
+		{
+			VolumeStatus v;
+			{
+				std::lock_guard<std::mutex> lock(g_mutex);
+				for (const auto &x : g_vols)
+					if (x.uuid == g_balloon_uuid && x.state == "locked")
+						v = x;
+			}
+			if (!v.uuid.empty())
+				Unlock(v);
+			break;
+		}
+		}
+		return 0;
+	case WM_TIMER:
+		if (wp == TIMER_POLL)
+			Poll();
+		return 0;
+	case WM_ACTION_DONE:
+	{
+		auto *m = reinterpret_cast<std::wstring *>(lp);
+		if (m)
+		{
+			Notify(L"winapfs", *m, NIIF_WARNING);
+			delete m;
+		}
+		Poll();
+		return 0;
+	}
+	case WM_DESTROY:
+		KillTimer(wnd, TIMER_POLL);
+		Shell_NotifyIconW(NIM_DELETE, &g_nid);
+		PostQuitMessage(0);
+		return 0;
+	}
+	return DefWindowProcW(wnd, msg, wp, lp);
+}
+
+} // namespace
+
+int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
+{
+	g_inst = inst;
+	HANDLE single = CreateMutexW(nullptr, TRUE, L"Local\\winapfs-tray");
+	if (GetLastError() == ERROR_ALREADY_EXISTS)
+		return 0;   // already running for this user
+
+	g_pipe = DefaultControlPipe();
+	int argc = 0;
+	wchar_t **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+	for (int i = 1; argv && i + 1 < argc; i++)
+		if (wcscmp(argv[i], L"--pipe") == 0)
+			g_pipe = argv[++i];
+	if (argv)
+		LocalFree(argv);
+
+	INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_STANDARD_CLASSES };
+	InitCommonControlsEx(&icc);
+
+	WNDCLASSEXW wc = { sizeof(wc) };
+	wc.lpfnWndProc = WndProc;
+	wc.hInstance = inst;
+	wc.lpszClassName = L"winapfs-tray";
+	RegisterClassExW(&wc);
+	g_wnd = CreateWindowExW(0, wc.lpszClassName, L"winapfs", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, inst, nullptr);
+	g_taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
+	ChangeWindowMessageFilterEx(g_wnd, g_taskbar_created, MSGFLT_ALLOW, nullptr);
+
+	SHSTOCKICONINFO sii = { sizeof(sii) };
+	SHGetStockIconInfo(SIID_DRIVEREMOVE, SHGSI_ICON | SHGSI_SMALLICON, &sii);
+	g_nid.cbSize = sizeof(g_nid);
+	g_nid.hWnd = g_wnd;
+	g_nid.uID = 1;
+	g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
+	g_nid.uCallbackMessage = WM_TRAY;
+	g_nid.hIcon = sii.hIcon;
+	wcscpy_s(g_nid.szTip, L"winapfs");
+	AddIcon();
+
+	Poll();
+	SetTimer(g_wnd, TIMER_POLL, kPollMs, nullptr);
+
+	MSG msg;
+	while (GetMessageW(&msg, nullptr, 0, 0) > 0)
+	{
+		TranslateMessage(&msg);
+		DispatchMessageW(&msg);
+	}
+	if (sii.hIcon)
+		DestroyIcon(sii.hIcon);
+	CloseHandle(single);
+	return 0;
+}

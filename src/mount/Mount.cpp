@@ -16,10 +16,21 @@ const char *const kWinFspNotice =
 	"https://github.com/winfsp/winfsp";
 
 static LogSink g_sink = nullptr;
+static thread_local std::string t_last_problem;
 
 void SetLogSink(LogSink sink)
 {
 	g_sink = sink;
+}
+
+const std::string &LastLoggedProblem()
+{
+	return t_last_problem;
+}
+
+void ClearLoggedProblem()
+{
+	t_last_problem.clear();
 }
 
 void Log(int level, const char *fmt, ...)
@@ -29,6 +40,8 @@ void Log(int level, const char *fmt, ...)
 	va_start(ap, fmt);
 	vsnprintf(buf, sizeof(buf), fmt, ap);
 	va_end(ap);
+	if (level <= 1)
+		t_last_problem = buf;
 	if (g_sink)
 		g_sink(level, buf);
 	else

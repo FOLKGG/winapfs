@@ -10,3 +10,5 @@
 #include <vector>
 
 int CmdService(const std::vector<std::wstring> &args);
+// `winapfs ctl ...`: talk to the running service (Control.h)
+int CmdCtl(const std::vector<std::wstring> &args);

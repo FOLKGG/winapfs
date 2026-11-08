@@ -33,7 +33,8 @@ static void Usage()
 		"  winapfs list [<image|\\\\.\\PhysicalDriveN>...]\n"
 		"  winapfs mount <image|\\\\.\\PhysicalDriveN> [X:|dir|*] [options]\n"
 		"  winapfs mount-all [<image|\\\\.\\PhysicalDriveN>...] [options]\n"
-		"  winapfs service install|uninstall|start|stop|status|debug   (see winapfs service)\n"
+		"  winapfs service install|uninstall|start|stop|status|config|debug   (see winapfs service)\n"
+		"  winapfs ctl list|mount|unmount|eject|set|rescan   control the service (see winapfs ctl)\n"
 		"\n"
 		"Without a source, list and mount-all scan every physical disk for APFS\n"
 		"partitions (GPT type 7C3457EF-0000-11AA-AA11-00306543ECAC). Raw disk access\n"
@@ -426,6 +427,8 @@ int wmain(int argc, wchar_t **wargv)
 		return 2;
 	}
 	std::wstring cmd = wargv[1];
+	if (cmd == L"ctl")
+		return CmdCtl(std::vector<std::wstring>(wargv + 2, wargv + argc));
 	if (cmd == L"service")
 		return CmdService(std::vector<std::wstring>(wargv + 2, wargv + argc));
 	Args a;

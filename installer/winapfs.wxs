@@ -62,6 +62,12 @@
         </RegistryKey>
         <Environment Id="PathEntry" Name="PATH" Value="[INSTALLFOLDER]" Part="last" Action="set" System="yes" Permanent="no" />
       </Component>
+      <!-- the tray app: started for every user at logon -->
+      <Component Id="TrayExe" Bitness="always64">
+        <File Id="TrayExe" Source="$(var.BuildDir)\src\mount\Release\winapfs-tray.exe" KeyPath="yes" />
+        <RegistryValue Root="HKLM" Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Run" Name="winapfs-tray"
+                       Type="string" Value="&quot;[#TrayExe]&quot;" />
+      </Component>
       <Component Id="CliExe" Bitness="always64">
         <File Source="$(var.BuildDir)\src\cli\Release\winapfs-cli.exe" KeyPath="yes" />
       </Component>
@@ -79,12 +85,33 @@
       </Component>
     </ComponentGroup>
 
+    <!-- close the tray app for uninstall and upgrades (it holds no state) -->
+    <util:CloseApplication Id="CloseTray" Target="winapfs-tray.exe" TerminateProcess="0" RebootPrompt="no" />
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="StartMenu" Bitness="always64">
+        <Shortcut Id="TrayShortcut" Name="winapfs" Description="APFS (Mac) disks: the winapfs tray"
+                  Target="[#TrayExe]" WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue Root="HKLM" Key="SOFTWARE\winapfs\Installer" Name="StartMenu" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
     <Feature Id="Main" Title="winapfs" Level="1">
       <ComponentGroupRef Id="Main" />
+      <ComponentRef Id="StartMenu" />
     </Feature>
 
-    <!-- one page: the licence (GPL-2.0, with the WinFsp notice on top), then install -->
+    <!-- one page: the licence (GPL-2.0, with the WinFsp notice on top), then install;
+         the last page offers to start the tray (as the user, not elevated) -->
     <ui:WixUI Id="WixUI_Minimal" />
     <WixVariable Id="WixUILicenseRtf" Value="$(var.ObjDir)\license.rtf" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Start winapfs (the tray app)" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <Property Id="WixShellExecTarget" Value="[#TrayExe]" />
+    <CustomAction Id="LaunchTray" BinaryRef="Wix4UtilCA_X64" DllEntry="WixShellExec" Impersonate="yes" />
+    <UI>
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchTray"
+               Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT Installed" />
+    </UI>
   </Package>
 </Wix>

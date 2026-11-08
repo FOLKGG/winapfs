@@ -22,6 +22,9 @@ namespace winapfs {
 using LogSink = void (*)(int level, const std::string &msg);
 void SetLogSink(LogSink sink);
 void Log(int level, const char *fmt, ...);
+// The last error or warning logged on this thread (why a mount failed).
+const std::string &LastLoggedProblem();
+void ClearLoggedProblem();
 
 // Locks on Windows volumes held for raw-disk writes, one per partition; the
 // owner keeps them for as long as volumes of that partition are mounted.

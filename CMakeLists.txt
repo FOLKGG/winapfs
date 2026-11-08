@@ -81,6 +81,7 @@ find_library(WINFSP_LIBRARY winfsp-x64
 	HINTS "$ENV{ProgramFiles\(x86\)}/WinFsp/lib" "C:/Program Files (x86)/WinFsp/lib")
 if(WINFSP_INCLUDE_DIR AND WINFSP_LIBRARY)
 	add_subdirectory(src/mount)
+	add_subdirectory(src/tray)
 else()
 	message(WARNING "WinFsp SDK not found; skipping the winapfs mount tool")
 endif()
