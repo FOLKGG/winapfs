@@ -33,7 +33,10 @@ not need admin. Windows Defender scans each file opened on the mount
 
 `testdata/` = images + manifests from the user's macOS generator
 (`testdata/generator/`, see its README). `*.img` are gitignored (2.7 GB);
-manifests and `SHA256SUMS` are tracked. Encrypted volume passphrase:
+manifests and `SHA256SUMS` are tracked. **Never mount them `--rw` or write to
+them in place** (even a no-op rw mount rewrites the checkpoint): tests copy
+them to `build/tests`. Pristine originals: `%USERPROFILE%\Downloads\winapfs-testdata\images`
+(restore from there and check `SHA256SUMS` if one changes). Encrypted volume passphrase:
 `winapfs-test`. Manifest quirks handled in the verifier:
 - skips `.fseventsd`, `.Spotlight-V100`, `.Trashes`, `.TemporaryItems`
 - stored uid/gid 99 (macOS `_unknown`, shown as the viewing user) matches anything
@@ -101,6 +104,8 @@ tests/verify.cpp         winapfs-verify: manifest checker (image or mounted dir)
 - Util.cpp: Windows no-echo `GetPassword`.
 - ApfsVolume.cpp: `Init`/`MountSnapshot` never prompt for a password on
   stdin; they fail and the caller asks.
+- ApfsContainer: keeps block zero's xid (`GetBlock0Xid`, `GetXid`,
+  `GetIncompatFeatures`) for the clean-unmount check (W5).
 - ApfsDir.cpp: `ReadFile` treats offsets with no covering extent as sparse
   holes (upstream returned false for a leading hole and underflowed `cur_size`
   past the last extent). `LookupName` returns the stored name and the drec
@@ -422,9 +427,43 @@ links.img. 121 tests, ~145 s.
 Not done (WinFsp has no hard-link creation; FIFOs can't be made from
 Windows; ACLs are still the fixed SD, W7).
 
+### W5 done (opt-in): physical-disk writes and write safety
+
+`winapfs mount|mount-all ... --rw`:
+- **Refusals** (`Container::WriteRefusal`, checked before any rw open, images
+  too): not cleanly unmounted (block-zero superblock xid ≠ newest checkpoint
+  xid: crash, hibernated Mac, unplugged without eject; ApfsLib patch keeps
+  block zero's xid), Fusion, encrypted, sealed, macOS-owned roles (System,
+  Recovery, VM, Preboot, Installer, Update, Time Machine backup and any other
+  non-None/User/Data role). `--force` overrides only the unclean check (with
+  a warning). If the engine still opens read-only (its own refusals), the
+  mount fails instead of silently mounting read-only.
+- **Physical disks** (`\\.\` paths) need `--allow-disk-writes` as well, until
+  the macOS fsck_apfs gate has passed. `DiskWriteLock` (core) locks and
+  dismounts every Windows volume (the RAW volume Windows makes for the APFS
+  partition) overlapping the partition for the life of the mount, as Windows
+  requires for raw writes into a volume's extents. kshim gets a raw disk's
+  size by IOCTL_DISK_GET_LENGTH_INFO when no size is given.
+- **One engine container per container**: kshim_bdev_register reuses the
+  device for the same path+offset (ref-counted; read-only and read-write
+  registrations can't mix: -EBUSY). Before, each volume of `mount-all` had its
+  own driver container (own allocator/omap): two rw volumes would corrupt it.
+- **Driver fix (upstream candidate)**, transaction.c: each volume joining a
+  container transaction gets writable copies of its own volume superblock,
+  omap and catalog (`sbi->s_trans_xid`), not only the volume that started it;
+  writing to a second volume crashed on nodes released by the last commit.
+- winapfs prints a symbolized stack on a crash (DbgHelp; PDBs are built).
+- Tests: `w5_unclean_*` (crash-made unclean image: refused, read-only works,
+  `--force` works), `w5_raw_*` (Win32 write test through `\\.\C:\...\copy.img`
+  with `--allow-disk-writes`, verify, fsck -c), `w5_multivol_*` (mount-all
+  --rw writing all three volumes, fsck -c, read back). 135 tests.
+  `tests\physical_test.ps1 -Write` (elevated) does the same on a VHD attached
+  read-write as a real \\.\PhysicalDriveN (not yet run).
+
 Next: the user's macOS `fsck_apfs` check of images written here
-(`build/tests/w3-*.img`, `w32-*.img`, `crash-*.img`, `full-*.img` after a test
-run), then W5 (physical-disk writes).
+(`build/tests/w3-*.img`, `w32-*.img`, `w5raw-*.img`, `w5-multivol.img`,
+`crash-*.img`, `full-*.img` after a test run); once it passes, physical-disk
+writes may drop the `--allow-disk-writes` requirement. Then W6/W7.
 
 ### Performance (2026-11-08, after the user's physical-disk copy test)
 
@@ -495,8 +534,9 @@ Tools: `apfsrw-bench <img> <container offset> <vol index> <MiB> [chunk KiB]
   use the Edit tool, not perl/sed with `\n`, on files under third_party/.
 - No sealed-volume (signed system volume) testing; ApfsLib reads the fext tree.
 - `--rw` mounts: hard links can't be made from Windows (WinFsp), the SD is a
-  fixed "Everyone: full access" (W7). No refusal yet for unclean/hibernated
-  containers or sealed volumes (W5 list). Writing a compressed file rewrites
+  fixed "Everyone: full access" (W7). A Mac hibernated *with the disk cleanly
+  checkpointed* can't be told apart (APFS has no hibernation flag); the unclean
+  check catches the usual case. Writing a compressed file rewrites
   it whole (decompressed copy); a hard-linked compressed file can't be
   written (EMLINK → unexpected I/O error on Windows).
 - Mount Manager drive letters (elevated) are picked from Z: down by

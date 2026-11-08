@@ -413,7 +413,16 @@ int apfs_transaction_start(struct super_block *sb, enum apfs_trans_kind kind)
 		return -ENOSPC;
 	}
 
-	if (nx_trans->t_starts_count == 0) {
+	/*
+	 * winapfs (upstream candidate): every volume that joins the container
+	 * transaction needs writable copies of its own volume superblock, omap
+	 * and catalog, not only the volume that started the transaction. With
+	 * the old check (t_starts_count == 0) a second volume kept nodes whose
+	 * buffers the last commit had released (a crash writing to two volumes
+	 * of one container).
+	 */
+	if (APFS_SB(sb)->s_trans_xid != nxi->nx_xid) {
+		APFS_SB(sb)->s_trans_xid = nxi->nx_xid;
 		err = apfs_map_volume_super(sb, true /* write */);
 		if (err) {
 			apfs_err(sb, "CoW failed for volume super");

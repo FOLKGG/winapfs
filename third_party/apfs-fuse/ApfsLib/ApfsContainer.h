@@ -55,6 +55,13 @@ public:
 	bool GetPasswordHint(std::string &hint, const apfs_uuid_t &vol_uuid);
 	bool IsUnencrypted() const { return m_keymgr.IsUnencrypted(); }
 
+	// winapfs: macOS writes the superblock copy in block zero when it
+	// unmounts cleanly; a newer checkpoint than block zero means the
+	// container was not unmounted cleanly (crash, hibernation, unplugged).
+	uint64_t GetBlock0Xid() const { return m_block0_xid; }
+	uint64_t GetXid() const { return m_nx.nx_o.o_xid; }
+	uint64_t GetIncompatFeatures() const { return m_nx.nx_incompatible_features; }
+
 	void dump(BlockDumper& bd);
 
 private:
@@ -69,6 +76,7 @@ private:
 	std::string m_passphrase;
 
 	nx_superblock_t m_nx;
+	uint64_t m_block0_xid = 0;   // winapfs
 
 	CheckPointMap m_cpm;
 	ApfsNodeMapperBTree m_omap;

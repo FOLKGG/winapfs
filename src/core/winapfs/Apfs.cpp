@@ -254,6 +254,50 @@ uint32_t Container::BlockSize() const { return m_nx->GetBlocksize(); }
 uint64_t Container::BlockCount() const { return m_nx->GetBlockCount(); }
 uint64_t Container::FreeBlocks() const { return m_nx->GetFreeBlocks(); }
 
+bool Container::CleanlyUnmounted() const
+{
+	return m_nx->GetBlock0Xid() == m_nx->GetXid();
+}
+
+bool Container::IsFusion() const
+{
+	return (m_nx->GetIncompatFeatures() & NX_INCOMPAT_FUSION) != 0;
+}
+
+std::string Container::WriteRefusal(const VolumeInfo &v, bool ignore_unclean) const
+{
+	if (IsFusion())
+		return "Fusion drives can't be written";
+	if (!ignore_unclean && !CleanlyUnmounted())
+		return "the disk was not ejected cleanly (Mac crashed, hibernated or disk unplugged): "
+			"attach it to the Mac and eject it properly, or mount it read-only";
+	if (v.encrypted)
+		return "encrypted volumes can't be written yet";
+	if (v.sealed)
+		return "sealed system volumes can't be written";
+	// volumes macOS owns; None, User and Data hold the user's files
+	switch (v.role)
+	{
+	case APFS_VOL_ROLE_NONE:
+	case APFS_VOL_ROLE_USER:
+	case APFS_VOL_ROLE_DATA:
+		return "";
+	case APFS_VOL_ROLE_SYSTEM: return "this is a macOS System volume";
+	case APFS_VOL_ROLE_RECOVERY: return "this is a macOS Recovery volume";
+	case APFS_VOL_ROLE_VM: return "this is a macOS VM (swap) volume";
+	case APFS_VOL_ROLE_PREBOOT: return "this is a macOS Preboot volume";
+	case APFS_VOL_ROLE_INSTALLER: return "this is a macOS Installer volume";
+	case APFS_VOL_ROLE_UPDATE: return "this is a macOS Update volume";
+	case APFS_VOL_ROLE_BACKUP: return "this is a Time Machine backup volume";
+	default:
+		return "this volume has a macOS system role (0x" + [](uint16_t r) {
+			char b[8];
+			snprintf(b, sizeof(b), "%x", r);
+			return std::string(b);
+		}(v.role) + ")";
+	}
+}
+
 // ---------------------------------------------------------------- Volume
 
 LibVolume::LibVolume(Container &c, std::unique_ptr<ApfsVolume> v, const VolumeInfo &info)

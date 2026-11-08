@@ -268,3 +268,49 @@ if(TARGET winapfs)
 		set_tests_properties(prealloc.${img} PROPERTIES RESOURCE_LOCK winfsp_mount)
 	endforeach()
 endif()
+
+# W5: write safety and raw-device writes (always on copies)
+if(TARGET winapfs)
+	file(TO_NATIVE_PATH "${CMAKE_CURRENT_BINARY_DIR}" BIN_NATIVE)
+
+	# an image left unclean (crashed after a synced checkpoint) is refused for --rw,
+	# mounts read-only, and is accepted with --force
+	set(unclean ${CMAKE_CURRENT_BINARY_DIR}/unclean-basic.img)
+	add_test(NAME w5_unclean_prepare
+		COMMAND apfsrw-writetest --crash kill 1 1 ${TD}/basic.Basic.manifest.json ${TD}/basic.img ${unclean} ${unclean}.model.json Basic)
+	# the crash exits 99 (non-zero: WILL_FAIL); a clean exit would leave a clean image
+	set_tests_properties(w5_unclean_prepare PROPERTIES FIXTURES_SETUP w5unclean WILL_FAIL TRUE)
+	add_test(NAME w5_unclean_refused COMMAND winapfs mount ${unclean} * --rw --run "cmd /c exit 0")
+	set_tests_properties(w5_unclean_refused PROPERTIES WILL_FAIL TRUE)
+	add_test(NAME w5_unclean_readonly COMMAND winapfs mount ${unclean} * --run "cmd /c exit 0")
+	add_test(NAME w5_unclean_force COMMAND winapfs mount ${unclean} * --rw --force --run "cmd /c exit 0")
+	set_tests_properties(w5_unclean_refused w5_unclean_readonly w5_unclean_force PROPERTIES
+		FIXTURES_REQUIRED w5unclean RESOURCE_LOCK winfsp_mount)
+	set_tests_properties(w5_unclean_force PROPERTIES DEPENDS "w5_unclean_refused;w5_unclean_readonly")
+
+	# the full Win32 write test through the raw-device path (\.\C:\...\copy.img),
+	# which needs --allow-disk-writes like a physical disk
+	set(rawwork ${CMAKE_CURRENT_BINARY_DIR}/w5raw-basic.img)
+	add_test(NAME w5_raw_prepare COMMAND ${CMAKE_COMMAND} -E copy ${TD}/basic.img ${rawwork})
+	set_tests_properties(w5_raw_prepare PROPERTIES FIXTURES_SETUP w5rawprep)
+	add_test(NAME w5_raw_write
+		COMMAND winapfs mount "${BS}${BS}.${BS}${BIN_NATIVE}${BS}w5raw-basic.img" * --rw --allow-disk-writes --volume Basic
+			--run "\"$<TARGET_FILE:apfsrw-writetest>\" --win32 %MOUNT% \"${TD}/basic.Basic.manifest.json\" \"${rawwork}\" \"${rawwork}.model.json\" Basic")
+	set_tests_properties(w5_raw_write PROPERTIES RESOURCE_LOCK winfsp_mount FIXTURES_REQUIRED w5rawprep FIXTURES_SETUP w5raw)
+	add_test(NAME w5_raw_verify COMMAND apfsrw-writetest --verify ${TD}/basic.Basic.manifest.json ${rawwork} ${rawwork}.model.json Basic)
+	add_test(NAME w5_raw_fsck COMMAND winapfs-fsck -c ${rawwork})
+	set_tests_properties(w5_raw_verify w5_raw_fsck PROPERTIES FIXTURES_REQUIRED w5raw)
+
+	# mount-all --rw: the volumes of one container share one engine container
+	# (separate ones would each have their own allocator and corrupt it)
+	set(mvwork ${CMAKE_CURRENT_BINARY_DIR}/w5-multivol.img)
+	add_test(NAME w5_multivol_prepare COMMAND ${CMAKE_COMMAND} -E copy ${TD}/multivol.img ${mvwork})
+	set_tests_properties(w5_multivol_prepare PROPERTIES FIXTURES_SETUP w5mvprep)
+	add_test(NAME w5_multivol_write
+		COMMAND winapfs mount-all ${mvwork} --rw
+			--run "powershell -NoProfile -Command \"foreach ($v in 'VolA','VolB','VolC') { $m = [Environment]::GetEnvironmentVariable('WINAPFS_MOUNT_' + $v); $d = New-Object byte[] 3000000; (New-Object Random 7).NextBytes($d); [IO.File]::WriteAllBytes($m + '${BS}' + $v + '.bin', $d) }\"")
+	set_tests_properties(w5_multivol_write PROPERTIES RESOURCE_LOCK winfsp_mount FIXTURES_REQUIRED w5mvprep FIXTURES_SETUP w5mv)
+	add_test(NAME w5_multivol_fsck COMMAND winapfs-fsck -c ${mvwork})
+	add_test(NAME w5_multivol_read COMMAND winapfs-cli cat ${mvwork} /VolC.bin -v VolC)
+	set_tests_properties(w5_multivol_fsck w5_multivol_read PROPERTIES FIXTURES_REQUIRED w5mv)
+endif()

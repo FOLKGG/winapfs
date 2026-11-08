@@ -2,6 +2,8 @@ add_library(winapfs_core STATIC
 	winapfs/Apfs.cpp
 	winapfs/Apfs.h
 	winapfs/Compression.cpp
+	winapfs/DiskLock.cpp
+	winapfs/DiskLock.h
 	winapfs/Compression.h
 	winapfs/Gpt.cpp
 	winapfs/Gpt.h

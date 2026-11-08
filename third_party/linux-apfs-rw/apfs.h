@@ -402,6 +402,7 @@ struct apfs_sb_info {
 	u64 s_snap_xid; /* Transaction id for mounted snapshot */
 
 	struct apfs_node *s_cat_root;	/* Root of the catalog tree */
+	u64 s_trans_xid;		/* winapfs: transaction the writable volume objects belong to */
 	struct apfs_omap *s_omap;	/* The object map */
 
 	struct apfs_object s_vobject;	/* Volume superblock object */

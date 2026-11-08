@@ -81,6 +81,7 @@ bool ApfsContainer::Init(xid_t req_xid)
 		return false;
 
 	memcpy(&m_nx, blk.data(), sizeof(nx_superblock_t));
+	m_block0_xid = m_nx.nx_o.o_xid;   // winapfs: clean-unmount check
 
 	// Scan container for most recent superblock (might fix segfaults)
 	uint64_t max_xid = 0;

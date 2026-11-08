@@ -128,6 +128,14 @@ public:
 	uint32_t BlockSize() const;
 	uint64_t BlockCount() const;
 	uint64_t FreeBlocks() const;
+
+	// macOS writes the superblock copy in block zero at a clean unmount. A
+	// newer checkpoint means it was not (a crash, a hibernated Mac, a disk
+	// unplugged without ejecting): the Mac may still expect that state.
+	bool CleanlyUnmounted() const;
+	bool IsFusion() const;
+	// Why a volume must not be opened read-write, or "" if it may be.
+	std::string WriteRefusal(const VolumeInfo &v, bool ignore_unclean = false) const;
 	const std::string &Path() const { return m_path; }
 	uint64_t PartitionOffset() const { return m_offset; }
 	uint64_t PartitionSize() const { return m_size; }

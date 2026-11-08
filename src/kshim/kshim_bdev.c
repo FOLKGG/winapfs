@@ -19,11 +19,14 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+#include <winioctl.h>
 
 #define MAX_BDEVS	64
 
 struct kshim_bdev {
 	bool used;
+	int regs;		/* registrations: volume mounts sharing this device */
+	wchar_t path[MAX_PATH];
 	HANDLE h;
 	u64 offset;
 	u64 size;
@@ -47,6 +50,28 @@ int kshim_bdev_register(const wchar_t *path, u64 offset, u64 size, bool writable
 	HANDLE h;
 	int i;
 
+	/*
+	 * Volumes of one container share its device, so the driver shares one
+	 * container instance among their mounts (as on Linux). Separate devices
+	 * gave each volume its own space manager and object map: two read-write
+	 * mounts of one container would have corrupted it.
+	 */
+	AcquireSRWLockExclusive(&g_bdev_lock);
+	for (i = 0; i < MAX_BDEVS; i++) {
+		struct kshim_bdev *b = &g_bdevs[i];
+		if (b->used && b->offset == offset && !_wcsicmp(b->path, path)) {
+			if (b->writable != writable) {
+				ReleaseSRWLockExclusive(&g_bdev_lock);
+				return -EBUSY;   /* the driver can't mix read-only and read-write mounts */
+			}
+			b->regs++;
+			snprintf(name, name_size, "kshim:%d", i);
+			ReleaseSRWLockExclusive(&g_bdev_lock);
+			return 0;
+		}
+	}
+	ReleaseSRWLockExclusive(&g_bdev_lock);
+
 	h = CreateFileW(path, GENERIC_READ | (writable ? GENERIC_WRITE : 0), FILE_SHARE_READ | FILE_SHARE_WRITE,
 			NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS, NULL);
 	if (h == INVALID_HANDLE_VALUE)
@@ -54,11 +79,28 @@ int kshim_bdev_register(const wchar_t *path, u64 offset, u64 size, bool writable
 
 	if (!size) {
 		LARGE_INTEGER sz;
-		if (!GetFileSizeEx(h, &sz)) {
-			CloseHandle(h);
-			return -EINVAL;
+		GET_LENGTH_INFORMATION li;
+		DWORD got = 0;
+		OVERLAPPED ov = { 0 };
+		if (GetFileSizeEx(h, &sz)) {
+			size = (u64)sz.QuadPart - offset;
+		} else {
+			/* a raw disk: ask the device (overlapped handle: wait for the result) */
+			ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+			if (!DeviceIoControl(h, IOCTL_DISK_GET_LENGTH_INFO, NULL, 0, &li, sizeof(li), NULL, &ov) &&
+			    GetLastError() != ERROR_IO_PENDING) {
+				CloseHandle(ov.hEvent);
+				CloseHandle(h);
+				return -EINVAL;
+			}
+			if (!GetOverlappedResult(h, &ov, &got, TRUE)) {
+				CloseHandle(ov.hEvent);
+				CloseHandle(h);
+				return -EINVAL;
+			}
+			CloseHandle(ov.hEvent);
+			size = (u64)li.Length.QuadPart - offset;
 		}
-		size = (u64)sz.QuadPart - offset;
 	}
 
 	AcquireSRWLockExclusive(&g_bdev_lock);
@@ -72,6 +114,8 @@ int kshim_bdev_register(const wchar_t *path, u64 offset, u64 size, bool writable
 	struct kshim_bdev *b = &g_bdevs[i];
 	memset(b, 0, sizeof(*b));
 	b->used = true;
+	b->regs = 1;
+	wcsncpy(b->path, path, MAX_PATH - 1);
 	b->h = h;
 	b->offset = offset;
 	b->size = size;
@@ -112,7 +156,9 @@ void kshim_bdev_unregister(const char *name)
 	struct kshim_bdev *b;
 	AcquireSRWLockExclusive(&g_bdev_lock);
 	b = lookup(name);
-	if (b && b->opens == 0) {
+	if (b && b->regs > 0)
+		b->regs--;
+	if (b && b->regs == 0 && b->opens == 0) {
 		if (getenv("KSHIM_IOSTATS"))
 			fprintf(stderr, "kshim %s: %lld reads (%lld KiB), %lld writes (%lld KiB)\n", name, (long long)g_reads,
 				(long long)g_read_bytes / 1024, (long long)g_writes, (long long)g_write_bytes / 1024);

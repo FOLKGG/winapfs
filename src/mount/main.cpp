@@ -6,9 +6,13 @@
 
 #include "ApfsFs.h"
 
+#include <winapfs/DiskLock.h>
 #include <winapfs/Names.h>
 
 #include <ApfsLib/Util.h>
+
+#include <Windows.h>
+#include <dbghelp.h>
 
 #include <cstdio>
 #include <io.h>
@@ -69,6 +73,8 @@ struct Args
 	int partition = -1;
 	std::string engine = "auto";
 	bool rw = false;
+	bool allow_disk_writes = false;
+	bool force = false;
 	MountOptions opts;
 };
 
@@ -91,6 +97,8 @@ static bool ParseArgs(const std::vector<std::wstring> &argv, Args &a)
 		else if (s == L"--run") { if (!next(a.run)) return false; }
 		else if (s == L"--engine") { if (!next(v)) return false; a.engine = WideToUtf8(v); if (a.engine != "auto" && a.engine != "rw" && a.engine != "lib") return false; }
 		else if (s == L"--rw") a.rw = true;
+		else if (s == L"--allow-disk-writes") a.allow_disk_writes = true;
+		else if (s == L"--force") a.force = true;
 		else if (s == L"--ask") a.ask = true;
 		else if (s == L"--hide-dotfiles") a.opts.hide_dotfiles = true;
 		else if (s == L"-d" || s == L"--debug") a.opts.debug = true;
@@ -167,10 +175,12 @@ static std::unique_ptr<Volume> OpenVolume(Container &c, const VolumeInfo &vi, co
 
 	if (a.rw)
 	{
-		// read-write: images only until physical-disk writes are proven (W5)
-		if (c.Path().compare(0, 4, "\\\\.\\") == 0)
+		// physical disks: opt-in until macOS fsck_apfs has passed on images written here
+		bool raw = c.Path().compare(0, 4, "\\\\.\\") == 0;
+		if (raw && !a.allow_disk_writes)
 		{
-			fprintf(stderr, "%s: writing to physical disks is not enabled yet; --rw works on image files\n", vi.name.c_str());
+			fprintf(stderr, "%s: writing to physical disks is experimental; add --allow-disk-writes "
+				"(and have a backup), or mount without --rw\n", vi.name.c_str());
 			return nullptr;
 		}
 		if (a.engine == "lib")
@@ -178,14 +188,45 @@ static std::unique_ptr<Volume> OpenVolume(Container &c, const VolumeInfo &vi, co
 			fprintf(stderr, "%s: --rw needs the linux-apfs-rw engine\n", vi.name.c_str());
 			return nullptr;
 		}
-		if (vi.encrypted)
+		std::string why = c.WriteRefusal(vi, a.force);
+		if (!why.empty())
 		{
-			fprintf(stderr, "%s: encrypted volumes can't be written yet\n", vi.name.c_str());
+			fprintf(stderr, "%s: not writable: %s\n", vi.name.c_str(), why.c_str());
 			return nullptr;
+		}
+		if (!c.CleanlyUnmounted())
+			fprintf(stderr, "%s: warning: writing to a disk that was not ejected cleanly (--force)\n", vi.name.c_str());
+		if (raw)
+		{
+			// Windows' RAW volume on the partition must be locked (once per partition)
+			static std::vector<std::pair<std::string, std::unique_ptr<DiskWriteLock>>> locks;
+			std::string key = c.Path() + "@" + std::to_string(c.PartitionOffset());
+			bool have = false;
+			for (const auto &l : locks)
+				have = have || l.first == key;
+			if (!have)
+			{
+				std::unique_ptr<DiskWriteLock> lock = DiskWriteLock::Acquire(c.Path(), c.PartitionOffset(), c.PartitionSize(), err);
+				if (!lock)
+				{
+					fprintf(stderr, "%s: %s\n", vi.name.c_str(), err.c_str());
+					return nullptr;
+				}
+				locks.emplace_back(key, std::move(lock));
+			}
 		}
 		std::unique_ptr<Volume> v = OpenRwVolume(c, vi.fsid, true, err);
 		if (!v)
+		{
 			fprintf(stderr, "%s: %s\n", vi.name.c_str(), err.c_str());
+			return nullptr;
+		}
+		if (!v->Writable())
+		{
+			// the engine falls back to read-only on its own refusals (see its messages)
+			fprintf(stderr, "%s: the engine opened it read-only; not mounting with --rw\n", vi.name.c_str());
+			return nullptr;
+		}
 		return v;
 	}
 
@@ -415,9 +456,44 @@ static int CmdMountAll(const Args &a)
 	return rc;
 }
 
+// On a crash: the exception and a symbolized stack of the faulting thread on
+// stderr (for bug reports; the PDB next to the exe gives names and lines).
+static LONG WINAPI CrashHandler(EXCEPTION_POINTERS *ep)
+{
+	HANDLE proc = GetCurrentProcess(), thread = GetCurrentThread();
+	CONTEXT ctx = *ep->ContextRecord;
+	STACKFRAME64 frame = {};
+	fprintf(stderr, "\n*** winapfs crashed: exception 0x%08lx at %p\n", ep->ExceptionRecord->ExceptionCode, ep->ExceptionRecord->ExceptionAddress);
+	SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME);
+	SymInitialize(proc, nullptr, TRUE);
+	frame.AddrPC.Offset = ctx.Rip;
+	frame.AddrFrame.Offset = ctx.Rbp;
+	frame.AddrStack.Offset = ctx.Rsp;
+	frame.AddrPC.Mode = frame.AddrFrame.Mode = frame.AddrStack.Mode = AddrModeFlat;
+	for (int i = 0; i < 40 && StackWalk64(IMAGE_FILE_MACHINE_AMD64, proc, thread, &frame, &ctx, nullptr,
+			SymFunctionTableAccess64, SymGetModuleBase64, nullptr); i++)
+	{
+		char buf[sizeof(SYMBOL_INFO) + 256];
+		SYMBOL_INFO *sym = reinterpret_cast<SYMBOL_INFO *>(buf);
+		sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+		sym->MaxNameLen = 255;
+		DWORD64 disp = 0;
+		DWORD ldisp = 0;
+		IMAGEHLP_LINE64 line = { sizeof(line) };
+		const char *name = SymFromAddr(proc, frame.AddrPC.Offset, &disp, sym) ? sym->Name : "?";
+		if (SymGetLineFromAddr64(proc, frame.AddrPC.Offset, &ldisp, &line))
+			fprintf(stderr, "  %2d %s  %s:%lu\n", i, name, line.FileName, line.LineNumber);
+		else
+			fprintf(stderr, "  %2d %s\n", i, name);
+	}
+	fflush(stderr);
+	return EXCEPTION_EXECUTE_HANDLER;
+}
+
 int wmain(int argc, wchar_t **wargv)
 {
 	SetConsoleOutputCP(CP_UTF8);
+	SetUnhandledExceptionFilter(CrashHandler);
 
 	if (argc < 2)
 	{
