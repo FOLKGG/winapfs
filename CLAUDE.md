@@ -458,7 +458,9 @@ Windows; ACLs are still the fixed SD, W7).
   with `--allow-disk-writes`, verify, fsck -c), `w5_multivol_*` (mount-all
   --rw writing all three volumes, fsck -c, read back). 135 tests.
   `tests\physical_test.ps1 -Write` (elevated) does the same on a VHD attached
-  read-write as a real \\.\PhysicalDriveN (not yet run).
+  read-write as a real \\.\PhysicalDriveN: passed 2026-11-08 (refusal without
+  the flag; Win32 writes through \\.\PhysicalDrive2 with Windows' RAW volume
+  locked; both engines 3484 entries / 0 problems; fsck -c clean).
 
 Next: the user's macOS `fsck_apfs` check of images written here
 (`build/tests/w3-*.img`, `w32-*.img`, `w5raw-*.img`, `w5-multivol.img`,
