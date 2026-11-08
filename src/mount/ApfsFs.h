@@ -62,6 +62,17 @@ public:
 	// Named streams are xattrs; only those ListXattrs shows are visible.
 	bool StreamVisible(const Stat &st, const std::string &xattr);
 
+	// Pending file growth. Windows sets the final size before writing (CopyFile,
+	// Explorer); growing the APFS file then would make every write land in a
+	// hole mid-file, where the engine creates one extent per block. The size
+	// is reported at once and applied when the data didn't reach it (cleanup,
+	// flush, unmount).
+	uint64_t EffectiveSize(const Stat &st);
+	void SetPendingSize(uint64_t inode, uint64_t size);   // 0 = none
+	uint64_t PendingSize(uint64_t inode);
+	int ApplyPendingSize(uint64_t inode);
+	void ApplyAllPendingSizes();
+
 	const MountOptions &Options() const { return m_opts; }
 	FSP_FILE_SYSTEM *FileSystem() { return m_fs; }
 
@@ -83,6 +94,9 @@ private:
 	// volume.
 	std::mutex m_cache_mutex;
 	std::unordered_map<std::wstring, std::pair<uint64_t, std::wstring>> m_dir_cache;
+
+	std::mutex m_pending_mutex;
+	std::unordered_map<uint64_t, uint64_t> m_pending_size;   // inode -> size Windows set
 };
 
 // Loads winfsp-x64.dll from the WinFsp install directory (delay-loaded).

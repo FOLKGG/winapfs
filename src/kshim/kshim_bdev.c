@@ -146,6 +146,13 @@ static int io(struct block_device *bdev, bool write, u64 off, void *buf, size_t 
 	InterlockedIncrement64(write ? &g_writes : &g_reads);
 	InterlockedAdd64(write ? &g_write_bytes : &g_read_bytes, (LONG64)len);
 
+	/* one event per thread (ReadFile/WriteFile reset it when the I/O starts) */
+	static __declspec(thread) HANDLE t_event;
+	if (!t_event)
+		t_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+	if (!t_event)
+		return -ENOMEM;
+
 	while (len > 0) {
 		OVERLAPPED ov = { 0 };
 		DWORD chunk = len > (1u << 30) ? (1u << 30) : (DWORD)len, done = 0;
@@ -153,14 +160,11 @@ static int io(struct block_device *bdev, bool write, u64 off, void *buf, size_t 
 
 		ov.Offset = (DWORD)off;
 		ov.OffsetHigh = (DWORD)(off >> 32);
-		ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+		ov.hEvent = t_event;
 		ok = write ? WriteFile(b->h, p, chunk, NULL, &ov) : ReadFile(b->h, p, chunk, NULL, &ov);
-		if (!ok && GetLastError() != ERROR_IO_PENDING) {
-			CloseHandle(ov.hEvent);
+		if (!ok && GetLastError() != ERROR_IO_PENDING)
 			return -EIO;
-		}
 		ok = GetOverlappedResult(b->h, &ov, &done, TRUE);
-		CloseHandle(ov.hEvent);
 		if (!ok || done != chunk)
 			return -EIO;
 		p += chunk;
@@ -320,6 +324,7 @@ int kshim_bdev_flush(struct block_device *bdev)
 	struct kshim_bdev *b = bdev->kshim_dev;
 	if (!b->writable)
 		return 0;
+	kshim_unplug();   /* queued writes belong before the barrier */
 	if (g_crash.how == CRASH_POWER) {
 		AcquireSRWLockExclusive(&g_crash.lock);
 		crash_apply(bdev, false);

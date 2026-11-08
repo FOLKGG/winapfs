@@ -348,6 +348,54 @@ bool ApfsFs::StreamVisible(const Stat &st, const std::string &xattr)
 	return false;
 }
 
+uint64_t ApfsFs::PendingSize(uint64_t inode)
+{
+	std::lock_guard<std::mutex> lock(m_pending_mutex);
+	auto it = m_pending_size.find(inode);
+	return it == m_pending_size.end() ? 0 : it->second;
+}
+
+void ApfsFs::SetPendingSize(uint64_t inode, uint64_t size)
+{
+	std::lock_guard<std::mutex> lock(m_pending_mutex);
+	if (size)
+		m_pending_size[inode] = size;
+	else
+		m_pending_size.erase(inode);
+}
+
+uint64_t ApfsFs::EffectiveSize(const Stat &st)
+{
+	if (st.type != FileType::File)
+		return st.size;
+	return std::max<uint64_t>(st.size, PendingSize(st.inode));
+}
+
+// Makes a pending size real (if the writes didn't get there) and forgets it.
+int ApfsFs::ApplyPendingSize(uint64_t inode)
+{
+	uint64_t want = PendingSize(inode);
+	if (!want)
+		return 0;
+	SetPendingSize(inode, 0);
+	Stat st;
+	if (!m_vol->GetStat(inode, st) || st.size >= want)
+		return 0;
+	return m_vol->SetSize(inode, want);
+}
+
+void ApfsFs::ApplyAllPendingSizes()
+{
+	std::vector<uint64_t> inodes;
+	{
+		std::lock_guard<std::mutex> lock(m_pending_mutex);
+		for (const auto &kv : m_pending_size)
+			inodes.push_back(kv.first);
+	}
+	for (uint64_t ino : inodes)
+		ApplyPendingSize(ino);
+}
+
 void ApfsFs::FillFileInfo(const Stat &st, const std::string &name, FSP_FSCTL_FILE_INFO &fi)
 {
 	uint64_t bs = m_block_size;
@@ -356,8 +404,10 @@ void ApfsFs::FillFileInfo(const Stat &st, const std::string &name, FSP_FSCTL_FIL
 	fi.ReparseTag = ReparseTag(st);
 	if (st.type == FileType::File)
 	{
-		fi.FileSize = st.size;
+		fi.FileSize = EffectiveSize(st);
 		fi.AllocationSize = st.compressed ? (st.size + bs - 1) / bs * bs : st.alloc_size;
+		if (fi.FileSize > st.size && fi.AllocationSize < fi.FileSize)
+			fi.AllocationSize = (fi.FileSize + bs - 1) / bs * bs;   // pending growth
 	}
 	fi.CreationTime = NsToFileTime(st.create_ns);
 	fi.LastAccessTime = NsToFileTime(st.access_ns);
@@ -790,6 +840,7 @@ static NTSTATUS Overwrite(FSP_FILE_SYSTEM *fs, PVOID ctx, UINT32 attrs, BOOLEAN 
 		FillNodeInfo(self, node, *fi);
 		return Errno(err);
 	}
+	self->SetPendingSize(node->st.inode, 0);
 	err = self->Vol().SetSize(node->st.inode, 0);
 	Refresh(self, node);   // a compressed file is now a new inode
 	if (!err)
@@ -848,21 +899,24 @@ static NTSTATUS Write(FSP_FILE_SYSTEM *fs, PVOID ctx, PVOID buf, UINT64 off, ULO
 	if (node->st.type != FileType::File)
 		return STATUS_INVALID_DEVICE_REQUEST;
 	Refresh(self, node);
+	uint64_t size = self->EffectiveSize(node->st);   // includes a pending growth
 	if (to_eof)
-		off = node->st.size;
+		off = size;
 	if (constrained)
 	{
 		// paging I/O: never extends the file
-		if (off >= node->st.size)
+		if (off >= size)
 		{
 			self->FillFileInfo(node->st, node->name, *fi);
 			return STATUS_SUCCESS;
 		}
-		len = static_cast<ULONG>(std::min<uint64_t>(len, node->st.size - off));
+		len = static_cast<ULONG>(std::min<uint64_t>(len, size - off));
 	}
 	size_t written = 0;
 	int err = self->Vol().Write(node->st.inode, off, buf, len, written);
 	*transferred = static_cast<ULONG>(written);
+	if (written && off + written >= size)
+		self->SetPendingSize(node->st.inode, 0);   // the data reached the size Windows set
 	{
 		std::lock_guard<std::mutex> lock(node->mutex);
 		node->reader.reset();   // a compressed file was replaced by a plain copy
@@ -894,10 +948,29 @@ static NTSTATUS SetFileSize(FSP_FILE_SYSTEM *fs, PVOID ctx, UINT64 size, BOOLEAN
 		return Errno(err);
 	}
 	Refresh(self, node);
-	// an allocation size below the file size truncates (NTFS semantics);
-	// otherwise allocation requests are hints the engine doesn't need
-	if (!set_alloc || size < node->st.size)
-		err = self->Vol().SetSize(node->st.inode, size);
+	uint64_t cur = self->EffectiveSize(node->st);
+	if (set_alloc)
+	{
+		// an allocation size below the file size truncates (NTFS semantics);
+		// otherwise allocation requests are hints the engine doesn't need
+		if (size < cur)
+		{
+			self->SetPendingSize(node->st.inode, size > node->st.size ? size : 0);
+			if (size < node->st.size)
+				err = self->Vol().SetSize(node->st.inode, size);
+		}
+	}
+	else if (size > node->st.size && !node->st.compressed)
+	{
+		// growth: reported now, written by the data or applied at cleanup
+		self->SetPendingSize(node->st.inode, size);
+	}
+	else
+	{
+		self->SetPendingSize(node->st.inode, 0);
+		if (size != node->st.size)
+			err = self->Vol().SetSize(node->st.inode, size);
+	}
 	{
 		std::lock_guard<std::mutex> lock(node->mutex);
 		node->reader.reset();
@@ -956,6 +1029,13 @@ static VOID Cleanup(FSP_FILE_SYSTEM *fs, PVOID ctx, PWSTR name, ULONG flags)
 {
 	ApfsFs *self = Self(fs);
 	ApfsFs::Node *node = static_cast<ApfsFs::Node *>(ctx);
+	if (node->stream.empty() && node->st.type == FileType::File)
+	{
+		if (flags & FspCleanupDelete)
+			self->SetPendingSize(node->st.inode, 0);
+		else if (self->ApplyPendingSize(node->st.inode) && self->Options().debug)
+			fprintf(stderr, "set size of %ls failed\n", name ? name : L"?");
+	}
 	if (!(flags & FspCleanupDelete) || !name)
 		return;
 	if (!node->stream.empty())
@@ -1000,7 +1080,13 @@ static NTSTATUS Rename(FSP_FILE_SYSTEM *fs, PVOID ctx, PWSTR name, PWSTR new_nam
 static NTSTATUS Flush(FSP_FILE_SYSTEM *fs, PVOID ctx, FSP_FSCTL_FILE_INFO *fi)
 {
 	ApfsFs *self = Self(fs);
-	int err = self->Vol().Writable() ? self->Vol().Sync() : 0;
+	int err = 0;
+	if (ctx && self->Vol().Writable())
+		err = self->ApplyPendingSize(static_cast<ApfsFs::Node *>(ctx)->st.inode);
+	else if (self->Vol().Writable())
+		self->ApplyAllPendingSizes();   // volume flush
+	if (!err && self->Vol().Writable())
+		err = self->Vol().Sync();
 	if (ctx)
 	{
 		ApfsFs::Node *node = static_cast<ApfsFs::Node *>(ctx);
@@ -1056,12 +1142,20 @@ static NTSTATUS Read(FSP_FILE_SYSTEM *fs, PVOID ctx, PVOID buf, UINT64 off, ULON
 		reader = node->reader;
 	}
 
-	if (off >= reader->Size())
+	uint64_t size = std::max<uint64_t>(reader->Size(), self->PendingSize(node->st.inode));
+	if (off >= size)
 		return STATUS_END_OF_FILE;
 
 	size_t got = 0;
-	if (!reader->Read(off, buf, len, got))
+	if (off < reader->Size() && !reader->Read(off, buf, len, got))
 		return STATUS_FILE_CORRUPT_ERROR;
+	// a pending growth (see SetFileSize) reads as zeros
+	uint64_t want = std::min<uint64_t>(len, size - off);
+	if (got < want)
+	{
+		memset(static_cast<uint8_t *>(buf) + got, 0, static_cast<size_t>(want - got));
+		got = static_cast<size_t>(want);
+	}
 	*transferred = static_cast<ULONG>(got);
 	return STATUS_SUCCESS;
 }
@@ -1411,6 +1505,8 @@ void ApfsFs::Stop()
 	FspFileSystemStopDispatcher(m_fs);
 	FspFileSystemDelete(m_fs);
 	m_fs = nullptr;
+	if (m_vol->Writable())
+		ApplyAllPendingSizes();   // handles still open at unmount
 }
 
 std::wstring ApfsFs::MountPoint() const

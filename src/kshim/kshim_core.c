@@ -366,22 +366,47 @@ bool test_and_clear_bit(long nr, volatile void *addr)
 	return _interlockedbittestandreset64((volatile long long *)addr + nr / 64, nr % 64) != 0;
 }
 
-unsigned long find_next_zero_bit_le(const void *addr, unsigned long size, unsigned long offset)
+/*
+ * Little-endian bitmap searches, 64 bits at a time (x64 is little-endian, so
+ * a u64 load sees bit i of the bitmap as bit i % 64 of word i / 64). The
+ * driver's allocator scans a 32768-bit chunk bitmap from 0 for every block;
+ * bit-at-a-time this was 30% of a large write. invert: search for a zero.
+ */
+static unsigned long find_le(const void *addr, unsigned long size, unsigned long offset, bool invert)
 {
 	const u8 *p = addr;
-	for (; offset < size; offset++)
-		if (!((p[offset / 8] >> (offset % 8)) & 1))
-			return offset;
+	while (offset < size) {
+		unsigned long word = offset / 64, bit = offset % 64;
+		u64 w;
+		unsigned long idx;
+		if ((word + 1) * 64 <= size) {
+			memcpy(&w, p + word * 8, 8);
+		} else {
+			/* tail word: only the bytes inside the bitmap */
+			size_t bytes = (size_t)((size - word * 64 + 7) / 8);
+			w = 0;
+			memcpy(&w, p + word * 8, bytes);
+		}
+		if (invert)
+			w = ~w;
+		w &= ~0ull << bit;
+		if (w && _BitScanForward64(&idx, w)) {
+			unsigned long found = word * 64 + idx;
+			return found < size ? found : size;
+		}
+		offset = (word + 1) * 64;
+	}
 	return size;
+}
+
+unsigned long find_next_zero_bit_le(const void *addr, unsigned long size, unsigned long offset)
+{
+	return find_le(addr, size, offset, true);
 }
 
 unsigned long find_next_bit_le(const void *addr, unsigned long size, unsigned long offset)
 {
-	const u8 *p = addr;
-	for (; offset < size; offset++)
-		if ((p[offset / 8] >> (offset % 8)) & 1)
-			return offset;
-	return size;
+	return find_le(addr, size, offset, false);
 }
 
 long kshim_atomic_add(volatile long *p, long v)

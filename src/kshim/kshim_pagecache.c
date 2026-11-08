@@ -29,6 +29,7 @@
 
 #define RECLAIM_THRESHOLD	(64 * 1024)	/* folios (256 MiB) */
 #define RECLAIM_TARGET		(48 * 1024)
+#define RECLAIM_BACKOFF		4096		/* new folios before another pass that fell short */
 
 /* ------------------------------------------------------------ folio index (hash map) */
 
@@ -110,6 +111,7 @@ static void pmap_remove(struct pmap *pm, struct folio *f)
 static SRWLOCK g_mappings_lock = SRWLOCK_INIT;
 static LIST_HEAD(g_mappings);
 static volatile long g_nr_folios;
+static volatile long g_reclaim_at = RECLAIM_THRESHOLD;
 
 void kshim_mapping_init(struct address_space *m, struct inode *host)
 {
@@ -347,8 +349,18 @@ struct folio *__filemap_get_folio(struct address_space *m, pgoff_t index, unsign
 
 	if (!f)
 		return ERR_PTR(-ENOENT);
-	if (created && InterlockedIncrement(&g_nr_folios) > RECLAIM_THRESHOLD)
+	/*
+	 * Reclaim when over the threshold. A pass can free little while most
+	 * folios are dirty (a big write before its commit); without the
+	 * back-off every new folio rescanned the whole cache (60% of the CPU
+	 * time of a large write).
+	 */
+	if (created && InterlockedIncrement(&g_nr_folios) > g_reclaim_at) {
+		long next;
 		kshim_reclaim();
+		next = g_nr_folios + RECLAIM_BACKOFF;
+		InterlockedExchange(&g_reclaim_at, next > RECLAIM_THRESHOLD ? next : RECLAIM_THRESHOLD);
+	}
 	if (fgp & FGP_LOCK)
 		folio_lock(f);
 	return f;
@@ -570,6 +582,11 @@ void brelse(struct buffer_head *bh)
 		__brelse(bh);
 }
 
+int trylock_buffer(struct buffer_head *bh)
+{
+	return !test_and_set_bit(BH_Lock, &bh->b_state);
+}
+
 void lock_buffer(struct buffer_head *bh)
 {
 	while (test_and_set_bit(BH_Lock, &bh->b_state))
@@ -614,16 +631,100 @@ void end_buffer_write_sync(struct buffer_head *bh, int uptodate)
 	put_bh(bh);
 }
 
-/* Synchronous: the I/O is done and b_end_io called on return. */
+/*
+ * Block plugging for writes. The driver's commit submits every transaction
+ * buffer and then waits for each (wait_on_buffer); Linux's block layer merges
+ * the adjacent bios. Writes from submit_bh are queued per thread and written
+ * sorted and merged (≤ 1 MiB requests) when the thread waits on a buffer,
+ * submits a read, issues a flush barrier, or has queued PLUG_MAX buffers.
+ * Queued buffers are locked (under I/O) until their end_io runs.
+ */
+#define PLUG_MAX	4096
+#define PLUG_BYTES	(1u << 20)
+
+static __declspec(thread) struct buffer_head **t_plug;
+static __declspec(thread) size_t t_plug_n, t_plug_cap;
+
+static int plug_cmp(const void *a, const void *b)
+{
+	const struct buffer_head *x = *(struct buffer_head *const *)a, *y = *(struct buffer_head *const *)b;
+	if (x->b_bdev != y->b_bdev)
+		return x->b_bdev < y->b_bdev ? -1 : 1;
+	return x->b_blocknr < y->b_blocknr ? -1 : x->b_blocknr > y->b_blocknr;
+}
+
+void kshim_unplug(void)
+{
+	struct buffer_head **v = t_plug;
+	size_t n = t_plug_n, i;
+	u8 *bounce;
+
+	if (!n)
+		return;
+	t_plug_n = 0;   /* end_io callbacks may submit again */
+	qsort(v, n, sizeof(*v), plug_cmp);
+	bounce = _aligned_malloc(PLUG_BYTES, PAGE_SIZE);
+	for (i = 0; i < n;) {
+		struct buffer_head *first = v[i];
+		size_t j = i + 1, bytes = first->b_size, k;
+		int err;
+
+		while (bounce && j < n && v[j]->b_bdev == first->b_bdev && v[j]->b_size == first->b_size &&
+		       v[j]->b_blocknr == v[j - 1]->b_blocknr + 1 && bytes + v[j]->b_size <= PLUG_BYTES) {
+			bytes += v[j]->b_size;
+			j++;
+		}
+		if (j - i == 1) {
+			err = kshim_bdev_write(first->b_bdev, (u64)first->b_blocknr * first->b_size, first->b_data, first->b_size);
+		} else {
+			size_t pos = 0;
+			for (k = i; k < j; k++) {
+				memcpy(bounce + pos, v[k]->b_data, v[k]->b_size);
+				pos += v[k]->b_size;
+			}
+			err = kshim_bdev_write(first->b_bdev, (u64)first->b_blocknr * first->b_size, bounce, bytes);
+		}
+		for (k = i; k < j; k++)
+			if (v[k]->b_end_io)
+				v[k]->b_end_io(v[k], err == 0);
+		i = j;
+	}
+	_aligned_free(bounce);
+}
+
+void wait_on_buffer(struct buffer_head *bh)
+{
+	kshim_unplug();
+	while (buffer_locked(bh))
+		SwitchToThread();   /* under I/O in another thread's plug */
+}
+
+/* Writes are queued (see above); reads are synchronous. */
 void submit_bh(unsigned int opf, struct buffer_head *bh)
 {
 	int err;
 	u64 off = (u64)bh->b_blocknr * bh->b_size;
 
-	if ((opf & REQ_OP_MASK) == REQ_OP_WRITE)
-		err = kshim_bdev_write(bh->b_bdev, off, bh->b_data, bh->b_size);
-	else
-		err = kshim_bdev_read(bh->b_bdev, off, bh->b_data, bh->b_size);
+	if ((opf & REQ_OP_MASK) == REQ_OP_WRITE) {
+		if (t_plug_n == t_plug_cap) {
+			size_t nc = t_plug_cap ? t_plug_cap * 2 : 256;
+			struct buffer_head **nv = realloc(t_plug, nc * sizeof(*nv));
+			if (!nv) {
+				err = kshim_bdev_write(bh->b_bdev, off, bh->b_data, bh->b_size);
+				if (bh->b_end_io)
+					bh->b_end_io(bh, err == 0);
+				return;
+			}
+			t_plug = nv;
+			t_plug_cap = nc;
+		}
+		t_plug[t_plug_n++] = bh;
+		if (t_plug_n >= PLUG_MAX)
+			kshim_unplug();
+		return;
+	}
+	kshim_unplug();   /* keep reads after earlier writes */
+	err = kshim_bdev_read(bh->b_bdev, off, bh->b_data, bh->b_size);
 	if (bh->b_end_io)
 		bh->b_end_io(bh, err == 0);
 }
@@ -749,16 +850,60 @@ static int write_folio_buffers(struct folio *f)
 	return err;
 }
 
+/* ------------------------------------------------------------ batched writeback */
+
+struct wb_ent {
+	struct buffer_head *bh;
+	struct folio *f;
+};
+
+static int wb_cmp(const void *a, const void *b)
+{
+	const struct buffer_head *x = ((const struct wb_ent *)a)->bh, *y = ((const struct wb_ent *)b)->bh;
+	if (x->b_bdev != y->b_bdev)
+		return x->b_bdev < y->b_bdev ? -1 : 1;
+	return x->b_blocknr < y->b_blocknr ? -1 : x->b_blocknr > y->b_blocknr;
+}
+
+#define WB_MAX_BYTES	(1u << 20)
+
+/* Ends the I/O of ents[0..n) (buffers locked, dirty bit already cleared). */
+static void wb_finish(struct wb_ent *ents, size_t n, int err)
+{
+	size_t i;
+	for (i = 0; i < n; i++) {
+		struct buffer_head *bh = ents[i].bh;
+		if (err) {
+			set_buffer_write_io_error(bh);
+			mark_buffer_dirty(bh);   /* still to be written */
+			folio_mark_dirty(ents[i].f);
+		} else {
+			set_buffer_uptodate(bh);
+		}
+		unlock_buffer(bh);
+		put_bh(bh);
+		folio_put(ents[i].f);
+	}
+}
+
+/*
+ * Writes every dirty buffer of a mapping, sorted by block and merged into
+ * requests of up to 1 MiB (Linux builds bios the same way). Writing buffer by
+ * buffer in hash order made each 4 KiB a separate device write. A buffer is
+ * locked from collection to completion, like a buffer under I/O in Linux.
+ */
 int kshim_mapping_writeback(struct address_space *m)
 {
 	struct pmap *pm = m->kshim_pages;
 	struct folio **list;
-	size_t i, n = 0;
+	struct wb_ent *ents = NULL;
+	size_t i, n = 0, ne = 0, cap = 0;
+	u8 *bounce = NULL;
 	int err = 0;
 
 	if (!pm)
 		return 0;
-	/* snapshot the dirty folios, then write without holding the map lock */
+	/* snapshot the dirty folios, then work without holding the map lock */
 	mutex_lock(&m->kshim_lock);
 	list = malloc((pm->count + 1) * sizeof(*list));
 	for (i = 0; i < pm->cap; i++) {
@@ -770,21 +915,85 @@ int kshim_mapping_writeback(struct address_space *m)
 	}
 	mutex_unlock(&m->kshim_lock);
 
+	/* collect the dirty buffers; a buffer someone else holds is written alone below */
 	for (i = 0; i < n; i++) {
 		struct folio *f = list[i];
-		int e;
+		struct buffer_head *head, *bh;
+		bool skipped = false;
+
 		folio_lock(f);
 		folio_clear_dirty_for_io(f);
-		e = write_folio_buffers(f);
-		if (e) {
-			folio_mark_dirty(f);
-			if (!err)
+		head = folio_buffers(f);
+		bh = head;
+		while (bh) {
+			if (buffer_mapped(bh) && buffer_dirty(bh)) {
+				if (!trylock_buffer(bh)) {
+					skipped = true;
+				} else if (!test_clear_buffer_dirty(bh)) {
+					unlock_buffer(bh);
+				} else {
+					if (ne == cap) {
+						size_t nc = cap ? cap * 2 : 256;
+						struct wb_ent *ne_ents = realloc(ents, nc * sizeof(*ents));
+						if (!ne_ents)
+							abort();
+						ents = ne_ents;
+						cap = nc;
+					}
+					get_bh(bh);
+					folio_get(f);
+					ents[ne].bh = bh;
+					ents[ne].f = f;
+					ne++;
+				}
+			}
+			bh = bh->b_this_page;
+			if (bh == head)
+				break;
+		}
+		if (skipped) {
+			int e = write_folio_buffers(f);   /* waits for those buffers */
+			if (e && !err)
 				err = e;
 		}
 		folio_unlock(f);
 		folio_put(f);
 	}
 	free(list);
+
+	qsort(ents, ne, sizeof(*ents), wb_cmp);
+	if (ne)
+		bounce = _aligned_malloc(WB_MAX_BYTES, PAGE_SIZE);
+	for (i = 0; i < ne;) {
+		struct buffer_head *first = ents[i].bh;
+		size_t j = i + 1, bytes = first->b_size;
+		int e;
+
+		while (bounce && j < ne && ents[j].bh->b_bdev == first->b_bdev &&
+		       ents[j].bh->b_size == first->b_size &&
+		       ents[j].bh->b_blocknr == ents[j - 1].bh->b_blocknr + 1 &&
+		       bytes + ents[j].bh->b_size <= WB_MAX_BYTES) {
+			bytes += ents[j].bh->b_size;
+			j++;
+		}
+		if (j - i == 1 || !bounce) {
+			e = kshim_bdev_write(first->b_bdev, (u64)first->b_blocknr * first->b_size, first->b_data, first->b_size);
+			j = i + 1;
+		} else {
+			size_t k, pos = 0;
+			for (k = i; k < j; k++) {
+				memcpy(bounce + pos, ents[k].bh->b_data, ents[k].bh->b_size);
+				pos += ents[k].bh->b_size;
+			}
+			e = kshim_bdev_write(first->b_bdev, (u64)first->b_blocknr * first->b_size, bounce, bytes);
+		}
+		if (e && !err)
+			err = -EIO;
+		wb_finish(ents + i, j - i, e);
+		i = j;
+	}
+	_aligned_free(bounce);
+	free(ents);
 	return err;
 }
 

@@ -13,6 +13,9 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 add_compile_definitions(_CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS UNICODE _UNICODE)
 add_compile_options(/utf-8 /MP)
+# PDBs in Release too (symbolized crash stacks, apfsrw-bench --profile); no effect on code
+add_compile_options($<$<CONFIG:Release>:/Zi>)
+add_link_options($<$<CONFIG:Release>:/DEBUG> $<$<CONFIG:Release>:/OPT:REF> $<$<CONFIG:Release>:/OPT:ICF>)
 
 set(TP ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 set(APFSFUSE ${TP}/apfs-fuse)

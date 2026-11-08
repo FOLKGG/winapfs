@@ -165,6 +165,10 @@ endforeach()
 
 # W3: writes with the linux-apfs-rw engine on image copies, read back through
 # both engines and checked with winapfs-fsck.
+add_executable(apfsrw-bench apfsrw_bench.cpp)
+target_link_libraries(apfsrw-bench PRIVATE apfsrw dbghelp)
+target_link_options(apfsrw-bench PRIVATE /ENTRY:wmainCRTStartup)
+
 add_executable(apfsrw-writetest writetest.cpp)
 target_link_libraries(apfsrw-writetest PRIVATE winapfs_core apfsrw bcrypt dbghelp)
 target_include_directories(apfsrw-writetest PRIVATE ${TP})
@@ -250,3 +254,17 @@ foreach(v "basic.img|basic|Basic" "casesensitive.img|casesensitive|CaseSens")
 	add_test(NAME diskfull_fsck.${img} COMMAND winapfs-fsck -c ${work})
 	set_tests_properties(diskfull_verify.${img} diskfull_fsck.${img} PROPERTIES FIXTURES_REQUIRED full-${img})
 endforeach()
+
+# the Windows write pattern: size first, then data (pending growth -> few extents)
+if(TARGET winapfs)
+	foreach(v "basic.img|Basic" "casesensitive.img|CaseSens")
+		string(REPLACE "|" ";" f "${v}")
+		list(GET f 0 img)
+		list(GET f 1 vol)
+		add_test(NAME prealloc.${img}
+			COMMAND powershell -NoProfile -ExecutionPolicy Bypass -File ${CMAKE_CURRENT_SOURCE_DIR}/prealloc_test.ps1
+				-Winapfs $<TARGET_FILE:winapfs> -Fsck $<TARGET_FILE:winapfs-fsck>
+				-Image ${TD}/${img} -Work ${CMAKE_CURRENT_BINARY_DIR}/prealloc-${img} -Volume ${vol})
+		set_tests_properties(prealloc.${img} PROPERTIES RESOURCE_LOCK winfsp_mount)
+	endforeach()
+endif()

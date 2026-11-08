@@ -189,8 +189,10 @@ int sync_dirty_buffer(struct buffer_head *bh);
 int __sync_dirty_buffer(struct buffer_head *bh, unsigned int op_flags);
 void write_dirty_buffer(struct buffer_head *bh, unsigned int op_flags);
 void lock_buffer(struct buffer_head *bh);
+int trylock_buffer(struct buffer_head *bh);
 void unlock_buffer(struct buffer_head *bh);
-static inline void wait_on_buffer(struct buffer_head *bh) { (void)bh; }
+void wait_on_buffer(struct buffer_head *bh);   /* writes the calling thread's plug first */
+void kshim_unplug(void);
 void ll_rw_block(unsigned int op, int nr, struct buffer_head *bhs[]);
 int bh_read(struct buffer_head *bh, unsigned int op_flags);
 void bh_read_nowait(struct buffer_head *bh, unsigned int op_flags);

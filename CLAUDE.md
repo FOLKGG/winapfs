@@ -191,8 +191,7 @@ kshim_pagecache.c folios (one 4 KiB page, page-aligned), per-mapping hash, buffe
                   buffers; a plain malloc made batched reads fail and fall back to
                   4 KiB pages: ~40 MB/s on the user's USB SSD), and physically
                   adjacent extent pieces are merged into one read.
-                  Known: files written by the engine get one extent record per
-                  4 KiB block (600 MiB file: 153,600 records, writes ~15 MB/s).
+                  Writes: see "Performance" below.
 kshim_vfs.c       inode cache (iget5_locked & co), transient dentries, sget/super
                   lifecycle, sync_filesystem (write_inode, sync_fs 0, flush, sync_fs 1)
 apfsrw_api.c      C API (src/kshim/api/apfsrw.h): mount/unmount/sync/statfs, lookup,
@@ -426,6 +425,34 @@ Windows; ACLs are still the fixed SD, W7).
 Next: the user's macOS `fsck_apfs` check of images written here
 (`build/tests/w3-*.img`, `w32-*.img`, `crash-*.img`, `full-*.img` after a test
 run), then W5 (physical-disk writes).
+
+### Performance (2026-11-08, after the user's physical-disk copy test)
+
+Reads (see kshim_pagecache.c above): batched readahead, aligned bounce
+buffer, merged adjacent extents. Writes, measured with a 600 MiB copy
+through a `--rw` mount of an image (was 25 s, ~15-25 MB/s; now ~1.4 s,
+~450 MB/s; engine alone ~600 MB/s), fixed in this order:
+1. **One extent per block**: Windows sets the final size before writing
+   (CopyFile/Explorer). Growing the APFS file made every write land
+   mid-file, where the driver never extends its cached extent (upstream
+   TODO), so a 600 MiB file had 153,600 extent records. ApfsFs keeps such
+   growth pending (reported size, zero reads, applied at cleanup/flush/
+   unmount if the data didn't reach it): now 18 extents. `prealloc.*` tests
+   it (fails on the old build with ~2050 pieces).
+2. **Page cache reclaim**: a pass that freed little (dirty pages before the
+   commit) was retried on every new folio, a full cache scan each time (60%
+   of CPU). Now it backs off 4096 folios.
+3. **Bitmap search**: the shim's find_next_zero_bit_le went bit by bit over
+   the 32768-bit chunk bitmap per allocated block (30%). Now 64-bit words.
+4. **Write batching**: submit_bh queues writes per thread (block plugging);
+   wait_on_buffer, reads, flush barriers and 4096 queued buffers write them
+   sorted and merged (≤ 1 MiB). Mapping writeback sorts and merges too.
+   600 MiB: 153,703 device writes → 670. One Win32 event per thread for I/O.
+Remaining cost: FlushFileBuffers at each commit (every 64K buffers).
+Tools: `apfsrw-bench <img> <container offset> <vol index> <MiB> [chunk KiB]
+[--profile]` (engine write throughput; the profile samples the writer every
+~15 ms and symbolizes with the Release PDBs, which are now always built);
+`KSHIM_IOSTATS=1` (device reads/writes and readahead extent pieces at unmount).
 
 ## Milestones (read path)
 
