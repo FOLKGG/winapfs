@@ -57,7 +57,8 @@ src/core/winapfs/        winapfs_core: thread-safe layer over ApfsLib
   Gpt.*                  own GPT parser: all APFS partitions, 512/4096 sectors, CRCs
   Names.*                APFS UTF-8 <-> Windows UTF-16 name mapping
 src/cli/                 winapfs-cli: info | list | cat | xattr
-src/mount/               winapfs: WinFsp front-end (ApfsFs) + `mount` command
+src/mount/               winapfs: WinFsp front-end (ApfsFs), `mount`, Mount.cpp
+                         (shared volume opening), Service.cpp (`service`)
 tests/verify.cpp         winapfs-verify: manifest checker (image or mounted dir)
 ```
 
@@ -163,7 +164,7 @@ Read-write milestones (after M1–M3):
     the unmodified WinFsp installer, on condition that (a) winapfs shows
     "WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos"
     plus a link to github.com/winfsp/winfsp in its UI and user-facing docs
-    (TODO: --help/about box, README, installer), and (b) nothing proprietary
+    (done: `winapfs` usage text and README.md; TODO: installer UI), and (b) nothing proprietary
     is linked or bundled with it. Source must be published (GPL); file
     headers that say GPL-2.0-or-later can stay, the combination is GPL-2.0.
 
@@ -462,10 +463,50 @@ Windows; ACLs are still the fixed SD, W7).
   the flag; Win32 writes through \\.\PhysicalDrive2 with Windows' RAW volume
   locked; both engines 3484 entries / 0 problems; fsck -c clean).
 
-Next: the user's macOS `fsck_apfs` check of images written here
+Gate still open: the user's macOS `fsck_apfs` check of images written here
 (`build/tests/w3-*.img`, `w32-*.img`, `w5raw-*.img`, `w5-multivol.img`,
 `crash-*.img`, `full-*.img` after a test run); once it passes, physical-disk
-writes may drop the `--allow-disk-writes` requirement. Then W6/W7.
+writes may drop the `--allow-disk-writes` requirement.
+
+### W7 status: stage 1 (auto-mount service) done
+
+Stages: (1) service; (2) installer: WiX MSI (winapfs.exe, service, event
+source) + Burn bundle chaining the WinFsp MSI, WinFsp notice in the UI, clean
+uninstall, upgrades (WiX not installed yet: `dotnet tool install --global
+wix`); (3) per-user tray helper for encrypted volumes (password / recovery
+key, Credential Manager); (4) Explorer polish (icon, eject), ACLs from POSIX
+owner/mode, settings UI.
+
+`winapfs service install|uninstall|start|stop|status|run|debug`
+(src/mount/Service.cpp; same exe; README.md documents it):
+- LocalSystem, auto-start, restarts on failure, pre-shutdown 60 s. Event log
+  source `winapfs` (message table from messages.mc, compiled by the SDK's
+  mc.exe in CMake; `;//` for comments in .mc files).
+- `AutoMounter`: scans physical drives (or `--image`s in debug) for APFS
+  volumes; mounts new ones at the remembered letter (`HKLM\SOFTWARE\winapfs\
+  Volumes\<UUID>\DriveLetter`, else highest free); unmounts volumes whose disk
+  or UUID is gone. Read-write if `ReadWrite` (per volume or global) — on
+  physical disks also `AllowDiskWrites` — else read-only; a refused rw open
+  falls back to read-only; `Disabled`, `HideDotfiles`. Encrypted volumes are
+  skipped (stage 3). Skipped volumes are logged once per disk.
+- Events: disk-interface arrival/removal → rescan (after 1.5 s and 4.5 s,
+  plus every 60 s); a handle notification per mounted disk: query-remove /
+  remove-pending / remove-complete unmount that disk before answering, so
+  "Safely remove" and VHD detach work; query-remove-failed → rescan.
+- Read-write and read-only volumes of one container share the engine
+  container: kshim lets read-only mounts reuse a writable device (the driver
+  makes them read-only per superblock; the first mount sets the container's
+  flags), the service mounts a container's rw volumes first. Before, the ro
+  volume fell back to ApfsLib, a second independent reader.
+- Mount.cpp: OpenVolume shared by CLI and service (log sink, caller-owned
+  DiskLocks). winapfs `--help` ends with the WinFsp notice.
+- Tests: `service.automount` (service debug on image copies with
+  `WINAPFS_CONFIG_HKCU=1` → HKCU\Software\winapfs-test: mounts everything,
+  remembers letters, honours Disabled/DriveLetter/ReadWrite, shares the
+  container, fsck clean). `tests\service_admin_test.ps1` (elevated): installs
+  the real service, attaches a VHD copy, waits for the drive, detaches, checks
+  the drive goes, uninstalls (not yet run). VHD helpers moved to
+  tests\vhd_helpers.ps1.
 
 ### Performance (2026-11-08, after the user's physical-disk copy test)
 

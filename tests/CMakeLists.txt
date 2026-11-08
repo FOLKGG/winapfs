@@ -314,3 +314,11 @@ if(TARGET winapfs)
 	add_test(NAME w5_multivol_read COMMAND winapfs-cli cat ${mvwork} /VolC.bin -v VolC)
 	set_tests_properties(w5_multivol_fsck w5_multivol_read PROPERTIES FIXTURES_REQUIRED w5mv)
 endif()
+
+# W7: the auto-mount service's logic (service debug on images, settings in HKCU)
+if(TARGET winapfs)
+	add_test(NAME service.automount
+		COMMAND powershell -NoProfile -ExecutionPolicy Bypass -File ${CMAKE_CURRENT_SOURCE_DIR}/service_test.ps1
+			-Winapfs $<TARGET_FILE:winapfs> -Fsck $<TARGET_FILE:winapfs-fsck> -Testdata ${TD} -WorkDir ${CMAKE_CURRENT_BINARY_DIR})
+	set_tests_properties(service.automount PROPERTIES RESOURCE_LOCK winfsp_mount PASS_REGULAR_EXPRESSION "OK: auto-mount")
+endif()

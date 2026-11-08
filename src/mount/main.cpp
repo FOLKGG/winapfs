@@ -2,11 +2,12 @@
 // Copyright (C) 2026 winapfs contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
-// winapfs: mount APFS volumes read-only through WinFsp.
+// winapfs: mount APFS volumes through WinFsp; `winapfs service` auto-mounts.
 
 #include "ApfsFs.h"
+#include "Mount.h"
+#include "Service.h"
 
-#include <winapfs/DiskLock.h>
 #include <winapfs/Names.h>
 
 #include <ApfsLib/Util.h>
@@ -26,12 +27,13 @@ static HANDLE g_stop_event;
 static void Usage()
 {
 	fprintf(stderr,
-		"winapfs - mount APFS volumes read-only (WinFsp)\n"
+		"winapfs - APFS volumes on Windows (WinFsp)\n"
 		"\n"
 		"usage:\n"
 		"  winapfs list [<image|\\\\.\\PhysicalDriveN>...]\n"
 		"  winapfs mount <image|\\\\.\\PhysicalDriveN> [X:|dir|*] [options]\n"
 		"  winapfs mount-all [<image|\\\\.\\PhysicalDriveN>...] [options]\n"
+		"  winapfs service install|uninstall|start|stop|status|debug   (see winapfs service)\n"
 		"\n"
 		"Without a source, list and mount-all scan every physical disk for APFS\n"
 		"partitions (GPT type 7C3457EF-0000-11AA-AA11-00306543ECAC). Raw disk access\n"
@@ -44,7 +46,12 @@ static void Usage()
 		"                             instead of a free drive letter\n"
 		"  -p, --password <pw>        password or recovery key for encrypted volumes\n"
 		"  --ask                      prompt for the password of encrypted volumes\n"
-		"  --rw                       mount read-write (experimental; image files only)\n"
+		"  --rw                       mount read-write (experimental). Refused when the disk\n"
+		"                             was not ejected cleanly, and for system, Time Machine,\n"
+		"                             sealed, encrypted and Fusion volumes\n"
+		"  --allow-disk-writes        with --rw: also write to physical disks (have a backup)\n"
+		"  --force                    with --rw: write although the disk was not ejected\n"
+		"                             cleanly (only if no Mac is hibernated on it)\n"
 		"  --engine auto|rw|lib       auto (default): linux-apfs-rw, or apfs-fuse for\n"
 		"                             encrypted volumes; rw or lib forces one\n"
 		"  --hide-dotfiles            mark names starting with '.' hidden\n"
@@ -53,7 +60,10 @@ static void Usage()
 		"                             environment gets WINAPFS_MOUNT_<volume>=<mount point>\n"
 		"  -d, --debug                WinFsp debug log to stderr\n"
 		"\n"
-		"Without --run, stays mounted until Ctrl+C.\n");
+		"Without --run, stays mounted until Ctrl+C.\n"
+		"\n"
+		"winapfs is free software (GPL-2.0). It uses:\n"
+		"%s\n", kWinFspNotice);
 }
 
 static BOOL WINAPI CtrlHandler(DWORD)
@@ -108,17 +118,10 @@ static bool ParseArgs(const std::vector<std::wstring> &argv, Args &a)
 	return true;
 }
 
-static std::string EnvName(const std::string &vol)
-{
-	std::string n = "WINAPFS_MOUNT_";
-	for (char c : vol)
-		n.push_back(isalnum(static_cast<unsigned char>(c)) ? c : '_');
-	return n;
-}
-
 // Mounted file systems plus the containers they read from.
 struct Session
 {
+	DiskLocks locks;   // first member: released after everything that writes
 	std::vector<std::unique_ptr<Container>> containers;
 	std::vector<std::unique_ptr<ApfsFs>> mounts;
 
@@ -166,107 +169,17 @@ struct Session
 	}
 };
 
-// Opens a volume, asking for a password when allowed. Returns null (with a
-// message) if it cannot be opened.
-static std::unique_ptr<Volume> OpenVolume(Container &c, const VolumeInfo &vi, const Args &a)
+static OpenOptions Opts(const Args &a, Session &s)
 {
-	std::string pw = a.password;
-	std::string err;
-
-	if (a.rw)
-	{
-		// physical disks: opt-in until macOS fsck_apfs has passed on images written here
-		bool raw = c.Path().compare(0, 4, "\\\\.\\") == 0;
-		if (raw && !a.allow_disk_writes)
-		{
-			fprintf(stderr, "%s: writing to physical disks is experimental; add --allow-disk-writes "
-				"(and have a backup), or mount without --rw\n", vi.name.c_str());
-			return nullptr;
-		}
-		if (a.engine == "lib")
-		{
-			fprintf(stderr, "%s: --rw needs the linux-apfs-rw engine\n", vi.name.c_str());
-			return nullptr;
-		}
-		std::string why = c.WriteRefusal(vi, a.force);
-		if (!why.empty())
-		{
-			fprintf(stderr, "%s: not writable: %s\n", vi.name.c_str(), why.c_str());
-			return nullptr;
-		}
-		if (!c.CleanlyUnmounted())
-			fprintf(stderr, "%s: warning: writing to a disk that was not ejected cleanly (--force)\n", vi.name.c_str());
-		if (raw)
-		{
-			// Windows' RAW volume on the partition must be locked (once per partition)
-			static std::vector<std::pair<std::string, std::unique_ptr<DiskWriteLock>>> locks;
-			std::string key = c.Path() + "@" + std::to_string(c.PartitionOffset());
-			bool have = false;
-			for (const auto &l : locks)
-				have = have || l.first == key;
-			if (!have)
-			{
-				std::unique_ptr<DiskWriteLock> lock = DiskWriteLock::Acquire(c.Path(), c.PartitionOffset(), c.PartitionSize(), err);
-				if (!lock)
-				{
-					fprintf(stderr, "%s: %s\n", vi.name.c_str(), err.c_str());
-					return nullptr;
-				}
-				locks.emplace_back(key, std::move(lock));
-			}
-		}
-		std::unique_ptr<Volume> v = OpenRwVolume(c, vi.fsid, true, err);
-		if (!v)
-		{
-			fprintf(stderr, "%s: %s\n", vi.name.c_str(), err.c_str());
-			return nullptr;
-		}
-		if (!v->Writable())
-		{
-			// the engine falls back to read-only on its own refusals (see its messages)
-			fprintf(stderr, "%s: the engine opened it read-only; not mounting with --rw\n", vi.name.c_str());
-			return nullptr;
-		}
-		return v;
-	}
-
-	// linux-apfs-rw for everything it supports; ApfsLib for encrypted volumes
-	if (a.engine == "rw" || (a.engine == "auto" && !vi.encrypted))
-	{
-		std::unique_ptr<Volume> v = OpenRwVolume(c, vi.fsid, false, err);
-		if (v || a.engine == "rw")
-		{
-			if (!v)
-				fprintf(stderr, "%s: %s\n", vi.name.c_str(), err.c_str());
-			return v;
-		}
-		fprintf(stderr, "%s: %s; falling back to apfs-fuse\n", vi.name.c_str(), err.c_str());
-	}
-
-	for (int attempt = 0; attempt < 3; attempt++)
-	{
-		if (vi.encrypted && pw.empty() && a.ask)
-		{
-			if (!vi.password_hint.empty())
-				fprintf(stderr, "Hint: %s\n", vi.password_hint.c_str());
-			fprintf(stderr, "Password (or recovery key) for %s: ", vi.name.c_str());
-			GetPassword(pw);
-		}
-		if (vi.encrypted && pw.empty())
-		{
-			fprintf(stderr, "skipping encrypted volume %s (use --ask or --password)\n", vi.name.c_str());
-			return nullptr;
-		}
-		std::unique_ptr<Volume> v = c.OpenVolume(vi.fsid, pw, err);
-		if (v)
-			return v;
-		if (!vi.encrypted || !a.ask)
-			break;
-		fprintf(stderr, "%s\n", err.c_str());
-		pw.clear();
-	}
-	fprintf(stderr, "%s: %s\n", vi.name.c_str(), err.c_str());
-	return nullptr;
+	OpenOptions o;
+	o.rw = a.rw;
+	o.allow_disk_writes = a.allow_disk_writes;
+	o.force = a.force;
+	o.engine = a.engine;
+	o.password = a.password;
+	o.ask = a.ask;
+	o.locks = &s.locks;
+	return o;
 }
 
 static bool MountOne(Session &s, std::unique_ptr<Volume> vol, const std::wstring &mount_point, const MountOptions &opts)
@@ -282,7 +195,7 @@ static bool MountOne(Session &s, std::unique_ptr<Volume> vol, const std::wstring
 	std::wstring mp = fs->MountPoint();
 	fprintf(stderr, "mounted %s at %ls (%s, %s)\n", name.c_str(), mp.c_str(),
 		fs->Vol().Writable() ? "read-write, experimental" : "read-only", fs->Vol().EngineName());
-	SetEnvironmentVariableW(Utf8ToWide(EnvName(name)).c_str(), mp.c_str());
+	SetEnvironmentVariableW(Utf8ToWide(MountEnvName(name)).c_str(), mp.c_str());
 	s.mounts.push_back(std::move(fs));
 	return true;
 }
@@ -381,11 +294,11 @@ static int CmdMount(const Args &a)
 	Args aa = a;
 	// a single explicit volume: offer the prompt when there is someone to answer it
 	aa.ask = a.ask || (a.password.empty() && _isatty(_fileno(stdin)));
-	std::unique_ptr<Volume> vol = OpenVolume(*c, *vi, aa);
+	Session s;
+	std::unique_ptr<Volume> vol = OpenVolume(*c, *vi, Opts(aa, s));
 	if (!vol)
 		return 1;
 
-	Session s;
 	s.containers.push_back(std::move(c));
 	if (!MountOne(s, std::move(vol), a.positional.size() > 1 ? a.positional[1] : L"*", a.opts))
 		return 1;
@@ -429,7 +342,7 @@ static int CmdMountAll(const Args &a)
 			}
 			for (const auto &vi : c->Volumes())
 			{
-				std::unique_ptr<Volume> vol = OpenVolume(*c, vi, a);
+				std::unique_ptr<Volume> vol = OpenVolume(*c, vi, Opts(a, s));
 				if (!vol)
 				{
 					failures++;
@@ -501,6 +414,8 @@ int wmain(int argc, wchar_t **wargv)
 		return 2;
 	}
 	std::wstring cmd = wargv[1];
+	if (cmd == L"service")
+		return CmdService(std::vector<std::wstring>(wargv + 2, wargv + argc));
 	Args a;
 	if (!ParseArgs(std::vector<std::wstring>(wargv + 2, wargv + argc), a))
 	{

@@ -60,9 +60,14 @@ int kshim_bdev_register(const wchar_t *path, u64 offset, u64 size, bool writable
 	for (i = 0; i < MAX_BDEVS; i++) {
 		struct kshim_bdev *b = &g_bdevs[i];
 		if (b->used && b->offset == offset && !_wcsicmp(b->path, path)) {
-			if (b->writable != writable) {
+			/*
+			 * A read-only volume may share a writable device (the driver
+			 * makes it read-only through its superblock); a read-write
+			 * mount can't use a device opened read-only.
+			 */
+			if (writable && !b->writable) {
 				ReleaseSRWLockExclusive(&g_bdev_lock);
-				return -EBUSY;   /* the driver can't mix read-only and read-write mounts */
+				return -EBUSY;
 			}
 			b->regs++;
 			snprintf(name, name_size, "kshim:%d", i);
