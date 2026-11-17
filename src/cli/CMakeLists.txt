@@ -1,4 +1,4 @@
-add_executable(winapfs-cli main.cpp)
+add_executable(winapfs-cli main.cpp ${CMAKE_SOURCE_DIR}/assets/app_icon.rc)
 target_link_libraries(winapfs-cli PRIVATE winapfs_core)
 target_compile_options(winapfs-cli PRIVATE /W4 /wd4100)
 target_link_options(winapfs-cli PRIVATE /ENTRY:wmainCRTStartup)

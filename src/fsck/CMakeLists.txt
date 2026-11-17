@@ -4,7 +4,7 @@ file(GLOB APFSCK_SRC ${APFSPROGS}/apfsck/*.c)
 file(GLOB APFSPROGS_LIB_SRC ${APFSPROGS}/lib/*.c)
 set(FSCK_C_SRC compat.c ${APFSCK_SRC} ${APFSPROGS_LIB_SRC})
 
-add_executable(winapfs-fsck main.cpp ${FSCK_C_SRC})
+add_executable(winapfs-fsck main.cpp ${FSCK_C_SRC} ${CMAKE_SOURCE_DIR}/assets/app_icon.rc)
 set_target_properties(winapfs-fsck PROPERTIES C_STANDARD 23)
 # compat/ shadows POSIX headers. Per-source so the C++ front-end never sees it
 # (the VS generator does not support $<COMPILE_LANGUAGE> in include paths).

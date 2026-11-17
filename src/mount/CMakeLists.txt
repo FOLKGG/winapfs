@@ -30,6 +30,7 @@ add_executable(winapfs
 	ApfsFs.cpp
 	ApfsFs.h
 	messages.mc
+	${CMAKE_SOURCE_DIR}/assets/app_icon.rc
 	${MC_OUT}/messages.h
 	${MC_OUT}/messages.rc)
 target_include_directories(winapfs PRIVATE ${MC_OUT})

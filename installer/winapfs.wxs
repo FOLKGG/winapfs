@@ -35,7 +35,11 @@
     <Launch Condition="Installed OR WINFSPDIR"
             Message="winapfs needs WinFsp (Windows File System Proxy). Install it from https://winfsp.dev, or use winapfs-setup.exe, which installs both." />
 
-    <Property Id="ARPURLINFOABOUT" Value="https://github.com/winfsp/winfsp" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/christofilojohn/winapfs" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/christofilojohn/winapfs/issues" />
+    <!-- the logo in Settings > Apps and on the Start-menu shortcut -->
+    <Icon Id="WinapfsIcon" SourceFile="$(sys.SOURCEFILEDIR)..\assets\winapfs.ico" />
+    <Property Id="ARPPRODUCTICON" Value="WinapfsIcon" />
     <Property Id="ARPCOMMENTS" Value="APFS (Mac) disks on Windows. Uses WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos." />
 
     <StandardDirectory Id="ProgramFiles64Folder">
@@ -91,7 +95,7 @@
     <StandardDirectory Id="ProgramMenuFolder">
       <Component Id="StartMenu" Bitness="always64">
         <Shortcut Id="TrayShortcut" Name="winapfs" Description="APFS (Mac) disks: the winapfs tray"
-                  Target="[#TrayExe]" WorkingDirectory="INSTALLFOLDER" />
+                  Target="[#TrayExe]" WorkingDirectory="INSTALLFOLDER" Icon="WinapfsIcon" />
         <RegistryValue Root="HKLM" Key="SOFTWARE\winapfs\Installer" Name="StartMenu" Type="integer" Value="1" KeyPath="yes" />
       </Component>
     </StandardDirectory>
@@ -105,6 +109,8 @@
          the last page offers to start the tray (as the user, not elevated) -->
     <ui:WixUI Id="WixUI_Minimal" />
     <WixVariable Id="WixUILicenseRtf" Value="$(var.ObjDir)\license.rtf" />
+    <WixVariable Id="WixUIDialogBmp" Value="$(sys.SOURCEFILEDIR)..\assets\installer-dialog.bmp" />
+    <WixVariable Id="WixUIBannerBmp" Value="$(sys.SOURCEFILEDIR)..\assets\installer-banner.bmp" />
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Start winapfs (the tray app)" />
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
     <Property Id="WixShellExecTarget" Value="[#TrayExe]" />

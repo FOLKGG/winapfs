@@ -262,6 +262,14 @@ INT_PTR CALLBACK UnlockProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
 		SetWindowLongPtrW(dlg, DWLP_USER, lp);
 		SetDlgItemTextW(dlg, IDC_UNLOCK_TEXT, (L"\"" + d->name + L"\" is encrypted. Enter its password or recovery key:").c_str());
 		SetDlgItemTextW(dlg, IDC_HINT, L"The password is sent to the winapfs service on this PC only.");
+		static HICON small_icon = nullptr, big_icon = nullptr;   // loaded once, kept
+		if (!small_icon)
+		{
+			LoadIconMetric(g_inst, MAKEINTRESOURCEW(IDI_APP), LIM_SMALL, &small_icon);
+			LoadIconMetric(g_inst, MAKEINTRESOURCEW(IDI_APP), LIM_LARGE, &big_icon);
+		}
+		SendMessageW(dlg, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(small_icon));
+		SendMessageW(dlg, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(big_icon));
 		SetForegroundWindow(dlg);
 		SetFocus(GetDlgItem(dlg, IDC_PASSWORD));
 		return FALSE;
@@ -308,7 +316,14 @@ void About()
 		L"Uses WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos\n"
 		L"https://github.com/winfsp/winfsp\n\n"
 		L"Writing to APFS disks is experimental: keep a backup.";
-	MessageBoxW(g_wnd, text.c_str(), L"About winapfs", MB_OK | MB_ICONINFORMATION);
+	MSGBOXPARAMSW mb = { sizeof(mb) };
+	mb.hwndOwner = g_wnd;
+	mb.hInstance = g_inst;
+	mb.lpszText = text.c_str();
+	mb.lpszCaption = L"About winapfs";
+	mb.dwStyle = MB_OK | MB_USERICON;
+	mb.lpszIcon = MAKEINTRESOURCEW(IDI_APP);
+	MessageBoxIndirectW(&mb);
 }
 
 void ShowMenu()
@@ -548,14 +563,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
 	g_taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
 	ChangeWindowMessageFilterEx(g_wnd, g_taskbar_created, MSGFLT_ALLOW, nullptr);
 
-	SHSTOCKICONINFO sii = { sizeof(sii) };
-	SHGetStockIconInfo(SIID_DRIVEREMOVE, SHGSI_ICON | SHGSI_SMALLICON, &sii);
+	// the logo, at the notification area's size for this DPI
+	HICON tray_icon = nullptr;
+	if (FAILED(LoadIconMetric(inst, MAKEINTRESOURCEW(IDI_APP), LIM_SMALL, &tray_icon)))
+		tray_icon = LoadIconW(nullptr, IDI_APPLICATION);
 	g_nid.cbSize = sizeof(g_nid);
 	g_nid.hWnd = g_wnd;
 	g_nid.uID = 1;
 	g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
 	g_nid.uCallbackMessage = WM_TRAY;
-	g_nid.hIcon = sii.hIcon;
+	g_nid.hIcon = tray_icon;
 	wcscpy_s(g_nid.szTip, L"winapfs");
 	AddIcon();
 
@@ -568,8 +585,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
 		TranslateMessage(&msg);
 		DispatchMessageW(&msg);
 	}
-	if (sii.hIcon)
-		DestroyIcon(sii.hIcon);
+	if (tray_icon)
+		DestroyIcon(tray_icon);
 	CloseHandle(single);
 	return 0;
 }

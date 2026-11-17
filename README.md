@@ -218,6 +218,9 @@ winapfs uses WinFsp under its FLOSS exception:
 trademark of Microsoft Corporation. winapfs is an independent project, not
 affiliated with or endorsed by either.*
 
+*winapfs was developed with the help of Claude Opus 5.5, an AI model by
+Anthropic, used for writing code, tests and documentation.*
+
 ## Contributing
 
 Bug reports are very welcome, especially from real disks. Please include
