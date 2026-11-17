@@ -28,6 +28,14 @@ It is free software, built on the Linux APFS driver
 mode on Windows through [WinFsp](https://winfsp.dev). No kernel driver of its own,
 no driver signing, nothing proprietary.
 
+> [!WARNING]
+> **Experimental software. Use it at your own risk.** winapfs is beta, and
+> writing to APFS disks is experimental: a bug could corrupt a volume and lose
+> data. **Back up anything you care about before connecting a disk, and before
+> enabling writes.** Disks mount read-only by default; leave them that way if you
+> only need to copy files off. winapfs comes with no warranty (see
+> [No warranty](#no-warranty)).
+
 ## Features
 
 - **Automatic mounting.** A background service mounts every APFS volume when a
@@ -200,6 +208,17 @@ The exact versions, local patches and full licence texts are listed in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Apple's
 [APFS Reference](https://developer.apple.com/support/downloads/Apple-File-System-Reference.pdf)
 documents the on-disk format.
+
+## No warranty
+
+winapfs is experimental software provided **"as is", without warranty of any
+kind**, express or implied, including fitness for a particular purpose. Writing
+to APFS volumes is experimental and has not yet been validated by Apple's own
+`fsck_apfs`; reading has been tested extensively, but no file system driver is
+free of bugs. **You use winapfs at your own risk**: the authors and contributors
+are not liable for any loss or corruption of data, or any other damage, arising
+from its use (GPL-2.0, sections 11 and 12). Keep backups, eject disks properly
+before unplugging them, and do not write to a disk you cannot afford to lose.
 
 ## Licence
 
