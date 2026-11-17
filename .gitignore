@@ -7,3 +7,4 @@
 /testdata/*.img
 *.errors
 dist/
+/winapfs-testdata/
