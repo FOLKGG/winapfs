@@ -152,10 +152,59 @@ static void free_buffer_ring(struct folio *f)
 	f->page.private = NULL;
 }
 
+/*
+ * Folio data pages: 4 KiB from 2 MiB VirtualAlloc blocks, freed pages kept on
+ * a lock-free list for reuse. _aligned_malloc(4096, 4096) costs about 8 KiB
+ * per page (twice the data). The pool keeps its peak size (bounded by the
+ * page-cache reclaim) for the life of the process.
+ */
+static SLIST_HEADER g_free_pages;
+static INIT_ONCE g_page_once = INIT_ONCE_STATIC_INIT;
+static SRWLOCK g_page_lock = SRWLOCK_INIT;
+static char *g_page_block;
+static size_t g_page_block_left;
+
+static BOOL CALLBACK page_pool_init(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+	(void)once; (void)param; (void)ctx;
+	InitializeSListHead(&g_free_pages);
+	return TRUE;
+}
+
+static void *page_alloc(void)
+{
+	PSLIST_ENTRY e;
+	void *p = NULL;
+	InitOnceExecuteOnce(&g_page_once, page_pool_init, NULL, NULL);
+	e = InterlockedPopEntrySList(&g_free_pages);
+	if (e)
+		return e;
+	AcquireSRWLockExclusive(&g_page_lock);
+	if (!g_page_block_left) {
+		g_page_block = VirtualAlloc(NULL, 2u << 20, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+		g_page_block_left = g_page_block ? (2u << 20) / PAGE_SIZE : 0;
+	}
+	if (g_page_block_left) {
+		p = g_page_block;
+		g_page_block += PAGE_SIZE;
+		g_page_block_left--;
+	}
+	ReleaseSRWLockExclusive(&g_page_lock);
+	if (!p)
+		abort();   /* out of memory */
+	return p;
+}
+
+static void page_free(void *p)
+{
+	if (p)
+		InterlockedPushEntrySList(&g_free_pages, (PSLIST_ENTRY)p);
+}
+
 static void folio_free(struct folio *f)
 {
 	free_buffer_ring(f);   /* none left normally: buffers hold a reference */
-	_aligned_free(f->page.data);
+	page_free(f->page.data);
 	free(f);
 	InterlockedDecrement(&g_nr_folios);
 }
@@ -239,8 +288,17 @@ static long drop_clean(struct address_space *m, long want)
 		struct folio *f = pm->slots[i];
 		if (!f || f == TOMBSTONE)
 			continue;
-		if (atomic_read(&f->page.refcount) != idle_refs(f) || folio_test_dirty(f) || folio_test_locked(f) || !buffers_idle(f))
+		if (atomic_read(&f->page.refcount) != idle_refs(f) || folio_test_locked(f) || !buffers_idle(f))
 			continue;
+		/*
+		 * Dirty with no dirty or in-transaction buffers: the transaction
+		 * commit wrote the buffers (and freed those of file data) but left
+		 * the folio flag set. Linux's background writeback would find
+		 * nothing to write and clean it; there is none here, so every
+		 * written page stayed "dirty" and the cache grew without bound.
+		 */
+		if (folio_test_dirty(f))
+			folio_clear_dirty_for_io(f);
 		folio_detach(m, f);
 		dropped++;
 	}
@@ -251,6 +309,44 @@ static long drop_clean(struct address_space *m, long want)
 void kshim_mapping_drop_clean(struct address_space *m)
 {
 	drop_clean(m, LONG_MAX);
+}
+
+/* Debugging: what the page cache holds and why reclaim can't drop it. */
+void kshim_pagecache_stats(char *buf, size_t size)
+{
+	struct list_head *pos;
+	long mappings = 0, total = 0, dirty = 0, locked = 0, refs = 0, busy = 0, droppable = 0, with_bufs = 0;
+	AcquireSRWLockShared(&g_mappings_lock);
+	list_for_each(pos, &g_mappings) {
+		struct address_space *m = container_of(pos, struct address_space, i_private_list);
+		struct pmap *pm = m->kshim_pages;
+		size_t i;
+		mappings++;
+		if (!pm)
+			continue;
+		mutex_lock(&m->kshim_lock);
+		for (i = 0; i < pm->cap; i++) {
+			struct folio *f = pm->slots[i];
+			if (!f || f == TOMBSTONE)
+				continue;
+			total++;
+			with_bufs += folio_buffers(f) != NULL;
+			if (folio_test_dirty(f))
+				dirty++;
+			else if (folio_test_locked(f))
+				locked++;
+			else if (atomic_read(&f->page.refcount) != idle_refs(f))
+				refs++;
+			else if (!buffers_idle(f))
+				busy++;
+			else
+				droppable++;
+		}
+		mutex_unlock(&m->kshim_lock);
+	}
+	ReleaseSRWLockShared(&g_mappings_lock);
+	snprintf(buf, size, "folios %ld (counter %ld): dirty %ld, locked %ld, extra refs %ld, busy buffers %ld, droppable %ld; "
+		"with buffers %ld; mappings %ld", total, (long)g_nr_folios, dirty, locked, refs, busy, droppable, with_bufs, mappings);
 }
 
 void kshim_reclaim(void)
@@ -334,7 +430,7 @@ struct folio *__filemap_get_folio(struct address_space *m, pgoff_t index, unsign
 	f = pmap_get(m->kshim_pages, index);
 	if (!f && (fgp & FGP_CREAT)) {
 		f = calloc(1, sizeof(*f));
-		f->page.data = _aligned_malloc(PAGE_SIZE, PAGE_SIZE);
+		f->page.data = page_alloc();
 		memset(f->page.data, 0, PAGE_SIZE);
 		f->page.index = index;
 		f->page.mapping = m;

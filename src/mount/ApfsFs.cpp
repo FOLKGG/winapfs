@@ -9,6 +9,7 @@
 #include <sddl.h>
 
 #include <cstdio>
+#include <map>
 
 namespace winapfs {
 
@@ -1334,6 +1335,35 @@ static bool AddDirEntry(ApfsFs *self, ApfsFs::Node *node, const std::wstring &wn
 	return FspFileSystemFillDirectoryBuffer(&node->dir_buffer, d, &result) != FALSE;
 }
 
+// WINAPFS_PROFILE or WINAPFS_DIRSTATS: who lists directories (process id ->
+// full listings), printed at exit. dirquery_test.ps1 uses it.
+static std::mutex g_rd_mutex;
+static std::map<DWORD, long> g_rd_by_pid;
+static bool g_rd_count = [] {
+	char v[4];
+	return (GetEnvironmentVariableA("WINAPFS_PROFILE", v, 4) && v[0] != '0') ||
+	       (GetEnvironmentVariableA("WINAPFS_DIRSTATS", v, 4) && v[0] != '0');
+}();
+
+void ReportDirectoryListings()
+{
+	if (!g_rd_count)
+		return;
+	std::lock_guard<std::mutex> lock(g_rd_mutex);
+	for (const auto &kv : g_rd_by_pid)
+	{
+		wchar_t name[MAX_PATH] = L"?";
+		DWORD n = MAX_PATH;
+		HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, kv.first);
+		if (p)
+		{
+			QueryFullProcessImageNameW(p, 0, name, &n);
+			CloseHandle(p);
+		}
+		fprintf(stderr, "directory listings: %ld by pid %lu (%ls)\n", kv.second, kv.first, name);
+	}
+}
+
 static NTSTATUS ReadDirectory(FSP_FILE_SYSTEM *fs, PVOID ctx, PWSTR pattern, PWSTR marker, PVOID buf, ULONG len, PULONG transferred)
 {
 	ApfsFs *self = Self(fs);
@@ -1342,6 +1372,11 @@ static NTSTATUS ReadDirectory(FSP_FILE_SYSTEM *fs, PVOID ctx, PWSTR pattern, PWS
 
 	if (node->st.type != FileType::Dir)
 		return STATUS_NOT_A_DIRECTORY;
+	if (g_rd_count && marker == nullptr)
+	{
+		std::lock_guard<std::mutex> lock(g_rd_mutex);
+		g_rd_by_pid[FspFileSystemOperationProcessId()]++;
+	}
 
 	if (FspFileSystemAcquireDirectoryBuffer(&node->dir_buffer, marker == nullptr, &result))
 	{
@@ -1377,6 +1412,32 @@ static NTSTATUS ReadDirectory(FSP_FILE_SYSTEM *fs, PVOID ctx, PWSTR pattern, PWS
 	return STATUS_SUCCESS;
 }
 
+// A QueryDirectory for one exact name (filters and Explorer do this after every
+// create, to fetch the stored name). Without this callback WinFsp answers it by
+// listing the whole directory, which made copying many files into one folder
+// quadratic.
+static NTSTATUS GetDirInfoByName(FSP_FILE_SYSTEM *fs, PVOID ctx, PWSTR name, FSP_FSCTL_DIR_INFO *d)
+{
+	ApfsFs *self = Self(fs);
+	ApfsFs::Node *node = static_cast<ApfsFs::Node *>(ctx);
+	if (node->st.type != FileType::Dir)
+		return STATUS_NOT_A_DIRECTORY;
+	std::wstring wname(name);
+	if (wname.empty() || wname.size() > 255)
+		return STATUS_OBJECT_NAME_NOT_FOUND;
+	DirEntry e;
+	Stat st;
+	if (!self->Vol().Lookup(node->st.inode, WindowsNameToApfs(wname), e) || !self->Vol().GetStat(e.inode, st))
+		return STATUS_OBJECT_NAME_NOT_FOUND;
+	std::wstring stored = ApfsNameToWindows(e.name);
+	size_t bytes = std::min<size_t>(stored.size(), 255) * sizeof(WCHAR);
+	memset(d, 0, sizeof(FSP_FSCTL_DIR_INFO));
+	d->Size = static_cast<UINT16>(sizeof(FSP_FSCTL_DIR_INFO) + bytes);
+	self->FillFileInfo(st, e.name, d->FileInfo);
+	memcpy(d->FileNameBuf, stored.data(), bytes);
+	return STATUS_SUCCESS;
+}
+
 static FSP_FILE_SYSTEM_INTERFACE g_interface = [] {
 	FSP_FILE_SYSTEM_INTERFACE i;
 	memset(&i, 0, sizeof(i));
@@ -1397,6 +1458,7 @@ static FSP_FILE_SYSTEM_INTERFACE g_interface = [] {
 	i.Rename = Rename;
 	i.GetSecurity = GetSecurity;
 	i.ReadDirectory = ReadDirectory;
+	i.GetDirInfoByName = GetDirInfoByName;
 	i.GetStreamInfo = GetStreamInfo;
 	i.ResolveReparsePoints = ResolveReparsePoints;
 	i.GetReparsePoint = GetReparsePoint;
@@ -1453,6 +1515,7 @@ NTSTATUS ApfsFs::Start(const wchar_t *mount_point)
 	vp.PersistentAcls = 1;
 	vp.ReadOnlyVolume = m_vol->Writable() ? 0 : 1;
 	vp.PostCleanupWhenModifiedOnly = 1;
+	vp.PassQueryDirectoryFileName = 1;  // GetDirInfoByName
 	vp.NamedStreams = 1;                // xattrs
 	vp.ReparsePoints = 1;               // symlinks, FIFOs, devices
 	vp.ReparsePointsAccessCheck = 0;

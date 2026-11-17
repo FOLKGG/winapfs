@@ -101,5 +101,7 @@ private:
 
 // Loads winfsp-x64.dll from the WinFsp install directory (delay-loaded).
 bool LoadWinFsp();
+// WINAPFS_PROFILE: directory listings per requesting process (stderr)
+void ReportDirectoryListings();
 
 } // namespace winapfs

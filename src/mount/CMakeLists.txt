@@ -23,6 +23,8 @@ add_executable(winapfs
 	Mount.h
 	Service.cpp
 	Control.cpp
+	Profiler.cpp
+	Profiler.h
 	Control.h
 	Service.h
 	ApfsFs.cpp
@@ -32,7 +34,7 @@ add_executable(winapfs
 	${MC_OUT}/messages.rc)
 target_include_directories(winapfs PRIVATE ${MC_OUT})
 target_include_directories(winapfs SYSTEM PRIVATE ${WINFSP_INCLUDE_DIR})
-target_link_libraries(winapfs PRIVATE winapfs_core ${WINFSP_LIBRARY} delayimp dbghelp setupapi cfgmgr32)
+target_link_libraries(winapfs PRIVATE winapfs_core ${WINFSP_LIBRARY} delayimp dbghelp setupapi cfgmgr32 winmm)
 target_link_options(winapfs PRIVATE /ENTRY:wmainCRTStartup /DELAYLOAD:winfsp-x64.dll)
 target_compile_options(winapfs PRIVATE /W4 /wd4100)
 install(TARGETS winapfs RUNTIME DESTINATION bin)

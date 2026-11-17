@@ -6,6 +6,7 @@
 
 #include "ApfsFs.h"
 #include "Mount.h"
+#include "Profiler.h"
 #include "Service.h"
 
 #include <winapfs/Names.h>
@@ -420,6 +421,8 @@ int wmain(int argc, wchar_t **wargv)
 {
 	SetConsoleOutputCP(CP_UTF8);
 	SetUnhandledExceptionFilter(CrashHandler);
+	StartProfilerFromEnv();
+	atexit([] { StopProfilerAndReport(); ReportDirectoryListings(); });
 
 	if (argc < 2)
 	{

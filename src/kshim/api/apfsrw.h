@@ -181,6 +181,8 @@ int apfsrw_setattr(apfsrw_node *n, const apfsrw_setattr_t *a);
 #define APFSRW_CRASH_POWER	3
 #define APFSRW_CRASH_NOBARRIER	4	/* POWER on a disk that ignores flushes (must corrupt) */
 void apfsrw_test_crash(int how, uint64_t at, uint32_t seed);
+/* Debugging: page-cache contents (kshim_pagecache_stats). */
+void apfsrw_debug_stats(char *buf, size_t size);
 uint64_t apfsrw_test_writes(void);
 
 #ifdef __cplusplus

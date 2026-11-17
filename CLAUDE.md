@@ -570,6 +570,29 @@ through a `--rw` mount of an image (was 25 s, ~15-25 MB/s; now ~1.4 s,
    sorted and merged (≤ 1 MiB). Mapping writeback sorts and merges too.
    600 MiB: 153,703 device writes → 670. One Win32 event per thread for I/O.
 Remaining cost: FlushFileBuffers at each commit (every 64K buffers).
+
+Long copy sessions (user report 2026-11-17: "freezes and slows to almost 0"):
+5. **Memory**: folios stayed dirty after the transaction commit had written
+   their buffers (the commit writes buffers, not folios), so reclaim never
+   dropped them and memory grew ~2x the data written. drop_clean now cleans
+   a dirty folio whose buffers are all idle and clean; pages come from a pool
+   (2 MiB VirtualAlloc blocks, SLIST free list) instead of _aligned_malloc.
+   1.2 GB written: ~275 MB flat.
+6. **Single-name directory queries**: after each create something in the
+   kernel (pid 0: a filter driver) queries the directory for that one name.
+   Without `GetDirInfoByName` (+ `PassQueryDirectoryFileName`) WinFsp answered
+   with a full ReadDirectory (ListDir + GetStat per entry): 3000 files in one
+   folder made 3015 full listings and the rate fell 1,437 → 512 files/s.
+   Now 1 listing, ~3,500 files/s flat (NTFS ~3,000); 30,000 CopyFile'd files
+   + 400 MB stay ~1,950 files/s, memory +~1 KB/file (inode cache, known gap).
+   Test: `dirquery.*` (tests/dirquery_test.ps1; listing count via
+   `WINAPFS_DIRSTATS=1`, exact-name/case/hidden/mapped-name queries).
+Profiling: `WINAPFS_PROFILE=1` samples every winapfs thread (~1 ms) and prints
+the hottest functions at exit (Profiler.cpp), plus listings per pid.
+`apfsrw-bench ... --files N --small KiB` measures engine file creation.
+Seen once: right after a test's unmount, opening the image failed with
+error 5 for a moment (environmental, Defender presumably); dirquery_test
+waits for the image to open before fsck.
 Tools: `apfsrw-bench <img> <container offset> <vol index> <MiB> [chunk KiB]
 [--profile]` (engine write throughput; the profile samples the writer every
 ~15 ms and symbolizes with the Release PDBs, which are now always built);

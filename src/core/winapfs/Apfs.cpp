@@ -101,7 +101,7 @@ bool Container::FindApfsPartitions(const std::string &path, std::vector<Partitio
 	std::unique_ptr<Device> dev(Device::OpenDevice(path.c_str()));
 	if (!dev)
 	{
-		err = "cannot open " + path;
+		err = "cannot open " + path + " (error " + std::to_string(GetLastError()) + ")";
 		return false;
 	}
 	parts.clear();

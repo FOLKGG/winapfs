@@ -466,3 +466,10 @@ uint64_t apfsrw_file_size(apfsrw_file *af)
 {
 	return (uint64_t)i_size_read(af->f.f_inode);
 }
+
+void kshim_pagecache_stats(char *buf, size_t size);
+
+void apfsrw_debug_stats(char *buf, size_t size)
+{
+	kshim_pagecache_stats(buf, size);
+}

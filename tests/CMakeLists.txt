@@ -166,7 +166,7 @@ endforeach()
 # W3: writes with the linux-apfs-rw engine on image copies, read back through
 # both engines and checked with winapfs-fsck.
 add_executable(apfsrw-bench apfsrw_bench.cpp)
-target_link_libraries(apfsrw-bench PRIVATE apfsrw dbghelp)
+target_link_libraries(apfsrw-bench PRIVATE apfsrw dbghelp psapi)
 target_link_options(apfsrw-bench PRIVATE /ENTRY:wmainCRTStartup)
 
 add_executable(apfsrw-writetest writetest.cpp)
@@ -266,6 +266,23 @@ if(TARGET winapfs)
 				-Winapfs $<TARGET_FILE:winapfs> -Fsck $<TARGET_FILE:winapfs-fsck>
 				-Image ${TD}/${img} -Work ${CMAKE_CURRENT_BINARY_DIR}/prealloc-${img} -Volume ${vol})
 		set_tests_properties(prealloc.${img} PROPERTIES RESOURCE_LOCK winfsp_mount)
+	endforeach()
+
+	# single-name directory queries (GetDirInfoByName): no full listing per create
+	foreach(v "basic.img|Basic|" "casesensitive.img|CaseSens|-CaseSensitive")
+		string(REPLACE "|" ";" f "${v}")
+		list(GET f 0 img)
+		list(GET f 1 vol)
+		list(LENGTH f n)
+		set(cs "")
+		if(n GREATER 2)
+			list(GET f 2 cs)
+		endif()
+		add_test(NAME dirquery.${img}
+			COMMAND powershell -NoProfile -ExecutionPolicy Bypass -File ${CMAKE_CURRENT_SOURCE_DIR}/dirquery_test.ps1
+				-Winapfs $<TARGET_FILE:winapfs> -Fsck $<TARGET_FILE:winapfs-fsck>
+				-Image ${TD}/${img} -Work ${CMAKE_CURRENT_BINARY_DIR}/dirquery-${img} -Volume ${vol} ${cs})
+		set_tests_properties(dirquery.${img} PROPERTIES RESOURCE_LOCK winfsp_mount)
 	endforeach()
 endif()
 

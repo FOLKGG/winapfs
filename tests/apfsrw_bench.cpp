@@ -15,6 +15,7 @@
 
 #include <Windows.h>
 #include <dbghelp.h>
+#include <psapi.h>
 
 #include <algorithm>
 #include <atomic>
@@ -93,6 +94,15 @@ int wmain(int argc, wchar_t **argv)
 	size_t mib = static_cast<size_t>(_wtoi(argv[4]));
 	size_t chunk = (argc > 5 && argv[5][0] != L'-' ? static_cast<size_t>(_wtoi(argv[5])) : 1024) * 1024;
 	bool profile = argc > 5 && wcscmp(argv[argc - 1], L"--profile") == 0;
+	int files = 0;   // --files N: N files of <MiB> each, with memory and page-cache stats after each
+	int small_files = 0;   // --small N: N files of 16 KiB in one directory, rate per 1000
+	for (int i = 5; i + 1 < argc; i++)
+	{
+		if (wcscmp(argv[i], L"--files") == 0)
+			files = _wtoi(argv[i + 1]);
+		if (wcscmp(argv[i], L"--small") == 0)
+			small_files = _wtoi(argv[i + 1]);
+	}
 
 	apfsrw_mount *m = nullptr;
 	int err = apfsrw_mount_volume(img, offset, 0, vol, true, nullptr, &m);
@@ -100,6 +110,96 @@ int wmain(int argc, wchar_t **argv)
 	{
 		fprintf(stderr, "mount: %d\n", err);
 		return 1;
+	}
+	if (small_files > 0)
+	{
+		apfsrw_node *r = nullptr, *dir = nullptr;
+		apfsrw_root(m, &r);
+		apfsrw_mkdir(r, "small", 5, 0755, &dir);
+		std::vector<uint8_t> data(16384, 0x33);
+		char stats[512];
+		std::thread smp;
+		if (profile)
+		{
+			HANDLE self = nullptr;
+			DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &self, 0, FALSE, DUPLICATE_SAME_ACCESS);
+			g_sampling = true;
+			smp = std::thread(Sampler, self);
+		}
+		double s0 = Now();
+		for (int k = 0; k < small_files; k++)
+		{
+			std::string name = "f" + std::to_string(k) + ".bin";
+			apfsrw_node *fn = nullptr;
+			if (apfsrw_create(dir, name.data(), name.size(), 0644, &fn))
+			{
+				fprintf(stderr, "create %s failed\n", name.c_str());
+				break;
+			}
+			apfsrw_file *ff = nullptr;
+			apfsrw_open(fn, true, &ff);
+			size_t w = 0;
+			apfsrw_write(ff, 0, data.data(), data.size(), &w);
+			apfsrw_release(ff);
+			apfsrw_put(fn);
+			if ((k + 1) % 1000 == 0)
+			{
+				double s1 = Now();
+				PROCESS_MEMORY_COUNTERS_EX pmc = { sizeof(pmc) };
+				GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS *>(&pmc), sizeof(pmc));
+				apfsrw_debug_stats(stats, sizeof(stats));
+				printf("small %6d: %6.0f files/s, private %5zu MB | %s\n", k + 1, 1000 / (s1 - s0), pmc.PrivateUsage >> 20, stats);
+				s0 = s1;
+			}
+		}
+		if (profile)
+		{
+			g_sampling = false;
+			smp.join();
+			Report();
+		}
+		apfsrw_put(dir);
+		apfsrw_put(r);
+		apfsrw_unmount(m);
+		return 0;
+	}
+	if (files > 0)
+	{
+		apfsrw_node *r = nullptr;
+		apfsrw_root(m, &r);
+		std::vector<uint8_t> data(chunk, 0x5a);
+		char stats[512];
+		for (int k = 0; k < files; k++)
+		{
+			std::string name = "many" + std::to_string(k) + ".bin";
+			apfsrw_node *fn = nullptr;
+			apfsrw_unlink(r, name.data(), name.size());
+			if (apfsrw_create(r, name.data(), name.size(), 0644, &fn))
+				break;
+			apfsrw_file *ff = nullptr;
+			apfsrw_open(fn, true, &ff);
+			double s0 = Now();
+			uint64_t tot = static_cast<uint64_t>(mib) << 20;
+			for (uint64_t off = 0; off < tot; off += chunk)
+			{
+				size_t w = 0;
+				if (apfsrw_write(ff, off, data.data(), static_cast<size_t>(std::min<uint64_t>(chunk, tot - off)), &w))
+					break;
+			}
+			apfsrw_release(ff);
+			apfsrw_put(fn);
+			double s1 = Now();
+			PROCESS_MEMORY_COUNTERS_EX pmc = { sizeof(pmc) };
+			GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS *>(&pmc), sizeof(pmc));
+			apfsrw_debug_stats(stats, sizeof(stats));
+			printf("file %2d: %5.0f MB/s, private %5zu MB | %s\n", k, tot / 1e6 / (s1 - s0), pmc.PrivateUsage >> 20, stats);
+		}
+		apfsrw_sync(m);
+		apfsrw_debug_stats(stats, sizeof(stats));
+		printf("after sync | %s\n", stats);
+		apfsrw_put(r);
+		apfsrw_unmount(m);
+		return 0;
 	}
 	apfsrw_node *root = nullptr, *n = nullptr;
 	apfsrw_root(m, &root);
