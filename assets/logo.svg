@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="t">
+  <title id="t">winapfs logo</title>
+  <!-- winapfs logo. SPDX-License-Identifier: CC0-1.0 (public domain dedication).
+       A drive holding a container of volumes, with a two-way arrow for read-write. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#16a3e0"/>
+      <stop offset="1" stop-color="#5b4fe0"/>
+    </linearGradient>
+    <linearGradient id="shine" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#bg)"/>
+  <rect x="16" y="16" width="480" height="240" rx="112" fill="url(#shine)"/>
+  <!-- drive body -->
+  <rect x="104" y="112" width="304" height="288" rx="44" fill="#ffffff"/>
+  <!-- three volumes in one container -->
+  <rect x="140" y="152" width="232" height="44" rx="14" fill="#16a3e0"/>
+  <rect x="140" y="212" width="232" height="44" rx="14" fill="#3a7ae0"/>
+  <rect x="140" y="272" width="148" height="44" rx="14" fill="#5b4fe0"/>
+  <!-- status light -->
+  <circle cx="340" cy="294" r="14" fill="#22c55e"/>
+  <!-- read / write arrows -->
+  <path d="M152 356 h176" stroke="#5b4fe0" stroke-width="16" stroke-linecap="round"/>
+  <path d="M308 336 l26 20 l-26 20" fill="none" stroke="#5b4fe0" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M178 336 l-26 20 l26 20" fill="none" stroke="#5b4fe0" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
