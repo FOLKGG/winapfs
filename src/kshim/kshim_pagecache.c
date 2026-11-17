@@ -33,77 +33,95 @@
 
 /* ------------------------------------------------------------ folio index (hash map) */
 
+/*
+ * Separate chaining (folio->kshim_hnext), at most one folio per bucket on
+ * average. This was open addressing with linear probing and tombstones that
+ * never counted towards the load: a long copy (pages created and reclaimed
+ * in one mapping for gigabytes) filled every free slot with tombstones, so
+ * lookups of uncached pages got slower and slower and finally looped forever
+ * under the mapping lock (user report 2026-11-17: Explorer copies slowed to
+ * ~0, then failed after ~3.7 GB through one file). Reclaim drops folios in
+ * table order, which also left long tombstone runs. Chaining has neither.
+ */
 struct pmap {
-	size_t cap;     /* power of two */
-	size_t count;
+	size_t cap;     /* buckets, power of two */
+	size_t count;   /* folios */
 	struct folio **slots;
 };
 
-#define TOMBSTONE	((struct folio *)(uintptr_t)1)
-
 static size_t phash(pgoff_t idx, size_t cap)
 {
-	u64 h = (u64)idx * 0x9E3779B97F4A7C15ULL;
-	return (size_t)(h >> 20) & (cap - 1);
+	u64 h = (u64)idx;   /* fmix64 */
+	h ^= h >> 33;
+	h *= 0xff51afd7ed558ccdULL;
+	h ^= h >> 33;
+	h *= 0xc4ceb9fe1a85ec53ULL;
+	h ^= h >> 33;
+	return (size_t)h & (cap - 1);
 }
+
+/* Every folio of a map; the body may detach (free) f. */
+#define PMAP_FOR_EACH(pm, i, f, next) \
+	for ((i) = 0; (i) < (pm)->cap; (i)++) \
+		for ((f) = (pm)->slots[i]; (f) && (((next) = (f)->kshim_hnext), 1); (f) = (next))
 
 static struct folio *pmap_get(struct pmap *pm, pgoff_t idx)
 {
-	size_t i;
+	struct folio *f;
 	if (!pm || !pm->cap)
 		return NULL;
-	for (i = phash(idx, pm->cap);; i = (i + 1) & (pm->cap - 1)) {
-		struct folio *f = pm->slots[i];
-		if (!f)
-			return NULL;
-		if (f != TOMBSTONE && f->page.index == idx)
+	for (f = pm->slots[phash(idx, pm->cap)]; f; f = f->kshim_hnext)
+		if (f->page.index == idx)
 			return f;
-	}
+	return NULL;
 }
 
 static void pmap_put_raw(struct pmap *pm, struct folio *f)
 {
-	size_t i;
-	for (i = phash(f->page.index, pm->cap);; i = (i + 1) & (pm->cap - 1)) {
-		if (!pm->slots[i] || pm->slots[i] == TOMBSTONE) {
-			pm->slots[i] = f;
-			return;
-		}
-	}
+	size_t b = phash(f->page.index, pm->cap);
+	f->kshim_hnext = pm->slots[b];
+	pm->slots[b] = f;
 }
 
-static void pmap_grow(struct pmap *pm)
+static void pmap_resize(struct pmap *pm, size_t cap)
 {
 	size_t old = pm->cap, i;
-	struct folio **slots = pm->slots;
-	pm->cap = old ? old * 2 : 64;
-	pm->slots = calloc(pm->cap, sizeof(*pm->slots));
+	struct folio **slots = pm->slots, *f, *next;
+	pm->cap = cap;
+	pm->slots = calloc(cap, sizeof(*pm->slots));
 	for (i = 0; i < old; i++)
-		if (slots[i] && slots[i] != TOMBSTONE)
-			pmap_put_raw(pm, slots[i]);
+		for (f = slots[i]; f; f = next) {
+			next = f->kshim_hnext;
+			pmap_put_raw(pm, f);
+		}
 	free(slots);
 }
 
+/* Only inserts resize: iterations (PMAP_FOR_EACH) remove but never insert. */
 static void pmap_insert(struct pmap *pm, struct folio *f)
 {
-	if ((pm->count + 1) * 2 > pm->cap)
-		pmap_grow(pm);
+	if (!pm->cap)
+		pmap_resize(pm, 64);
+	else if (pm->count + 1 > pm->cap)
+		pmap_resize(pm, pm->cap * 2);
+	else if (pm->cap > 1024 && (pm->count + 1) * 8 < pm->cap)
+		pmap_resize(pm, pm->cap / 4);   /* a big file's pages were reclaimed */
 	pmap_put_raw(pm, f);
 	pm->count++;
 }
 
 static void pmap_remove(struct pmap *pm, struct folio *f)
 {
-	size_t i;
-	for (i = phash(f->page.index, pm->cap);; i = (i + 1) & (pm->cap - 1)) {
-		if (!pm->slots[i])
-			return;
-		if (pm->slots[i] == f) {
-			pm->slots[i] = TOMBSTONE;
+	struct folio **pp;
+	if (!pm->cap)
+		return;
+	for (pp = &pm->slots[phash(f->page.index, pm->cap)]; *pp; pp = &(*pp)->kshim_hnext)
+		if (*pp == f) {
+			*pp = f->kshim_hnext;
+			f->kshim_hnext = NULL;
 			pm->count--;
 			return;
 		}
-	}
 }
 
 /* ------------------------------------------------------------ mappings */
@@ -243,15 +261,13 @@ static void folio_detach(struct address_space *m, struct folio *f)
 void kshim_mapping_release_all(struct address_space *m)
 {
 	struct pmap *pm = m->kshim_pages;
+	struct folio *f, *next;
 	size_t i;
 	if (!pm)
 		return;
 	mutex_lock(&m->kshim_lock);
-	for (i = 0; i < pm->cap; i++) {
-		struct folio *f = pm->slots[i];
-		if (f && f != TOMBSTONE)
-			folio_detach(m, f);
-	}
+	PMAP_FOR_EACH(pm, i, f, next)
+		folio_detach(m, f);
 	mutex_unlock(&m->kshim_lock);
 	AcquireSRWLockExclusive(&g_mappings_lock);
 	list_del(&m->i_private_list);
@@ -279,15 +295,15 @@ static bool buffers_idle(struct folio *f)
 static long drop_clean(struct address_space *m, long want)
 {
 	struct pmap *pm = m->kshim_pages;
+	struct folio *f, *next;
 	long dropped = 0;
 	size_t i;
 	if (!pm)
 		return 0;
 	mutex_lock(&m->kshim_lock);
-	for (i = 0; i < pm->cap && dropped < want; i++) {
-		struct folio *f = pm->slots[i];
-		if (!f || f == TOMBSTONE)
-			continue;
+	PMAP_FOR_EACH(pm, i, f, next) {
+		if (dropped >= want)
+			break;   /* leaves this bucket; the outer loop checks again */
 		if (atomic_read(&f->page.refcount) != idle_refs(f) || folio_test_locked(f) || !buffers_idle(f))
 			continue;
 		/*
@@ -320,15 +336,13 @@ void kshim_pagecache_stats(char *buf, size_t size)
 	list_for_each(pos, &g_mappings) {
 		struct address_space *m = container_of(pos, struct address_space, i_private_list);
 		struct pmap *pm = m->kshim_pages;
+		struct folio *f, *next;
 		size_t i;
 		mappings++;
 		if (!pm)
 			continue;
 		mutex_lock(&m->kshim_lock);
-		for (i = 0; i < pm->cap; i++) {
-			struct folio *f = pm->slots[i];
-			if (!f || f == TOMBSTONE)
-				continue;
+		PMAP_FOR_EACH(pm, i, f, next) {
 			total++;
 			with_bufs += folio_buffers(f) != NULL;
 			if (folio_test_dirty(f))
@@ -1002,12 +1016,13 @@ int kshim_mapping_writeback(struct address_space *m)
 	/* snapshot the dirty folios, then work without holding the map lock */
 	mutex_lock(&m->kshim_lock);
 	list = malloc((pm->count + 1) * sizeof(*list));
-	for (i = 0; i < pm->cap; i++) {
-		struct folio *f = pm->slots[i];
-		if (f && f != TOMBSTONE && folio_test_dirty(f)) {
-			folio_get(f);
-			list[n++] = f;
-		}
+	{
+		struct folio *f, *next;
+		PMAP_FOR_EACH(pm, i, f, next)
+			if (folio_test_dirty(f)) {
+				folio_get(f);
+				list[n++] = f;
+			}
 	}
 	mutex_unlock(&m->kshim_lock);
 
@@ -1158,13 +1173,13 @@ void truncate_inode_pages(struct address_space *m, loff_t start)
 {
 	struct pmap *pm = m->kshim_pages;
 	pgoff_t first = (pgoff_t)((start + PAGE_SIZE - 1) >> PAGE_SHIFT);
+	struct folio *f, *next;
 	size_t i;
 	if (!pm)
 		return;
 	mutex_lock(&m->kshim_lock);
-	for (i = 0; i < pm->cap; i++) {
-		struct folio *f = pm->slots[i];
-		if (f && f != TOMBSTONE && f->page.index >= first) {
+	PMAP_FOR_EACH(pm, i, f, next) {
+		if (f->page.index >= first) {
 			/*
 			 * The driver's ->invalidate_folio is a no-op: buffers already
 			 * in a transaction are written by its commit, so they must

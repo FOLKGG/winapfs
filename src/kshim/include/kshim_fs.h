@@ -236,6 +236,7 @@ struct page {
 /* One page per folio: folio_size() == PAGE_SIZE always. */
 struct folio {
 	struct page page;
+	struct folio *kshim_hnext;   /* next in its mapping's hash bucket */
 };
 static inline struct folio *page_folio(struct page *p) { return container_of(p, struct folio, page); }
 #define folio_page(f, n)	(&(f)->page)

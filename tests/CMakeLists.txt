@@ -255,6 +255,24 @@ foreach(v "basic.img|basic|Basic" "casesensitive.img|casesensitive|CaseSens")
 	set_tests_properties(diskfull_verify.${img} diskfull_fsck.${img} PROPERTIES FIXTURES_REQUIRED full-${img})
 endforeach()
 
+# page cache under long sessions (user report 2026-11-17: big copies slowed to
+# ~0 and hung after ~3 GB through one file): a 24 GiB sparse file read once
+# (ever-new pages in one mapping), and a 600 MiB file re-read 8 times
+set(pc_sparse ${CMAKE_CURRENT_BINARY_DIR}/pagecache-sparse.img)
+set(pc_reread ${CMAKE_CURRENT_BINARY_DIR}/pagecache-reread.img)
+add_test(NAME pagecache_prepare COMMAND ${CMAKE_COMMAND} -E copy ${TD}/basic.img ${pc_sparse})
+add_test(NAME pagecache_prepare_reread COMMAND ${CMAKE_COMMAND} -E copy ${TD}/multivol.img ${pc_reread})
+set_tests_properties(pagecache_prepare PROPERTIES FIXTURES_SETUP pagecache)
+set_tests_properties(pagecache_prepare_reread PROPERTIES FIXTURES_SETUP pagecache_reread)
+add_test(NAME pagecache.sparse COMMAND apfsrw-bench ${pc_sparse} 20480 0 0 --sparse 24)
+add_test(NAME pagecache.reread COMMAND apfsrw-bench ${pc_reread} 20480 0 600 --reread 8)
+add_test(NAME pagecache_fsck.sparse COMMAND winapfs-fsck ${pc_sparse})
+add_test(NAME pagecache_fsck.reread COMMAND winapfs-fsck ${pc_reread})
+set_tests_properties(pagecache.sparse PROPERTIES FIXTURES_REQUIRED pagecache FIXTURES_SETUP pagecache_done TIMEOUT 300)
+set_tests_properties(pagecache.reread PROPERTIES FIXTURES_REQUIRED pagecache_reread FIXTURES_SETUP pagecache_reread_done TIMEOUT 300)
+set_tests_properties(pagecache_fsck.sparse PROPERTIES FIXTURES_REQUIRED pagecache_done)
+set_tests_properties(pagecache_fsck.reread PROPERTIES FIXTURES_REQUIRED pagecache_reread_done)
+
 # the Windows write pattern: size first, then data (pending growth -> few extents)
 if(TARGET winapfs)
 	foreach(v "basic.img|Basic" "casesensitive.img|CaseSens")

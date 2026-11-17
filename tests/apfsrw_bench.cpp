@@ -96,12 +96,18 @@ int wmain(int argc, wchar_t **argv)
 	bool profile = argc > 5 && wcscmp(argv[argc - 1], L"--profile") == 0;
 	int files = 0;   // --files N: N files of <MiB> each, with memory and page-cache stats after each
 	int small_files = 0;   // --small N: N files of 16 KiB in one directory, rate per 1000
+	int rereads = 0;   // --reread N: write one file of <MiB>, then read it N times (page-cache churn in one mapping)
+	int sparse_gib = 0;   // --sparse G: read a G GiB sparse file once (ever-new pages in one mapping)
 	for (int i = 5; i + 1 < argc; i++)
 	{
 		if (wcscmp(argv[i], L"--files") == 0)
 			files = _wtoi(argv[i + 1]);
 		if (wcscmp(argv[i], L"--small") == 0)
 			small_files = _wtoi(argv[i + 1]);
+		if (wcscmp(argv[i], L"--reread") == 0)
+			rereads = _wtoi(argv[i + 1]);
+		if (wcscmp(argv[i], L"--sparse") == 0)
+			sparse_gib = _wtoi(argv[i + 1]);
 	}
 
 	apfsrw_mount *m = nullptr;
@@ -162,6 +168,174 @@ int wmain(int argc, wchar_t **argv)
 		apfsrw_put(r);
 		apfsrw_unmount(m);
 		return 0;
+	}
+	if (sparse_gib > 0)
+	{
+		// Regression for the page-cache index (2026-11-17): a huge file read
+		// once creates and reclaims ever-new pages in one mapping. The old
+		// open-addressing table ran out of empty slots after a few GB
+		// (tombstones) and every lookup of an uncached page looped forever.
+		// A sparse file needs no space: holes read as zero pages. Fails on a
+		// GiB that takes 5x the first, or after 60 s without progress.
+		apfsrw_node *r = nullptr, *fn = nullptr;
+		apfsrw_root(m, &r);
+		apfsrw_unlink(r, "sparse.bin", 10);
+		if (apfsrw_create(r, "sparse.bin", 10, 0644, &fn))
+		{
+			fprintf(stderr, "create failed\n");
+			return 1;
+		}
+		apfsrw_setattr_t sa = {};
+		sa.mask = APFSRW_SET_SIZE;
+		sa.size = static_cast<uint64_t>(sparse_gib) << 30;
+		if (apfsrw_setattr(fn, &sa))
+		{
+			fprintf(stderr, "setattr size failed\n");
+			return 1;
+		}
+		static volatile LONG progress = 0;
+		std::thread watchdog([] {
+			LONG last = -1;
+			for (;;)
+			{
+				Sleep(60000);
+				LONG p = progress;
+				if (p < 0)
+					return;
+				if (p == last)
+				{
+					fprintf(stderr, "FAIL: no progress for 60 s (hang)\n");
+					fflush(stderr);
+					ExitProcess(3);
+				}
+				last = p;
+			}
+		});
+		std::vector<uint8_t> data(1 << 20);
+		apfsrw_file *ff = nullptr;
+		apfsrw_open(fn, false, &ff);
+		double first = 0, s0 = Now();
+		int rc = 0;
+		for (uint64_t off = 0; off < sa.size && !rc; off += data.size())
+		{
+			size_t got = 0;
+			data[0] = 1;
+			if (apfsrw_read(ff, off, data.data(), data.size(), &got) || got != data.size() || data[0] != 0)
+			{
+				fprintf(stderr, "FAIL: read at %llu\n", (unsigned long long)off);
+				rc = 1;
+			}
+			InterlockedIncrement(&progress);
+			if (((off + data.size()) & ((1ull << 30) - 1)) == 0)
+			{
+				double s = Now() - s0;
+				printf("GiB %3llu: %6.0f MB/s\n", (unsigned long long)((off + data.size()) >> 30), 1073.741824 / s);
+				fflush(stdout);
+				if (first == 0)
+					first = s > 0.05 ? s : 0.05;
+				else if (s > 5 * first)
+				{
+					fprintf(stderr, "FAIL: a GiB took %.2f s, the first %.2f s\n", s, first);
+					rc = 1;
+				}
+				s0 = Now();
+			}
+		}
+		InterlockedExchange(&progress, -1);
+		watchdog.detach();
+		apfsrw_release(ff);
+		apfsrw_unlink(r, "sparse.bin", 10);
+		apfsrw_put(fn);
+		apfsrw_put(r);
+		apfsrw_unmount(m);
+		if (!rc)
+			printf("OK: read a %d GiB sparse file\n", sparse_gib);
+		return rc;
+	}
+	if (rereads > 0)
+	{
+		// Regression for the page-cache index: pages created and reclaimed
+		// in one mapping for gigabytes made lookups slower and slower, then
+		// loop forever (2026-11-17). Fails if a pass takes 5x the first, and
+		// a watchdog ends a hung run.
+		apfsrw_node *r = nullptr, *fn = nullptr;
+		apfsrw_root(m, &r);
+		apfsrw_unlink(r, "reread.bin", 10);
+		if (apfsrw_create(r, "reread.bin", 10, 0644, &fn))
+		{
+			fprintf(stderr, "create failed\n");
+			return 1;
+		}
+		std::vector<uint8_t> data(1 << 20);
+		apfsrw_file *ff = nullptr;
+		apfsrw_open(fn, true, &ff);
+		uint64_t tot = static_cast<uint64_t>(mib) << 20;
+		for (uint64_t off = 0; off < tot; off += data.size())
+		{
+			memset(data.data(), static_cast<int>(off >> 20) & 0xff, data.size());
+			size_t w = 0;
+			if (apfsrw_write(ff, off, data.data(), data.size(), &w))
+			{
+				fprintf(stderr, "write failed at %llu\n", (unsigned long long)off);
+				return 1;
+			}
+		}
+		apfsrw_sync(m);
+		static volatile LONG progress = 0;
+		std::thread watchdog([] {
+			LONG last = -1;
+			for (;;)
+			{
+				Sleep(60000);
+				LONG p = progress;
+				if (p < 0)
+					return;
+				if (p == last)
+				{
+					fprintf(stderr, "FAIL: no progress for 60 s (hang)\n");
+					fflush(stderr);
+					ExitProcess(3);
+				}
+				last = p;
+			}
+		});
+		double first = 0;
+		int rc = 0;
+		for (int k = 0; k < rereads && !rc; k++)
+		{
+			double s0 = Now();
+			for (uint64_t off = 0; off < tot; off += data.size())
+			{
+				size_t got = 0;
+				if (apfsrw_read(ff, off, data.data(), data.size(), &got) || got != data.size() ||
+				    data[0] != static_cast<uint8_t>((off >> 20) & 0xff) || data[data.size() - 1] != data[0])
+				{
+					fprintf(stderr, "FAIL: pass %d reads back wrong at %llu\n", k, (unsigned long long)off);
+					rc = 1;
+					break;
+				}
+				InterlockedIncrement(&progress);
+			}
+			double s = Now() - s0;
+			printf("pass %2d: %6.0f MB/s (%.2f s)\n", k, tot / 1e6 / s, s);
+			fflush(stdout);
+			if (k == 0)
+				first = s > 0.05 ? s : 0.05;
+			else if (s > 5 * first)
+			{
+				fprintf(stderr, "FAIL: pass %d took %.2f s, the first %.2f s\n", k, s, first);
+				rc = 1;
+			}
+		}
+		InterlockedExchange(&progress, -1);
+		watchdog.detach();
+		apfsrw_release(ff);
+		apfsrw_put(fn);
+		apfsrw_put(r);
+		apfsrw_unmount(m);
+		if (!rc)
+			printf("OK: %d passes over %zu MiB\n", rereads, mib);
+		return rc;
 	}
 	if (files > 0)
 	{

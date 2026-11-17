@@ -587,6 +587,22 @@ Long copy sessions (user report 2026-11-17: "freezes and slows to almost 0"):
    + 400 MB stay ~1,950 files/s, memory +~1 KB/file (inode cache, known gap).
    Test: `dirquery.*` (tests/dirquery_test.ps1; listing count via
    `WINAPFS_DIRSTATS=1`, exact-name/case/hidden/mapped-name queries).
+7. **Page-cache index hang** (the real cause of "slows to ~0, then the copy
+   fails"; found on the user's disk with a stack dump of the stuck service:
+   one thread spinning in `__filemap_get_folio` → `pmap_get`, every other
+   operation waiting on its mapping lock, WinFsp failing the IRPs after 5 min).
+   The per-mapping folio index was open addressing with linear probing whose
+   tombstones never counted towards the load, so a huge file (ever-new page
+   indices created and reclaimed in one mapping) used up every empty slot:
+   lookups slowed (237 → 89 MB/s) and then looped forever after ~3 GB.
+   Re-reading the same file never triggers it (its tombstones get reused).
+   Now separate chaining (`folio->kshim_hnext`, fmix64 hash, load ≤ 1,
+   shrinks when a big file's pages are reclaimed); `PMAP_FOR_EACH` iterates
+   safely while folios are detached. 24 GiB sparse read: hung before, now 8 s
+   at ~3.3 GB/s. Tests: `pagecache.sparse` (`apfsrw-bench ... --sparse 24`,
+   60 s no-progress watchdog), `pagecache.reread` (`--reread 8`), + fsck.
+   Tool: `stacks.exe` (scratchpad, not in the repo) dumped the SYSTEM
+   service's stacks elevated with SeDebugPrivilege and the build's PDBs.
 Profiling: `WINAPFS_PROFILE=1` samples every winapfs thread (~1 ms) and prints
 the hottest functions at exit (Profiler.cpp), plus listings per pid.
 `apfsrw-bench ... --files N --small KiB` measures engine file creation.
