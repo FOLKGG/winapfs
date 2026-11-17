@@ -492,6 +492,7 @@ struct inode {
 	struct inode *kshim_hnext;
 	unsigned long kshim_hashval;
 	struct list_head kshim_sb_list;
+	struct list_head kshim_lru;   /* on sb->kshim_unused while i_count == 0 */
 	struct mutex kshim_wait;  /* held while I_NEW */
 	void *kshim_link;         /* cached symlink body */
 };
@@ -955,6 +956,9 @@ struct super_block {
 	void *kshim_icache;       /* inode hash table */
 	struct mutex kshim_ilock;
 	struct list_head kshim_inodes;
+	struct list_head kshim_unused;   /* unreferenced inodes, oldest first */
+	long kshim_nr_unused;
+	struct work_struct kshim_evict_work;
 };
 static inline bool sb_rdonly(const struct super_block *sb) { return (sb->s_flags & SB_RDONLY) != 0; }
 #define SB_I_CGROUPWB	0

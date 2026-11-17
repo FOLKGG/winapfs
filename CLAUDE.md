@@ -603,6 +603,29 @@ Long copy sessions (user report 2026-11-17: "freezes and slows to almost 0"):
    60 s no-progress watchdog), `pagecache.reread` (`--reread 8`), + fsck.
    Tool: `stacks.exe` (scratchpad, not in the repo) dumped the SYSTEM
    service's stacks elevated with SeDebugPrivilege and the build's PDBs.
+8. **Bounded inode memory**: every inode a session touched stayed cached
+   until unmount (RwVolume's inode -> node map and kshim's inode cache): ~1 KB
+   per file plus a mapping each, page reclaim walked every mapping (periodic
+   stalls), the 4096-bucket inode hash got long chains, and unmount/sync
+   rescanned the inode list once per inode (quadratic). Now:
+   - `apfsrw_iget(mount, ino)` (driver `apfs_iget` + `d_obtain_alias`) and
+     `apfsrw_stat.parent_ino` (`i_parent_id`). RwVolume caches 4096 nodes
+     (LRU), opens others by number, hands out held references (`NodeRef`),
+     and has no parent map. Unlinked inodes are only forgotten, never reopened.
+   - kshim: unreferenced inodes go on `sb->kshim_unused`; beyond 4096,
+     `evict_unused_work` (work thread: writing a leftover I_DIRTY inode starts
+     a transaction) evicts the oldest down to 3/4, skipping any someone took
+     meanwhile. Transactions `ihold` every inode they change until commit, so
+     inodes are evictable right after a commit. As in Linux, an inode stays
+     hashed while it is evicted and iget waits for it (else an iget during an
+     orphan's eviction could clean the orphan twice). iput marks I_FREEING
+     under the lock after re-checking the count. evict_inodes and
+     sync_filesystem collect in one pass (holding references).
+   50,000 files (engine): 50,004 cached inodes → ~3,500-14,000 (dropping at
+   each commit); 90,000 files: memory flat at ~285 MB (the page cache's
+   256 MB ceiling). Through the mount, 40,000 CopyFile'd files: flat ~290 MB,
+   ~2,700 files/s (was ~1,950 and +1 KB/file). Test: `inodecache.small`
+   (bench `--small 30000` fails above 16384 cached mappings after a sync).
 Profiling: `WINAPFS_PROFILE=1` samples every winapfs thread (~1 ms) and prints
 the hottest functions at exit (Profiler.cpp), plus listings per pid.
 `apfsrw-bench ... --files N --small KiB` measures engine file creation.
@@ -642,12 +665,9 @@ Tools: `apfsrw-bench <img> <container offset> <vol index> <MiB> [chunk KiB]
 - Hard links appear as independent files (same IndexNumber); WinFsp has no
   hard-link count (`HardLinks` is unimplemented).
 - Fusion drives (two devices) are not exposed by the front-ends.
-- RwVolume's inode -> node map holds every node it has seen until unmount
-  (fine for tests; a big volume walk will grow memory; needs an LRU).
 - Git Bash rewrites "/path" arguments to C:/Program Files/Git/...; use
   `MSYS_NO_PATHCONV=1` or PowerShell when passing APFS paths to the tools.
-- kshim: unreferenced inodes stay cached until unmount (no inode reclaim yet);
-  ioctl `unsigned long arg` is 32-bit on Windows, so pointer ioctls must not go
+- kshim: ioctl `unsigned long arg` is 32-bit on Windows, so pointer ioctls must not go
   through the driver's ioctl handlers; `pgoff_t` is 32-bit (16 TiB file limit).
 - Build helpers: `build_target.cmd <target>` builds one target;
   `summarize_errors.sh <target>` builds and groups MSVC errors by kind.

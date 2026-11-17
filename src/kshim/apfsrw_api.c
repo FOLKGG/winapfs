@@ -129,6 +129,25 @@ int apfsrw_root(apfsrw_mount *m, apfsrw_node **out)
 	return 0;
 }
 
+int apfsrw_iget(apfsrw_mount *m, uint64_t ino, apfsrw_node **out)
+{
+	struct inode *inode;
+	struct dentry *d;
+
+	if (ino == apfs_ino(m->root->d_inode))
+		return apfsrw_root(m, out);
+	inode = apfs_iget(m->sb, ino);
+	if (IS_ERR(inode))
+		return (int)PTR_ERR(inode);
+	d = d_obtain_alias(inode);   /* takes over the inode reference */
+	if (IS_ERR(d)) {
+		iput(inode);
+		return (int)PTR_ERR(d);
+	}
+	*out = N(d);
+	return 0;
+}
+
 apfsrw_node *apfsrw_get(apfsrw_node *n)
 {
 	return N(dget(D(n)));
@@ -205,6 +224,7 @@ int apfsrw_getattr(apfsrw_node *n, apfsrw_stat *st)
 	st->rdev = k.rdev;
 	st->attributes = k.attributes;
 	st->bsd_flags = APFS_I(i)->i_bsd_flags;
+	st->parent_ino = APFS_I(i)->i_parent_id;
 	return 0;
 }
 

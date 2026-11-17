@@ -3,13 +3,16 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
 // Volume on the linux-apfs-rw engine (apfsrw API). The engine works with
-// looked-up nodes (dentries); the Volume interface works with inode numbers,
-// so every node we see is kept in an inode -> node map until unmount.
+// nodes (dentries); the Volume interface works with inode numbers. Recently
+// used nodes are cached (LRU, bounded); others are opened again by inode
+// number (apfsrw_iget). Every node handed out is a held reference (NodeRef),
+// so eviction never frees a node another thread is using.
 
 #include "Apfs.h"
 
 #include <apfsrw.h>
 
+#include <list>
 #include <mutex>
 #include <unordered_map>
 
@@ -70,6 +73,37 @@ private:
 	std::mutex m_mutex;
 };
 
+// A held node reference (apfsrw_put on destruction); converts to the pointer.
+class NodeRef
+{
+public:
+	NodeRef() = default;
+	explicit NodeRef(apfsrw_node *n) : m_node(n) {}
+	NodeRef(NodeRef &&o) noexcept : m_node(o.m_node) { o.m_node = nullptr; }
+	NodeRef &operator=(NodeRef &&o) noexcept
+	{
+		if (this != &o)
+		{
+			if (m_node)
+				apfsrw_put(m_node);
+			m_node = o.m_node;
+			o.m_node = nullptr;
+		}
+		return *this;
+	}
+	NodeRef(const NodeRef &) = delete;
+	NodeRef &operator=(const NodeRef &) = delete;
+	~NodeRef()
+	{
+		if (m_node)
+			apfsrw_put(m_node);
+	}
+	operator apfsrw_node *() const { return m_node; }
+
+private:
+	apfsrw_node *m_node = nullptr;
+};
+
 class RwVolume : public Volume
 {
 public:
@@ -77,15 +111,15 @@ public:
 	{
 		apfsrw_node *root = nullptr;
 		apfsrw_root(m_mount, &root);
-		m_nodes[kRootInode] = root;
-		m_parent[kRootInode] = kRootParent;
+		m_root = root;   // pinned, never evicted
 	}
 
 	~RwVolume() override
 	{
 		for (auto &kv : m_nodes)
-			apfsrw_put(kv.second);
+			apfsrw_put(kv.second.node);
 		m_nodes.clear();
+		apfsrw_put(m_root);
 		apfsrw_unmount(m_mount);
 	}
 
@@ -104,7 +138,6 @@ public:
 
 	bool GetStat(uint64_t inode, Stat &st) override
 	{
-		apfsrw_node *n = Get(inode);
 		apfsrw_stat s;
 		st = Stat();
 		if (inode == kRootParent)
@@ -114,10 +147,11 @@ public:
 			st.mode = 0040755;
 			return true;
 		}
+		NodeRef n = Get(inode);
 		if (!n || apfsrw_getattr(n, &s))
 			return false;
 		st.inode = s.ino;
-		st.parent = Parent(inode);
+		st.parent = s.ino == kRootInode ? kRootParent : s.parent_ino;
 		st.mode = static_cast<uint16_t>(s.mode);
 		st.type = TypeFromMode(s.mode);
 		st.uid = s.uid;
@@ -137,7 +171,7 @@ public:
 
 	bool Lookup(uint64_t parent, const std::string &name, DirEntry &out) override
 	{
-		apfsrw_node *p = Get(parent);
+		NodeRef p = Get(parent);
 		if (!p)
 			return false;
 		char stored[1024];
@@ -150,7 +184,7 @@ public:
 			apfsrw_put(child);
 			return false;
 		}
-		Remember(s.ino, child, parent);
+		Remember(s.ino, child);
 		out.name = stored;
 		out.inode = s.ino;
 		out.type = TypeFromMode(s.mode);
@@ -159,7 +193,7 @@ public:
 
 	bool ListDir(uint64_t dir_inode, std::vector<DirEntry> &entries) override
 	{
-		apfsrw_node *dir = Get(dir_inode);
+		NodeRef dir = Get(dir_inode);
 		entries.clear();
 		if (!dir)
 			return false;
@@ -175,23 +209,13 @@ public:
 			static_cast<Ctx *>(c)->out->push_back(std::move(e));
 			return 0;
 		}, &ctx);
-		if (err)
-			return false;
-		// callers stat the entries next; make every child addressable by inode
-		for (const auto &e : entries)
-		{
-			if (Get(e.inode))
-				continue;
-			apfsrw_node *child = nullptr;
-			if (apfsrw_lookup(dir, e.name.data(), e.name.size(), &child) == 0)
-				Remember(e.inode, child, dir_inode);
-		}
-		return true;
+		// children are opened by inode number when stat'ed (Get)
+		return err == 0;
 	}
 
 	std::unique_ptr<FileReader> OpenFile(const Stat &st, std::string &err) override
 	{
-		apfsrw_node *n = Get(st.inode);
+		NodeRef n = Get(st.inode);
 		apfsrw_file *f = nullptr;
 		if (st.type != FileType::File)
 		{
@@ -209,7 +233,7 @@ public:
 
 	bool ListXattrs(uint64_t inode, const Stat &st, std::vector<std::string> &names) override
 	{
-		apfsrw_node *n = Get(inode);
+		NodeRef n = Get(inode);
 		names.clear();
 		if (!n)
 			return false;
@@ -236,7 +260,7 @@ public:
 
 	bool GetXattr(uint64_t inode, const std::string &name, std::vector<uint8_t> &data) override
 	{
-		apfsrw_node *n = Get(inode);
+		NodeRef n = Get(inode);
 		if (!n)
 			return false;
 		long size = apfsrw_getxattr(n, name.c_str(), nullptr, 0);
@@ -252,7 +276,7 @@ public:
 
 	bool GetXattrSize(uint64_t inode, const std::string &name, uint64_t &size) override
 	{
-		apfsrw_node *n = Get(inode);
+		NodeRef n = Get(inode);
 		long s = n ? apfsrw_getxattr(n, name.c_str(), nullptr, 0) : -1;
 		if (s < 0)
 			return false;
@@ -276,7 +300,7 @@ public:
 
 	bool ReadLink(uint64_t inode, std::string &target) override
 	{
-		apfsrw_node *n = Get(inode);
+		NodeRef n = Get(inode);
 		if (!n)
 			return false;
 		std::vector<char> buf(4096);
@@ -298,7 +322,8 @@ public:
 
 	int Create(uint64_t parent, const std::string &name, bool dir, uint32_t mode, DirEntry &out) override
 	{
-		apfsrw_node *p = Get(parent), *n = nullptr;
+		NodeRef p = Get(parent);
+		apfsrw_node *n = nullptr;
 		if (!p)
 			return -2;
 		int err = dir ? apfsrw_mkdir(p, name.data(), name.size(), mode, &n) : apfsrw_create(p, name.data(), name.size(), mode, &n);
@@ -311,7 +336,7 @@ public:
 			apfsrw_put(n);
 			return err;
 		}
-		Remember(s.ino, n, parent);
+		Remember(s.ino, n);
 		out.name = name;
 		out.inode = s.ino;
 		out.type = dir ? FileType::Dir : FileType::File;
@@ -320,7 +345,7 @@ public:
 
 	int Remove(uint64_t parent, const std::string &name, bool dir) override
 	{
-		apfsrw_node *p = Get(parent);
+		NodeRef p = Get(parent);
 		if (!p)
 			return -2;
 		uint64_t victim = InodeOf(p, name);
@@ -332,7 +357,7 @@ public:
 
 	int Rename(uint64_t old_parent, const std::string &old_name, uint64_t new_parent, const std::string &new_name, bool replace) override
 	{
-		apfsrw_node *op = Get(old_parent), *np = Get(new_parent);
+		NodeRef op = Get(old_parent), np = Get(new_parent);
 		if (!op || !np)
 			return -2;
 		uint64_t moved = InodeOf(op, old_name), replaced = InodeOf(np, new_name);
@@ -340,11 +365,6 @@ public:
 			replace ? 0 : APFSRW_RENAME_NOREPLACE);
 		if (err)
 			return err;
-		if (moved)
-		{
-			std::lock_guard<std::mutex> lock(m_mutex);
-			m_parent[moved] = new_parent;
-		}
 		if (replaced && replaced != moved)
 			ForgetIfUnlinked(replaced);
 		return 0;
@@ -352,7 +372,8 @@ public:
 
 	int Symlink(uint64_t parent, const std::string &name, const std::string &target, DirEntry &out) override
 	{
-		apfsrw_node *p = Get(parent), *n = nullptr;
+		NodeRef p = Get(parent);
+		apfsrw_node *n = nullptr;
 		if (!p)
 			return -2;
 		int err = apfsrw_symlink(p, name.data(), name.size(), target.c_str(), &n);
@@ -365,7 +386,7 @@ public:
 			apfsrw_put(n);
 			return err;
 		}
-		Remember(s.ino, n, parent);
+		Remember(s.ino, n);
 		out.name = name;
 		out.inode = s.ino;
 		out.type = FileType::Symlink;
@@ -374,7 +395,7 @@ public:
 
 	int Link(uint64_t inode, uint64_t parent, const std::string &name) override
 	{
-		apfsrw_node *src = Get(inode), *p = Get(parent);
+		NodeRef src = Get(inode), p = Get(parent);
 		if (!src || !p)
 			return -2;
 		return apfsrw_link(src, p, name.data(), name.size(), nullptr);
@@ -382,7 +403,7 @@ public:
 
 	int SetXattr(uint64_t inode, const std::string &name, const void *data, size_t len, int flags) override
 	{
-		apfsrw_node *n = Get(inode);
+		NodeRef n = Get(inode);
 		if (!n)
 			return -2;
 		int f = ((flags & kXattrCreate) ? APFSRW_XATTR_CREATE : 0) | ((flags & kXattrReplace) ? APFSRW_XATTR_REPLACE : 0);
@@ -391,7 +412,7 @@ public:
 
 	int RemoveXattr(uint64_t inode, const std::string &name) override
 	{
-		apfsrw_node *n = Get(inode);
+		NodeRef n = Get(inode);
 		return n ? apfsrw_removexattr(n, name.c_str()) : -2;
 	}
 
@@ -420,7 +441,7 @@ public:
 		int err = Decompressed(inode);
 		if (err)
 			return err;
-		apfsrw_node *n = Get(inode);
+		NodeRef n = Get(inode);
 		apfsrw_file *f = nullptr;
 		if (!n)
 			return -2;
@@ -475,7 +496,7 @@ public:
 private:
 	int Setattr(uint64_t inode, const apfsrw_setattr_t &a)
 	{
-		apfsrw_node *n = Get(inode);
+		NodeRef n = Get(inode);
 		return n ? apfsrw_setattr(n, &a) : -2;
 	}
 
@@ -487,7 +508,7 @@ private:
 		Stat st;
 		if (!GetStat(inode, st) || !st.compressed)
 			return 0;
-		apfsrw_node *p = Get(st.parent);
+		NodeRef p = Get(st.parent);
 		std::vector<DirEntry> ents;
 		if (!p || !ListDir(st.parent, ents))
 			return -2;
@@ -508,15 +529,11 @@ private:
 			apfsrw_put(n);
 			return err;
 		}
-		Remember(s.ino, n, st.parent);
+		Remember(s.ino, n);
+		apfsrw_node *old = Drop(st.inode);   // the replaced inode can go
+		if (old)
+			apfsrw_put(old);
 		std::lock_guard<std::mutex> lock(m_mutex);
-		auto it = m_nodes.find(st.inode);
-		if (it != m_nodes.end())
-		{
-			apfsrw_put(it->second);   // the replaced inode can go
-			m_nodes.erase(it);
-		}
-		m_parent.erase(st.inode);
 		m_alias[st.inode] = s.ino;
 		inode = s.ino;
 		return 0;
@@ -551,54 +568,106 @@ private:
 	}
 
 	// Drop our node for an inode that lost its last name, so the engine can
-	// evict it (that is what frees its blocks).
+	// evict it (that is what frees its blocks). Only looks in the cache: an
+	// unlinked inode is never opened again by number.
 	void ForgetIfUnlinked(uint64_t inode)
 	{
-		apfsrw_node *n = Get(inode);
-		apfsrw_stat s;
-		if (!n || (apfsrw_getattr(n, &s) == 0 && s.nlink > 0))
-			return;
-		std::lock_guard<std::mutex> lock(m_mutex);
-		auto it = m_nodes.find(inode);
-		if (it != m_nodes.end())
+		apfsrw_node *cached = nullptr;
 		{
-			apfsrw_put(it->second);
-			m_nodes.erase(it);
-			m_parent.erase(inode);
+			std::lock_guard<std::mutex> lock(m_mutex);
+			auto it = m_nodes.find(inode);
+			if (it == m_nodes.end())
+				return;
+			cached = apfsrw_get(it->second.node);
 		}
+		NodeRef n(cached);
+		apfsrw_stat s;
+		if (apfsrw_getattr(n, &s) == 0 && s.nlink > 0)
+			return;
+		apfsrw_node *drop = Drop(inode);
+		if (drop)
+			apfsrw_put(drop);
 	}
 
-	// Borrowed pointer; the map holds the reference until unmount.
-	apfsrw_node *Get(uint64_t inode)
-	{
-		std::lock_guard<std::mutex> lock(m_mutex);
-		auto it = m_nodes.find(Current(inode));
-		return it == m_nodes.end() ? nullptr : it->second;
-	}
-
-	uint64_t Parent(uint64_t inode)
-	{
-		std::lock_guard<std::mutex> lock(m_mutex);
-		auto it = m_parent.find(Current(inode));
-		return it == m_parent.end() ? 0 : it->second;
-	}
-
-	// Takes ownership of node's reference.
-	void Remember(uint64_t inode, apfsrw_node *node, uint64_t parent)
+	// Remove an inode from the cache; returns its node for the caller to put.
+	apfsrw_node *Drop(uint64_t inode)
 	{
 		std::lock_guard<std::mutex> lock(m_mutex);
 		auto it = m_nodes.find(inode);
 		if (it == m_nodes.end())
-			m_nodes[inode] = node;
-		else
-			apfsrw_put(node);
-		m_parent[inode] = parent;
+			return nullptr;
+		apfsrw_node *n = it->second.node;
+		m_lru.erase(it->second.lru);
+		m_nodes.erase(it);
+		return n;
 	}
 
+	// A held reference to the node of an inode: from the cache, or opened by
+	// number (and cached). Empty if the inode doesn't exist.
+	NodeRef Get(uint64_t inode)
+	{
+		uint64_t ino;
+		{
+			std::lock_guard<std::mutex> lock(m_mutex);
+			ino = Current(inode);
+			if (ino == kRootInode)
+				return NodeRef(apfsrw_get(m_root));
+			auto it = m_nodes.find(ino);
+			if (it != m_nodes.end())
+			{
+				m_lru.splice(m_lru.end(), m_lru, it->second.lru);
+				return NodeRef(apfsrw_get(it->second.node));
+			}
+		}
+		apfsrw_node *n = nullptr;
+		if (apfsrw_iget(m_mount, ino, &n))
+			return NodeRef();
+		Remember(ino, apfsrw_get(n));
+		return NodeRef(n);
+	}
+
+	// Takes ownership of node's reference. Evicts the least recently used
+	// nodes beyond kMaxNodes (their engine inodes then go on the engine's own
+	// bounded unused list).
+	void Remember(uint64_t inode, apfsrw_node *node)
+	{
+		std::vector<apfsrw_node *> evicted;
+		{
+			std::lock_guard<std::mutex> lock(m_mutex);
+			if (inode == kRootInode || m_nodes.count(inode))
+			{
+				evicted.push_back(node);
+			}
+			else
+			{
+				m_lru.push_back(inode);
+				m_nodes[inode] = Entry{ node, std::prev(m_lru.end()) };
+				while (m_nodes.size() > kMaxNodes)
+				{
+					uint64_t old = m_lru.front();
+					m_lru.pop_front();
+					auto it = m_nodes.find(old);
+					evicted.push_back(it->second.node);
+					m_nodes.erase(it);
+				}
+			}
+		}
+		for (apfsrw_node *n : evicted)
+			apfsrw_put(n);
+	}
+
+	static constexpr size_t kMaxNodes = 4096;
+	struct Entry
+	{
+		apfsrw_node *node;
+		std::list<uint64_t>::iterator lru;
+	};
+
 	apfsrw_mount *m_mount;
+	apfsrw_node *m_root = nullptr;
 	std::mutex m_mutex;
-	std::unordered_map<uint64_t, apfsrw_node *> m_nodes;
-	std::unordered_map<uint64_t, uint64_t> m_parent;
+	std::unordered_map<uint64_t, Entry> m_nodes;
+	std::list<uint64_t> m_lru;   // least recently used first
 	std::unordered_map<uint64_t, uint64_t> m_alias;   // decompressed: old inode -> new
 };
 

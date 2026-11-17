@@ -38,6 +38,7 @@ typedef struct apfsrw_stat {
 	uint32_t rdev;
 	uint64_t attributes;    /* STATX_ATTR_* (compressed 0x4, immutable 0x10, append 0x20, nodump 0x40) */
 	uint32_t bsd_flags;      /* APFS BSD flags (UF_HIDDEN, UF_IMMUTABLE, UF_COMPRESSED, ...) */
+	uint64_t parent_ino;     /* primary parent directory (a hard link's first name) */
 } apfsrw_stat;
 
 typedef struct apfsrw_statfs {
@@ -81,6 +82,8 @@ int apfsrw_lookup(apfsrw_node *dir, const char *name, size_t len, apfsrw_node **
 /* Like apfsrw_lookup, but also returns the name as stored on disk (its case and
  * normalization may differ from name on insensitive volumes). */
 int apfsrw_lookup_stored(apfsrw_node *dir, const char *name, size_t len, apfsrw_node **out, char *stored, size_t stored_size);
+/* A node for an inode number (no name: usable for everything but apfsrw_name). */
+int apfsrw_iget(apfsrw_mount *m, uint64_t ino, apfsrw_node **out);
 apfsrw_node *apfsrw_get(apfsrw_node *n);
 void apfsrw_put(apfsrw_node *n);
 int apfsrw_getattr(apfsrw_node *n, apfsrw_stat *st);

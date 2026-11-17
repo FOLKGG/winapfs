@@ -51,6 +51,7 @@ static void inode_init_always(struct super_block *sb, struct inode *inode)
 	inode->i_private = NULL;
 	inode->kshim_link = NULL;
 	inode->kshim_hnext = NULL;
+	INIT_LIST_HEAD(&inode->kshim_lru);
 	inode->i_mapping = &inode->i_data;
 	kshim_mapping_init(&inode->i_data, inode);
 	init_rwsem(&inode->i_rwsem);
@@ -62,6 +63,7 @@ void inode_init_once(struct inode *inode)
 {
 	memset(inode, 0, sizeof(*inode));
 	INIT_LIST_HEAD(&inode->kshim_sb_list);
+	INIT_LIST_HEAD(&inode->kshim_lru);
 }
 
 static struct inode *alloc_inode(struct super_block *sb)
@@ -120,13 +122,28 @@ static void hash(struct super_block *sb, struct inode *inode, unsigned long hash
 	ic->buckets[hashval % ICACHE_BUCKETS] = inode;
 }
 
+/* take an inode off the unused list (caller holds kshim_ilock) */
+static void lru_del(struct super_block *sb, struct inode *inode)
+{
+	if (!list_empty(&inode->kshim_lru)) {
+		list_del_init(&inode->kshim_lru);
+		sb->kshim_nr_unused--;
+	}
+}
+
+/*
+ * As in Linux, the inode stays hashed while the driver evicts it, and a
+ * lookup that finds an I_FREEING inode waits for it to go: otherwise an iget
+ * during the eviction of an unlinked inode would read it again from disk and
+ * its orphan could be cleaned twice. (RwVolume opens inodes by number.)
+ */
 static void evict(struct inode *inode)
 {
 	struct super_block *sb = inode->i_sb;
 
-	inode->i_state |= I_FREEING;
 	mutex_lock(&sb->kshim_ilock);
-	unhash(sb, inode);
+	inode->i_state |= I_FREEING;
+	lru_del(sb, inode);
 	mutex_unlock(&sb->kshim_ilock);
 	if (sb->s_op->evict_inode) {
 		sb->s_op->evict_inode(inode);
@@ -134,6 +151,9 @@ static void evict(struct inode *inode)
 		truncate_inode_pages_final(&inode->i_data);
 		clear_inode(inode);
 	}
+	mutex_lock(&sb->kshim_ilock);
+	unhash(sb, inode);
+	mutex_unlock(&sb->kshim_ilock);
 	destroy_inode(inode);
 }
 
@@ -154,8 +174,15 @@ again:
 	mutex_lock(&sb->kshim_ilock);
 	ic = icache(sb);
 	for (inode = ic->buckets[hashval % ICACHE_BUCKETS]; inode; inode = inode->kshim_hnext) {
+		if (inode->kshim_hashval == hashval && (inode->i_state & I_FREEING) && test(inode, data)) {
+			/* being evicted: wait until it is gone, then look again */
+			mutex_unlock(&sb->kshim_ilock);
+			Sleep(1);
+			goto again;
+		}
 		if (inode->kshim_hashval == hashval && !(inode->i_state & I_FREEING) && test(inode, data)) {
 			atomic_inc(&inode->i_count);
+			lru_del(sb, inode);
 			mutex_unlock(&sb->kshim_ilock);
 			if (fresh)
 				destroy_inode(fresh);
@@ -208,6 +235,7 @@ struct inode *ilookup(struct super_block *sb, unsigned long ino)
 	for (inode = icache(sb)->buckets[ino % ICACHE_BUCKETS]; inode; inode = inode->kshim_hnext)
 		if (inode->i_ino == ino && !(inode->i_state & I_FREEING)) {
 			atomic_inc(&inode->i_count);
+			lru_del(sb, inode);
 			break;
 		}
 	mutex_unlock(&sb->kshim_ilock);
@@ -269,39 +297,146 @@ void ihold(struct inode *inode)
 }
 
 /*
+ * Unreferenced inodes kept cached. Beyond this many, the oldest are evicted
+ * by evict_unused_work. Without a bound every inode a long session touched
+ * stayed in memory until unmount (~1 KB each plus its cached pages), lookups
+ * walked ever longer hash chains, and unmount got slow.
+ */
+#define ICACHE_MAX_UNUSED	4096
+
+/*
+ * Evicts the oldest unreferenced inodes down to 3/4 of the limit. Runs on the
+ * work thread: writing a dirty inode starts a transaction, which iput's
+ * callers (the transaction commit among them) can't do. Transactions hold
+ * every inode they change until they commit, so an unreferenced inode has
+ * normally been written already; a leftover I_DIRTY is written first.
+ */
+static void evict_unused_work(struct work_struct *w)
+{
+	struct super_block *sb = container_of(w, struct super_block, kshim_evict_work);
+	long budget;
+
+	mutex_lock(&sb->kshim_ilock);
+	budget = sb->kshim_nr_unused;   /* one pass at most: a re-dirtied inode goes back on the list */
+	mutex_unlock(&sb->kshim_ilock);
+	for (; budget > 0; budget--) {
+		struct inode *inode;
+		bool last;
+
+		mutex_lock(&sb->kshim_ilock);
+		if (!(sb->s_flags & SB_ACTIVE) || sb->kshim_nr_unused <= ICACHE_MAX_UNUSED * 3 / 4 ||
+		    list_empty(&sb->kshim_unused)) {
+			mutex_unlock(&sb->kshim_ilock);
+			return;
+		}
+		inode = list_first_entry(&sb->kshim_unused, struct inode, kshim_lru);
+		lru_del(sb, inode);
+		if (inode->i_state & (I_FREEING | I_NEW)) {
+			mutex_unlock(&sb->kshim_ilock);
+			continue;
+		}
+		atomic_inc(&inode->i_count);   /* ours while writing */
+		mutex_unlock(&sb->kshim_ilock);
+
+		if ((inode->i_state & I_DIRTY) && inode->i_nlink && !is_bad_inode(inode) && !sb_rdonly(sb) &&
+		    sb->s_op->write_inode) {
+			inode->i_state &= ~I_DIRTY;
+			sb->s_op->write_inode(inode, NULL);
+		}
+
+		/* evict only if nobody took it meanwhile */
+		mutex_lock(&sb->kshim_ilock);
+		last = atomic_read(&inode->i_count) == 1 && !(inode->i_state & (I_FREEING | I_DIRTY));
+		if (last) {
+			atomic_set(&inode->i_count, 0);
+			inode->i_state |= I_FREEING;
+		}
+		mutex_unlock(&sb->kshim_ilock);
+		if (last)
+			evict(inode);
+		else
+			iput(inode);   /* back on the list when its user lets go */
+	}
+}
+
+/*
  * Last reference: unlinked inodes are evicted at once (that is what deletes
- * them on disk); others stay cached until unmount or memory pressure.
+ * them on disk); others go on the unused list (see evict_unused_work).
  */
 void iput(struct inode *inode)
 {
+	struct super_block *sb;
+
 	if (!inode)
 		return;
 	if (!atomic_dec_and_test(&inode->i_count))
 		return;
-	if (inode->i_nlink == 0 || is_bad_inode(inode) || !(inode->i_sb->s_flags & SB_ACTIVE)) {
-		if ((inode->i_state & I_DIRTY) && inode->i_nlink && inode->i_sb->s_op->write_inode && !is_bad_inode(inode))
-			inode->i_sb->s_op->write_inode(inode, NULL);
+	sb = inode->i_sb;
+	if (inode->i_nlink == 0 || is_bad_inode(inode) || !(sb->s_flags & SB_ACTIVE)) {
+		if ((inode->i_state & I_DIRTY) && inode->i_nlink && sb->s_op->write_inode && !is_bad_inode(inode)) {
+			inode->i_state &= ~I_DIRTY;
+			sb->s_op->write_inode(inode, NULL);   /* may take and drop references */
+		}
+		/* evict unless someone took it meanwhile (their iput comes back here) */
+		mutex_lock(&sb->kshim_ilock);
+		if (atomic_read(&inode->i_count) != 0 || (inode->i_state & I_FREEING)) {
+			mutex_unlock(&sb->kshim_ilock);
+			return;
+		}
+		inode->i_state |= I_FREEING;
+		mutex_unlock(&sb->kshim_ilock);
 		evict(inode);
+		return;
 	}
+	mutex_lock(&sb->kshim_ilock);
+	if (atomic_read(&inode->i_count) == 0 && !(inode->i_state & (I_FREEING | I_NEW)) && list_empty(&inode->kshim_lru)) {
+		list_add_tail(&inode->kshim_lru, &sb->kshim_unused);
+		sb->kshim_nr_unused++;
+		if (sb->kshim_nr_unused > ICACHE_MAX_UNUSED)
+			schedule_work(&sb->kshim_evict_work);
+	}
+	mutex_unlock(&sb->kshim_ilock);
 }
 
+/* Unmount: evict every unreferenced inode (one pass; it was a rescan per inode). */
 void evict_inodes(struct super_block *sb)
 {
 	for (;;) {
-		struct inode *victim = NULL;
+		struct inode **victims;
 		struct list_head *pos;
+		size_t n = 0, cap = 0, k;
+
 		mutex_lock(&sb->kshim_ilock);
+		list_for_each(pos, &sb->kshim_inodes)
+			cap++;
+		victims = malloc((cap + 1) * sizeof(*victims));
 		list_for_each(pos, &sb->kshim_inodes) {
 			struct inode *i = container_of(pos, struct inode, kshim_sb_list);
 			if (atomic_read(&i->i_count) == 0 && !(i->i_state & I_FREEING)) {
-				victim = i;
-				break;
+				atomic_inc(&i->i_count);   /* held, so evicting one can't free another under us */
+				lru_del(sb, i);
+				victims[n++] = i;
 			}
 		}
 		mutex_unlock(&sb->kshim_ilock);
-		if (!victim)
-			break;
-		evict(victim);
+		for (k = 0; k < n; k++) {
+			struct inode *i = victims[k];
+			bool last;
+			mutex_lock(&sb->kshim_ilock);
+			last = atomic_read(&i->i_count) == 1;
+			if (last) {
+				atomic_set(&i->i_count, 0);
+				i->i_state |= I_FREEING;   /* only now: the driver may iget the others meanwhile */
+			} else {
+				atomic_dec(&i->i_count);   /* someone took it; their iput evicts it (!SB_ACTIVE) */
+			}
+			mutex_unlock(&sb->kshim_ilock);
+			if (last)
+				evict(i);
+		}
+		free(victims);
+		if (!n)
+			break;   /* evicting can release others (a dir's children); loop until none */
 	}
 }
 
@@ -594,6 +729,8 @@ static struct super_block *alloc_super(struct file_system_type *type, int flags)
 	struct super_block *sb = calloc(1, sizeof(*sb));
 	INIT_LIST_HEAD(&sb->s_list);
 	INIT_LIST_HEAD(&sb->kshim_inodes);
+	INIT_LIST_HEAD(&sb->kshim_unused);
+	kshim_init_work(&sb->kshim_evict_work, evict_unused_work);
 	mutex_init(&sb->kshim_ilock);
 	init_rwsem(&sb->s_umount);
 	sb->s_type = type;
@@ -661,27 +798,35 @@ int sync_filesystem(struct super_block *sb)
 
 	if (sb_rdonly(sb))
 		return 0;
+	/* one pass collects the dirty inodes (it was a rescan per inode) */
 	for (;;) {
-		struct inode *dirty = NULL;
+		struct inode **dirty;
+		size_t n = 0, cap = 0, k;
 		mutex_lock(&sb->kshim_ilock);
+		list_for_each(pos, &sb->kshim_inodes)
+			cap++;
+		dirty = malloc((cap + 1) * sizeof(*dirty));
 		list_for_each(pos, &sb->kshim_inodes) {
 			struct inode *i = container_of(pos, struct inode, kshim_sb_list);
 			if ((i->i_state & I_DIRTY) && !(i->i_state & (I_FREEING | I_NEW)) && i->i_nlink) {
-				dirty = i;
 				atomic_inc(&i->i_count);
-				break;
+				lru_del(sb, i);
+				dirty[n++] = i;
 			}
 		}
 		mutex_unlock(&sb->kshim_ilock);
-		if (!dirty)
-			break;
-		dirty->i_state &= ~I_DIRTY;
-		if (sb->s_op->write_inode) {
-			e = sb->s_op->write_inode(dirty, NULL);
-			if (e && !err)
-				err = e;
+		for (k = 0; k < n; k++) {
+			dirty[k]->i_state &= ~I_DIRTY;
+			if (sb->s_op->write_inode) {
+				e = sb->s_op->write_inode(dirty[k], NULL);
+				if (e && !err)
+					err = e;
+			}
+			iput(dirty[k]);
 		}
-		iput(dirty);
+		free(dirty);
+		if (!n)
+			break;   /* writing can dirty others; loop until clean */
 	}
 	if (sb->s_op->sync_fs) {
 		e = sb->s_op->sync_fs(sb, 0);
@@ -706,7 +851,8 @@ void generic_shutdown_super(struct super_block *sb)
 	if (sb->s_root) {
 		struct dentry *root = sb->s_root;
 		sync_filesystem(sb);
-		sb->s_flags &= ~SB_ACTIVE;
+		sb->s_flags &= ~SB_ACTIVE;   /* the eviction work stops; iput evicts at once */
+		cancel_work_sync(&sb->kshim_evict_work);
 		sb->s_root = NULL;
 		dput(root);
 		evict_inodes(sb);
@@ -739,6 +885,7 @@ void deactivate_locked_super(struct super_block *sb)
 	if (atomic_dec_and_test(&sb->s_active)) {
 		if (sb->s_type->kill_sb)
 			sb->s_type->kill_sb(sb);
+		cancel_work_sync(&sb->kshim_evict_work);
 		free(sb->kshim_icache);
 		free(sb->s_bdi);
 		free(sb);

@@ -164,10 +164,24 @@ int wmain(int argc, wchar_t **argv)
 			smp.join();
 			Report();
 		}
+		// Inode cache bound (2026-11-17): every inode a session touched used to
+		// stay cached until unmount (a mapping each). Committed, unreferenced
+		// inodes are evicted beyond ~4K now.
+		apfsrw_sync(m);
+		apfsrw_debug_stats(stats, sizeof(stats));
+		const char *mp = strstr(stats, "mappings ");
+		long mappings = mp ? atol(mp + 9) : -1;
+		printf("after sync: %ld mappings\n", mappings);
+		int rc = 0;
+		if (small_files >= 20000 && (mappings < 0 || mappings > 16384))
+		{
+			fprintf(stderr, "FAIL: %ld mappings cached after %d files: inodes are not evicted\n", mappings, small_files);
+			rc = 1;
+		}
 		apfsrw_put(dir);
 		apfsrw_put(r);
 		apfsrw_unmount(m);
-		return 0;
+		return rc;
 	}
 	if (sparse_gib > 0)
 	{
