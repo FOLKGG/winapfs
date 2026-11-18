@@ -1,4 +1,4 @@
-// winapfs - read-only APFS for Windows
+// winapfs - APFS for Windows
 // Copyright (C) 2026 winapfs contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
@@ -10,7 +10,10 @@
 //   0x01-0x1F and " * : < > ? \ |   ->  U+F000 + c
 //   a trailing ' ' or '.'           ->  U+F020 / U+F02E
 // Bytes that are not valid UTF-8 become lone surrogates U+DC80 + (b - 0x80)
-// (Python's "surrogateescape"), which NTFS-style names tolerate.
+// (Python's "surrogateescape"), which NTFS-style names tolerate. A stored
+// U+F001-U+F07F character that the reverse mapping would turn into a
+// forbidden character is escaped the same way, byte by byte, so every name
+// round-trips exactly.
 // Unicode normalization is left alone: the name Windows sees is exactly the
 // stored name (NFC or NFD); lookups use APFS's own normalization rules.
 

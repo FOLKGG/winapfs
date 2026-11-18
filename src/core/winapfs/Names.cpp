@@ -1,4 +1,4 @@
-// winapfs - read-only APFS for Windows
+// winapfs - APFS for Windows
 // Copyright (C) 2026 winapfs contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -72,6 +72,22 @@ std::wstring ApfsNameToWindows(const std::string &s)
 			out.push_back(static_cast<wchar_t>(0xDC00 + b));  // b >= 0x80 here
 			i += 1;
 			continue;
+		}
+
+		// A stored name can already hold a private use character that
+		// WindowsNameToApfs would turn back into a forbidden one (U+F03A ->
+		// ':'). Escape its bytes like invalid UTF-8 so the round trip is exact.
+		if (c >= 0xF001 && c <= 0xF07F)
+		{
+			char32_t orig = c - 0xF000;
+			bool last = (i + len == n);
+			if (IsWinForbidden(orig) || (last && (orig == ' ' || orig == '.')))
+			{
+				for (size_t k = 0; k < len; k++)
+					out.push_back(static_cast<wchar_t>(0xDC00 + p[i + k]));
+				i += len;
+				continue;
+			}
 		}
 
 		if (IsWinForbidden(c))
