@@ -4,6 +4,12 @@ target_include_directories(winapfs-verify PRIVATE ${TP})
 target_compile_options(winapfs-verify PRIVATE /W3)
 target_link_options(winapfs-verify PRIVATE /ENTRY:wmainCRTStartup)
 
+# APFS <-> Windows name mapping: exact round trip, no collisions (no images needed)
+add_executable(winapfs-names-test names_test.cpp ${CMAKE_SOURCE_DIR}/src/core/winapfs/Names.cpp)
+target_include_directories(winapfs-names-test PRIVATE ${CMAKE_SOURCE_DIR}/src/core)
+target_compile_options(winapfs-names-test PRIVATE /W4)
+add_test(NAME unit.names COMMAND winapfs-names-test)
+
 set(TD ${CMAKE_SOURCE_DIR}/testdata)
 set(TEST_PASSWORD winapfs-test)
 
