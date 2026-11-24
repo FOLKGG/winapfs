@@ -6,7 +6,7 @@
 
 <p align="center">
   <b>Mac (APFS) disks on Windows, as ordinary drive letters.</b><br>
-  Plug in a Mac-formatted drive and open it in Explorer: read it, and (experimentally) write to it.
+  Plug in a Mac-formatted drive and open it in Explorer: read it, and write to unencrypted volumes.
 </p>
 
 <p align="center">
@@ -31,11 +31,11 @@ mode on Windows through [WinFsp](https://winfsp.dev). No kernel driver of its ow
 no driver signing, nothing proprietary.
 
 > [!WARNING]
-> **Experimental software. Use it at your own risk.** winapfs is beta, and
-> writing to APFS disks is experimental: a bug could corrupt a volume and lose
-> data. **Back up anything you care about before connecting a disk, and before
-> enabling writes.** Disks mount read-only by default; leave them that way if you
-> only need to copy files off. winapfs comes with no warranty (see
+> **Use it at your own risk.** Writing to unencrypted APFS volumes is stable and
+> opt-in, while overall winapfs remains in active beta development. **Back up
+> anything you care about before connecting a disk, and before enabling writes.**
+> Disks mount read-only by default; leave them that way if you only need to copy
+> files off. winapfs comes with no warranty (see
 > [No warranty](#no-warranty)).
 
 ## Features
@@ -67,8 +67,8 @@ no driver signing, nothing proprietary.
 - **Encrypted volumes** (FileVault / encrypted APFS): read with the password or
   recovery key (tray / Dashboard "Unlock…", optional saving in Windows
   Credential Manager for automatic unlock, or `--ask`).
-- **Read-write** (experimental) on images and, opt-in, on physical disks, with
-  conservative safety checks (see [Writing](#writing-experimental)).
+- **Read-write** (opt-in) on unencrypted images and physical disks, with
+  conservative safety checks (see [Writing](#writing)).
 - **Several volumes per container**, GPT disks with 512- and 4096-byte sectors,
   and raw disk images (`.img`).
 
@@ -78,7 +78,7 @@ no driver signing, nothing proprietary.
 |---|---|
 | Reading (files, metadata, xattrs, links, compression) | ✅ Stable, checked against manifests made on macOS |
 | Encrypted volumes | ✅ Read-only |
-| Writing to unencrypted volumes | 🧪 Experimental. Passes crash/consistency and 8-thread concurrent write tests, and 7 `winapfs`-written test images (`basic`, `casesensitive`, `compressed`, `conc-compressed`, `links`, `multivol`, `w5-multivol`) are validated in CI with Apple's `fsck_apfs -n -l` and macOS read-only mounts; physical-disk writes remain opt-in and experimental |
+| Writing to unencrypted volumes | ✅ Stable (opt-in). Passes 155/155 tests (crash/power-cut recovery, disk-full, 8-thread concurrent writes), and all 9 `winapfs`-written images (`basic`, `casesensitive`, `compressed`, `conc-compressed`, `crash-basic`, `full-basic`, `links`, `multivol`, `w5-multivol`) pass double Apple `fsck_apfs -n -l`, full-tree read, and macOS read-write round-trip validation in CI |
 | Writing to encrypted volumes, snapshots | ⏳ Planned |
 | Fusion drives, Time Machine and macOS system volumes (writing) | ⛔ Refused (read-only) |
 
@@ -135,11 +135,12 @@ winapfs-fsck \\.\PhysicalDrive2                # check a container (read-only)
 
 `winapfs --help`, `winapfs service` and `winapfs ctl` describe every option.
 
-## Writing (experimental)
+## Writing
 
 Writing uses the same engine Linux uses, and every change goes through APFS's
 copy-on-write transactions and checkpoints, so a crash or an unplugged cable
-leaves the last checkpoint intact. Still, it is young code: **keep a backup.**
+leaves the last checkpoint intact. Even so, always **keep a backup** before
+enabling writes on important data.
 
 Writing is off by default. Turn it on per volume in the tray (*Read-write*), or
 with `winapfs mount … --rw`. Physical disks also need *Allow writing to disks*
@@ -202,10 +203,12 @@ contents and metadata:
   installer's service;
 - **cross-OS macOS `fsck_apfs` validation** (`.github/workflows/fsck-apfs.yml`):
   generates real macOS APFS images, runs the full 6-stage `ctest` suite
-  (155 tests) on Windows, then sends all 7 WinFsp-written images (`basic`,
-  `casesensitive`, `compressed`, `conc-compressed`, `links`, `multivol`,
-  `w5-multivol`) back to macOS to verify them with Apple's `fsck_apfs -n -l`
-  and read-only `hdiutil` mounts.
+  (155 tests) on Windows, then sends all 9 `winapfs`-written images (`basic`,
+  `casesensitive`, `compressed`, `conc-compressed`, `crash-basic`, `full-basic`,
+  `links`, `multivol`, `w5-multivol`) back to macOS to verify them with
+  pre-roundtrip Apple `fsck_apfs -n -l`, full-tree file read verification, a
+  macOS `-readwrite` round-trip write/rename/append check, and post-roundtrip
+  Apple `fsck_apfs -n -l`.
 
 ## Build from source
 
